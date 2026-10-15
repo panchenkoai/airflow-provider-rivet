@@ -5,19 +5,28 @@ binary on the worker as a subprocess and turn its result into Airflow's: retry o
 unit failed, and what to do about it. The contract it implements is
 [ADR-0039](https://github.com/panchenkoai/rivet/blob/main/docs/adr/0039-scheduler-contract.md).
 
-Status: first cut, not published to PyPI. It is versioned independently of the binary and checks
+Status: alpha. It is versioned independently of the binary and checks
 the binary's version at run time (minimum **rivet 0.31.0**; a lower one is refused with both
 versions in the message). Supported: Airflow 2.10+ and 3.x, Python 3.12+ (Airflow 2.10 only on 3.12).
 
 ## Install
 
 ```bash
-pip install "airflow-provider-rivet @ git+https://github.com/panchenkoai/airflow-provider-rivet"
-pip install "airflow-provider-rivet[slack] @ git+https://github.com/panchenkoai/airflow-provider-rivet"
+pip install airflow-provider-rivet            # or airflow-provider-rivet[slack]
 ```
 
 Install it into the Airflow environment with Airflow's own constraints file, so it does not move
 Airflow's pins.
+
+The rivet binary must be on every worker. On the official Airflow images (Debian 12, glibc 2.36)
+take it from rivet's container image, which is built on the same Debian release; the
+`*-linux-gnu` archive of rivet 0.31.0 needs glibc 2.38 and does not start there:
+
+```dockerfile
+FROM apache/airflow:3.3.2
+COPY --from=ghcr.io/panchenkoai/rivet:v0.31.0 /usr/local/bin/rivet /usr/local/bin/rivet
+RUN pip install --no-cache-dir airflow-provider-rivet
+```
 
 The rivet binary must be on the worker's `PATH`, or pass `rivet_bin="/abs/path/rivet"`.
 
@@ -448,7 +457,10 @@ started outside Airflow** (cron, a shell), nor against a second DAG over the sam
 
 ## Known limits
 
-- Not published; the Kubernetes mode has unit tests only (no pod was run).
+- The Kubernetes mode has unit tests only (no pod was run).
+- On rivet 0.31.0 the `rows` / `files` of a CDC `run` task leave out its `initial: snapshot`: the first
+  run of a CDC DAG reports 0 rows while the snapshot files hold the whole table (the binary's
+  `--summary-output` counts the stream only; found by the live gate).
 - `load` and `compact` against a warehouse were exercised only through the fake binary.
 - Narrowing a load to one export today means rewriting the config through a YAML reader and
   writer: comments are dropped and YAML anchors are expanded in the copy.
