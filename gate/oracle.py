@@ -7,7 +7,7 @@ report: the XCom and the stored cursor are compared with counts and values taken
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import duckdb
@@ -48,21 +48,29 @@ def rows_in(con: duckdb.DuckDBPyConnection, files: Sequence[str]) -> int:
     return con.execute(f"SELECT count(*) FROM read_parquet({_files(files)}, union_by_name=true)").fetchone()[0]
 
 
-def batch_delta(con: duckdb.DuckDBPyConnection, files: Sequence[str], source: str, columns: Sequence[str],
-                cursor: str, after: Any) -> list[str]:
+def batch_delta(
+    con: duckdb.DuckDBPyConnection, files: Sequence[str], source: str, columns: Sequence[str], cursor: str, after: Any
+) -> list[str]:
     """The files of one incremental run hold exactly the source rows past the previous high-water, with their values."""
     cols = ", ".join(columns)
-    got = f"SELECT {cols} FROM read_parquet({_files(files)}, union_by_name=true)" if files else f"SELECT {cols} FROM {source} WHERE false"
+    got = (
+        f"SELECT {cols} FROM read_parquet({_files(files)}, union_by_name=true)"
+        if files
+        else f"SELECT {cols} FROM {source} WHERE false"
+    )
     where = "" if after is None else f" WHERE {cursor} > '{_instant(after).isoformat()}'::TIMESTAMPTZ"
     return _diff(con, got, f"SELECT {cols} FROM {source}{where}", f"delta of {source}")
 
 
-def batch_latest(con: duckdb.DuckDBPyConnection, files: Sequence[str], source: str, columns: Sequence[str],
-                 key: str, cursor: str, deleted: int) -> list[str]:
+def batch_latest(
+    con: duckdb.DuckDBPyConnection, files: Sequence[str], source: str, columns: Sequence[str], key: str, cursor: str, deleted: int
+) -> list[str]:
     """The newest version of every key across all runs equals the source; only the `deleted` keys are extra."""
     cols = ", ".join(columns)
-    latest = (f"SELECT {cols} FROM (SELECT *, row_number() OVER (PARTITION BY {key} ORDER BY {cursor} DESC) AS rn "
-              f"FROM read_parquet({_files(files)}, union_by_name=true)) WHERE rn = 1")
+    latest = (
+        f"SELECT {cols} FROM (SELECT *, row_number() OVER (PARTITION BY {key} ORDER BY {cursor} DESC) AS rn "
+        f"FROM read_parquet({_files(files)}, union_by_name=true)) WHERE rn = 1"
+    )
     live = f"SELECT {cols} FROM ({latest}) WHERE {key} IN (SELECT {key} FROM {source})"
     problems = _diff(con, live, f"SELECT {cols} FROM {source}", f"latest versions of {source}")
     gone = con.execute(f"SELECT count(*) FROM ({latest}) WHERE {key} NOT IN (SELECT {key} FROM {source})").fetchone()[0]
@@ -71,18 +79,33 @@ def batch_latest(con: duckdb.DuckDBPyConnection, files: Sequence[str], source: s
     return problems
 
 
-def cdc_replay(con: duckdb.DuckDBPyConnection, snapshot: Sequence[str], stream: Sequence[Sequence[str]], source: str,
-               columns: Sequence[str], key: str) -> list[str]:
+def cdc_replay(
+    con: duckdb.DuckDBPyConnection,
+    snapshot: Sequence[str],
+    stream: Sequence[Sequence[str]],
+    source: str,
+    columns: Sequence[str],
+    key: str,
+) -> list[str]:
     """The snapshot with every captured change applied in order (run, then `__seq`) equals the source."""
     cols = ", ".join(columns)
-    parts = [f"SELECT 0 AS run_no, 0 AS seq, 'insert' AS op, {cols} FROM read_parquet({_files(snapshot)}, union_by_name=true)"] if snapshot else []
-    parts += [f"SELECT {n} AS run_no, __seq AS seq, __op AS op, {cols} FROM read_parquet({_files(files)}, union_by_name=true)"
-              for n, files in enumerate(stream, start=1) if files]
+    parts = (
+        [f"SELECT 0 AS run_no, 0 AS seq, 'insert' AS op, {cols} FROM read_parquet({_files(snapshot)}, union_by_name=true)"]
+        if snapshot
+        else []
+    )
+    parts += [
+        f"SELECT {n} AS run_no, __seq AS seq, __op AS op, {cols} FROM read_parquet({_files(files)}, union_by_name=true)"
+        for n, files in enumerate(stream, start=1)
+        if files
+    ]
     if not parts:
         return [f"replay of {source}: no snapshot and no change files"]
     events = " UNION ALL BY NAME ".join(f"({p})" for p in parts)
-    final = (f"SELECT {cols} FROM (SELECT *, row_number() OVER (PARTITION BY {key} ORDER BY run_no DESC, seq DESC) AS rn "
-             f"FROM ({events})) WHERE rn = 1 AND op <> 'delete'")
+    final = (
+        f"SELECT {cols} FROM (SELECT *, row_number() OVER (PARTITION BY {key} ORDER BY run_no DESC, seq DESC) AS rn "
+        f"FROM ({events})) WHERE rn = 1 AND op <> 'delete'"
+    )
     return _diff(con, final, f"SELECT {cols} FROM {source}", f"replay of {source}")
 
 
@@ -90,7 +113,9 @@ def cdc_ops(con: duckdb.DuckDBPyConnection, files: Sequence[str], expected: Mapp
     """The change files of one run carry exactly the expected number of events per operation."""
     got: dict[str, int] = {}
     if files:
-        got = dict(con.execute(f"SELECT __op, count(*) FROM read_parquet({_files(files)}, union_by_name=true) GROUP BY 1").fetchall())
+        got = dict(
+            con.execute(f"SELECT __op, count(*) FROM read_parquet({_files(files)}, union_by_name=true) GROUP BY 1").fetchall()
+        )
     want = {op: n for op, n in expected.items() if n}
     return [] if got == want else [f"{what}: operations {got}, expected {want}"]
 
@@ -103,7 +128,7 @@ def same_count(reported: int, counted: int, what: str) -> list[str]:
 def _instant(value: Any) -> datetime:
     """A timestamp from a datetime or a stored text form; a naive one is UTC (rivet stores the cursor in UTC)."""
     stamp = value if isinstance(value, datetime) else datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    return stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
+    return stamp if stamp.tzinfo else stamp.replace(tzinfo=UTC)
 
 
 def stored_cursor(stored: Any, source_max: Any, what: str) -> list[str]:

@@ -18,8 +18,15 @@ from typing import Any
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
 PACKAGE_FILES = ("airflow_provider_rivet", "pyproject.toml", "README.md", "LICENSE", "CHANGELOG.md")
-STATE_CONN = {"conn_type": "postgres", "host": "gate-state", "port": 5432, "login": "rivet", "password": "rivet",
-              "schema": "rivet_state", "extra": {"rivet_params": "sslmode=require"}}
+STATE_CONN = {
+    "conn_type": "postgres",
+    "host": "gate-state",
+    "port": 5432,
+    "login": "rivet",
+    "password": "rivet",
+    "schema": "rivet_state",
+    "extra": {"rivet_params": "sslmode=require"},
+}
 SOURCE_DSN = "host=127.0.0.1 port={port} dbname=rivet user=rivet password=rivet"
 
 
@@ -35,11 +42,28 @@ class Flavor:
 
 
 FLAVORS = {
-    "2.10.5": Flavor("2.10.5", "/api/v1", "airflow-webserver", "/health",
-                     ("airflow-webserver", "airflow-scheduler", "airflow-worker", "airflow-triggerer", "airflow-init", "airflow-cli")),
-    "3.3.2": Flavor("3.3.2", "/api/v2", "airflow-apiserver", "/api/v2/monitor/health",
-                    ("airflow-apiserver", "airflow-scheduler", "airflow-dag-processor", "airflow-worker", "airflow-triggerer",
-                     "airflow-init", "airflow-cli")),
+    "2.10.5": Flavor(
+        "2.10.5",
+        "/api/v1",
+        "airflow-webserver",
+        "/health",
+        ("airflow-webserver", "airflow-scheduler", "airflow-worker", "airflow-triggerer", "airflow-init", "airflow-cli"),
+    ),
+    "3.3.2": Flavor(
+        "3.3.2",
+        "/api/v2",
+        "airflow-apiserver",
+        "/api/v2/monitor/health",
+        (
+            "airflow-apiserver",
+            "airflow-scheduler",
+            "airflow-dag-processor",
+            "airflow-worker",
+            "airflow-triggerer",
+            "airflow-init",
+            "airflow-cli",
+        ),
+    ),
 }
 
 OVERLAY = """\
@@ -67,7 +91,9 @@ services:
 """
 
 
-def sh(args: list[str], *, input: str | None = None, timeout: float = 900, check: bool = True, **kw: Any) -> subprocess.CompletedProcess:
+def sh(
+    args: list[str], *, input: str | None = None, timeout: float = 900, check: bool = True, **kw: Any
+) -> subprocess.CompletedProcess:
     """Run a command, failing with its output when `check` is set."""
     done = subprocess.run(args, input=input, text=True, capture_output=True, timeout=timeout, **kw)
     if check and done.returncode != 0:
@@ -105,22 +131,48 @@ class Stand:
                 shutil.copytree(src, ctx / "provider" / name, ignore=shutil.ignore_patterns("__pycache__"))
             else:
                 shutil.copy2(src, ctx / "provider" / name)
-        sh(["docker", "build", "-q", "-t", self.image, "--build-arg", f"AIRFLOW_IMAGE=apache/airflow:{self.flavor.version}",
-            "-f", str(HERE / "stand" / "Dockerfile"), str(ctx)], timeout=1800)
+        sh(
+            [
+                "docker",
+                "build",
+                "-q",
+                "-t",
+                self.image,
+                "--build-arg",
+                f"AIRFLOW_IMAGE=apache/airflow:{self.flavor.version}",
+                "-f",
+                str(HERE / "stand" / "Dockerfile"),
+                str(ctx),
+            ],
+            timeout=1800,
+        )
 
     def lay_out(self) -> None:
         """A fresh project dir: compose files, the DAG file, the rivet dirs the containers mount."""
         if self.dir.exists():
             shutil.rmtree(self.dir)
-        for sub in ("dags", "logs", "config", "plugins", "image/provider", "rivet/configs", "rivet/out", "rivet/markers",
-                    "rivet/state/sqlite", "rivet/state/pg"):
+        for sub in (
+            "dags",
+            "logs",
+            "config",
+            "plugins",
+            "image/provider",
+            "rivet/configs",
+            "rivet/out",
+            "rivet/markers",
+            "rivet/state/sqlite",
+            "rivet/state/pg",
+        ):
             (self.dir / sub).mkdir(parents=True)
         shutil.copy2(HERE / "stand" / f"airflow-{self.flavor.version}.yaml", self.dir / "docker-compose.yaml")
         shutil.copy2(HERE / "stand" / "dags" / "rivet_gate.py", self.dir / "dags" / "rivet_gate.py")
-        services = "\n".join(f"  {s}:\n    <<: *rivet" + ('\n    ports: !override ["127.0.0.1::8080"]' if s == self.flavor.ui_service else "")
-                             for s in self.flavor.services)
-        (self.dir / "docker-compose.gate.yaml").write_text(OVERLAY.format(
-            image=self.image, state_conn=json.dumps(STATE_CONN), rivet_dir=self.rivet_dir, services=services))
+        services = "\n".join(
+            f"  {s}:\n    <<: *rivet" + ('\n    ports: !override ["127.0.0.1::8080"]' if s == self.flavor.ui_service else "")
+            for s in self.flavor.services
+        )
+        (self.dir / "docker-compose.gate.yaml").write_text(
+            OVERLAY.format(image=self.image, state_conn=json.dumps(STATE_CONN), rivet_dir=self.rivet_dir, services=services)
+        )
 
     def down(self) -> None:
         """Remove the project's containers and volumes (a leftover from an earlier run too)."""
@@ -139,8 +191,10 @@ class Stand:
         while True:
             try:
                 urllib.request.urlopen(f"http://127.0.0.1:{self.ui_port}{self.flavor.health}", timeout=5)
-                ready = [self.compose("exec", "-T", db, "pg_isready", "-U", "rivet", check=False).returncode == 0
-                         for db in ("gate-source", "gate-state")]
+                ready = [
+                    self.compose("exec", "-T", db, "pg_isready", "-U", "rivet", check=False).returncode == 0
+                    for db in ("gate-source", "gate-state")
+                ]
                 if all(ready):
                     return
             except (urllib.error.URLError, OSError):
@@ -155,8 +209,9 @@ class Stand:
 
     def psql(self, service: str, db: str, sql: str) -> str:
         """Run SQL through psql inside a database container; the unaligned result."""
-        return self.compose("exec", "-T", service, "psql", "-v", "ON_ERROR_STOP=1", "-At", "-U", "rivet", "-d", db,
-                            input=sql).stdout
+        return self.compose(
+            "exec", "-T", service, "psql", "-v", "ON_ERROR_STOP=1", "-At", "-U", "rivet", "-d", db, input=sql
+        ).stdout
 
     def _call(self, method: str, path: str, body: Any = None) -> Any:
         """One REST call with this version's auth; JSON in and out."""
@@ -171,9 +226,12 @@ class Stand:
         if self.flavor.version.startswith("2."):
             return "Basic " + base64.b64encode(b"airflow:airflow").decode()
         if self._token is None:
-            req = urllib.request.Request(f"http://127.0.0.1:{self.ui_port}/auth/token", method="POST",
-                                         data=json.dumps({"username": "airflow", "password": "airflow"}).encode(),
-                                         headers={"Content-Type": "application/json"})
+            req = urllib.request.Request(
+                f"http://127.0.0.1:{self.ui_port}/auth/token",
+                method="POST",
+                data=json.dumps({"username": "airflow", "password": "airflow"}).encode(),
+                headers={"Content-Type": "application/json"},
+            )
             with urllib.request.urlopen(req, timeout=30) as r:
                 self._token = json.loads(r.read())["access_token"]
         return f"Bearer {self._token}"

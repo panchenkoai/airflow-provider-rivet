@@ -68,7 +68,9 @@ exports:
     destination: {{ type: local, path: /opt/rivet/out/cdc_{state}/ }}
 """
 DAGS = [f"gate_{kind}_{state}" for state in STATES for kind in ("cdc", "batch")]
-RIVET_TASKS = {f"gate_batch_{s}": [f"apply.{s}_{short}" for short, _ in TABLES.values()] for s in STATES} | {f"gate_cdc_{s}": ["run"] for s in STATES}
+RIVET_TASKS = {f"gate_batch_{s}": [f"apply.{s}_{short}" for short, _ in TABLES.values()] for s in STATES} | {
+    f"gate_cdc_{s}": ["run"] for s in STATES
+}
 
 
 @dataclass
@@ -89,7 +91,7 @@ class Verdicts:
         """Run a step; an exception is a FAIL of that cell, not a crash of the gate."""
         try:
             return step()
-        except Exception as exc:  # noqa: BLE001 - every failure becomes a graded row
+        except Exception as exc:
             self.grade(cell, [f"{type(exc).__name__}: {exc}"])
             return None
 
@@ -97,8 +99,10 @@ class Verdicts:
 def write_configs(rivet_dir: Path) -> None:
     """The four rivet configs the gate DAGs run."""
     for state in STATES:
-        exports = "".join(BATCH_EXPORT.format(state=state, short=short, cols=", ".join(cols), table=table)
-                          for table, (short, cols) in TABLES.items())
+        exports = "".join(
+            BATCH_EXPORT.format(state=state, short=short, cols=", ".join(cols), table=table)
+            for table, (short, cols) in TABLES.items()
+        )
         (rivet_dir / "configs" / f"batch_{state}.yaml").write_text(BATCH.format(exports=exports))
         (rivet_dir / "configs" / f"cdc_{state}.yaml").write_text(CDC.format(state=state, tables=", ".join(TABLES)))
 
@@ -140,9 +144,18 @@ def stored_cursors(stand: Stand, state: str) -> dict[str, str]:
     return dict(line.split("|", 1) for line in text.splitlines() if "|" in line)
 
 
-def run_cycle(stand: Stand, v: Verdicts, n: int, name: str, changes: str | None, ops: dict[str, dict[str, int]],
-              files_before: set[str], high_water: dict[str, Any], history: dict[str, list[list[str]]],
-              sabotage: str | None) -> tuple[set[str], dict[str, Any]]:
+def run_cycle(
+    stand: Stand,
+    v: Verdicts,
+    n: int,
+    name: str,
+    changes: str | None,
+    ops: dict[str, dict[str, int]],
+    files_before: set[str],
+    high_water: dict[str, Any],
+    history: dict[str, list[list[str]]],
+    sabotage: str | None,
+) -> tuple[set[str], dict[str, Any]]:
     """Trigger the four DAGs (the SQLite CDC run paused, the SQLite batch run inside its window), wait, grade."""
     run_id = f"gate_{n}_{name}"
     if changes:
@@ -172,30 +185,62 @@ def run_cycle(stand: Stand, v: Verdicts, n: int, name: str, changes: str | None,
     for dag in DAGS:
         tasks[dag] = stand.tasks(dag, run_id)
         bad = {t: i["state"] for t, i in tasks[dag].items() if t in RIVET_TASKS[dag] and i["state"] != "success"}
-        v.grade(f"{name}/{dag}/run", ([f"run {states.get(dag)}"] if states.get(dag) != "success" else []) +
-                ([f"tasks {bad}"] if bad else []), ok=f"run {states.get(dag)}")
-    c, b = tasks["gate_cdc_sqlite"].get("run", {}), [tasks["gate_batch_sqlite"].get(t, {}) for t in RIVET_TASKS["gate_batch_sqlite"]]
-    v.guard(f"{name}/sqlite-two-writers-overlap", lambda: v.grade(f"{name}/sqlite-two-writers-overlap", oracle.inside(
-        [(t["start_date"], t["end_date"]) for t in b], (c["start_date"], c["end_date"]), "SQLite batch inside the SQLite CDC run")))
+        v.grade(
+            f"{name}/{dag}/run",
+            ([f"run {states.get(dag)}"] if states.get(dag) != "success" else []) + ([f"tasks {bad}"] if bad else []),
+            ok=f"run {states.get(dag)}",
+        )
+    c, b = (
+        tasks["gate_cdc_sqlite"].get("run", {}),
+        [tasks["gate_batch_sqlite"].get(t, {}) for t in RIVET_TASKS["gate_batch_sqlite"]],
+    )
+    v.guard(
+        f"{name}/sqlite-two-writers-overlap",
+        lambda: v.grade(
+            f"{name}/sqlite-two-writers-overlap",
+            oracle.inside(
+                [(t["start_date"], t["end_date"]) for t in b],
+                (c["start_date"], c["end_date"]),
+                "SQLite batch inside the SQLite CDC run",
+            ),
+        ),
+    )
 
     con = oracle.connect(stand.source_dsn)
     try:
-        by_dir = {state: {kind: sorted(f for f in new if f"/{kind}_{state}/" in f) for kind in ("batch", "cdc")} for state in STATES}
+        by_dir = {
+            state: {kind: sorted(f for f in new if f"/{kind}_{state}/" in f) for kind in ("batch", "cdc")} for state in STATES
+        }
         for state in STATES:
             for table, (short, cols) in TABLES.items():
                 src = f"src.public.{table}"
                 mine = [f for f in new if f"/batch_{state}/{short}/" in f]
                 every = sorted(f for f in files_after if f"/batch_{state}/{short}/" in f)
                 cell = f"{name}/batch/{state}/{short}"
-                v.guard(cell + "/delta-values", lambda: v.grade(cell + "/delta-values", oracle.batch_delta(
-                    con, sorted(mine), src, cols, "updated_at", high_water.get(table)), ok=f"{oracle.rows_in(con, mine)} row(s)"))
-                v.guard(cell + "/latest-equals-source", lambda: v.grade(cell + "/latest-equals-source", oracle.batch_latest(
-                    con, every, src, cols, "id", "updated_at", DELETED_BY_BATCH[name] if table == "gate_orders" else 0)))
+                v.guard(
+                    cell + "/delta-values",
+                    lambda: v.grade(
+                        cell + "/delta-values",
+                        oracle.batch_delta(con, sorted(mine), src, cols, "updated_at", high_water.get(table)),
+                        ok=f"{oracle.rows_in(con, mine)} row(s)",
+                    ),
+                )
+                v.guard(
+                    cell + "/latest-equals-source",
+                    lambda: v.grade(
+                        cell + "/latest-equals-source",
+                        oracle.batch_latest(
+                            con, every, src, cols, "id", "updated_at", DELETED_BY_BATCH[name] if table == "gate_orders" else 0
+                        ),
+                    ),
+                )
                 xcom = v.guard(cell + "/xcom-rows", lambda: stand.xcom(f"gate_batch_{state}", run_id, f"apply.{state}_{short}"))
                 if xcom is not None:
-                    v.grade(cell + "/xcom-rows", oracle.same_count(sum(u.get("rows") or 0 for u in xcom["units"]),
-                                                                    oracle.rows_in(con, mine), cell),
-                            ok=f"degraded {xcom.get('degraded')}")
+                    v.grade(
+                        cell + "/xcom-rows",
+                        oracle.same_count(sum(u.get("rows") or 0 for u in xcom["units"]), oracle.rows_in(con, mine), cell),
+                        ok=f"degraded {xcom.get('degraded')}",
+                    )
                 cursors = v.guard(cell + "/stored-cursor", lambda: stored_cursors(stand, state))
                 if cursors is not None:
                     top = con.execute(f"SELECT max(updated_at) FROM {src}").fetchone()[0]
@@ -204,21 +249,31 @@ def run_cycle(stand: Stand, v: Verdicts, n: int, name: str, changes: str | None,
             for table, (_, cols) in TABLES.items():
                 cell = f"{name}/cdc/{state}/{table}"
                 stream_new = [f for f in cdc_new if f"/{table}/" in f and "/snapshot/" not in f]
-                v.guard(cell + "/operations", lambda: v.grade(cell + "/operations", oracle.cdc_ops(con, stream_new, ops[table], cell)))
+                v.guard(
+                    cell + "/operations", lambda: v.grade(cell + "/operations", oracle.cdc_ops(con, stream_new, ops[table], cell))
+                )
                 snapshot = sorted(f for f in files_after if f"/cdc_{state}/{table}/snapshot/" in f)
                 stream = [[f for f in run if f"/{table}/" in f] for run in history[state]]
-                v.guard(cell + "/replay-equals-source", lambda: v.grade(cell + "/replay-equals-source", oracle.cdc_replay(
-                    con, snapshot, stream, f"src.public.{table}", cols, "id")))
+                v.guard(
+                    cell + "/replay-equals-source",
+                    lambda: v.grade(
+                        cell + "/replay-equals-source",
+                        oracle.cdc_replay(con, snapshot, stream, f"src.public.{table}", cols, "id"),
+                    ),
+                )
             xcom = v.guard(f"{name}/cdc/{state}/xcom-rows", lambda: stand.xcom(f"gate_cdc_{state}", run_id, "run"))
             if xcom is not None:
-                v.grade(f"{name}/cdc/{state}/xcom-rows", oracle.same_count(sum(u.get("rows") or 0 for u in xcom["units"]),
-                                                                           oracle.rows_in(con, cdc_new), f"cdc {state}"),
-                        ok=f"degraded {xcom.get('degraded')}")
+                v.grade(
+                    f"{name}/cdc/{state}/xcom-rows",
+                    oracle.same_count(
+                        sum(u.get("rows") or 0 for u in xcom["units"]), oracle.rows_in(con, cdc_new), f"cdc {state}"
+                    ),
+                    ok=f"degraded {xcom.get('degraded')}",
+                )
         marks = {t: con.execute(f"SELECT max(updated_at) FROM src.public.{t}").fetchone()[0] for t in TABLES}
     finally:
         con.close()
     return files_after, marks
-
 
 
 def play(stand: Stand, v: Verdicts, sabotage: str | None) -> None:
