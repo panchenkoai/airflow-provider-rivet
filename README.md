@@ -514,3 +514,26 @@ The tests need no rivet binary and no running Airflow: a fake `rivet` script rep
 scenario (and enforces rivet's own `query_file` rule, tied to the Rust source by a test).
 `tests/test_dag_runs.py` runs the builders' DAGs through `dag.test()` against a SQLite metadata
 database created in a throwaway `AIRFLOW_HOME`, with real task instances and trigger rules.
+
+## Live gate
+
+`gate/` runs this provider and a rivet Linux binary in real Airflow 2.10.5 and 3.3.2 stacks (the official
+compose files, Celery) and grades the result with oracles, never with rivet's own report:
+
+```bash
+uv run --only-group gate python -m gate --rivet-bin /path/to/linux/rivet            # both Airflow versions
+uv run --only-group gate python -m gate --rivet-bin ./rivet --airflow 3.3.2 --keep  # one stack, left up
+uv run --only-group gate python -m pytest -q gate/tests                             # the oracles, RED on every mutant
+```
+
+Per stack: four DAGs (incremental batch and CDC with `initial: snapshot`, each on a shared SQLite state and on
+a TLS PostgreSQL state), three cycles (initial load, a delta of inserts / updates / deletes, an idle run). The
+SQLite CDC run pauses at `cdc_after_open` and the SQLite batch run must finish inside that window, so the two
+writers on one SQLite file overlap on every cycle. Oracles: DuckDB over the Parquet against the source read by
+DuckDB's postgres scanner (delta == source rows past the previous high-water; newest version per key == source;
+CDC snapshot + changes replayed by `__seq` == source; exact operation counts), the stored cursor read by a plain
+SQLite / psql client, and the Airflow REST API (run and task states, XCom rows == rows in the files).
+`--sabotage drop-delta-file` must turn it red. Each stack is torn down with its volumes before and after.
+
+rivet's release gate runs it on every release candidate (`dev/release_oracle/airflow_provider.py`, pinned by
+`dev/release_oracle/airflow-provider.ref`); the `Live gate` workflow here runs it against a released binary.
