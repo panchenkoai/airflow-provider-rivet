@@ -66,6 +66,16 @@ jobs:
         env:
           RIVET_SRC: rivet
 
+  gate-oracles:
+    name: Gate oracles (RED on every mutant)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/install-action@v2.87.22
+        with:
+          tool: uv
+      - run: uv run --only-group gate python -m pytest -q gate/tests
+
   build:
     name: Build sdist and wheel
     runs-on: ubuntu-latest

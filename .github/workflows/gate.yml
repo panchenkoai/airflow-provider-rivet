@@ -1,0 +1,44 @@
+name: Live gate
+
+# The live Airflow gate (python -m gate) against a released rivet binary: on demand, and before a provider release.
+# rivet's own release gate runs the same scenario against its candidate build (dev/release_oracle/airflow_provider.py).
+
+on:
+  workflow_dispatch:
+    inputs:
+      rivet:
+        description: "rivet release tag (default: the latest release)"
+        required: false
+  push:
+    tags: ["airflow-v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  gate:
+    name: Airflow 2.10.5 and 3.3.2 on rivet ${{ inputs.rivet || 'latest' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/install-action@v2.87.22
+        with:
+          tool: uv
+      - name: Download the rivet Linux binary
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ inputs.rivet }}"
+          [ -n "$tag" ] || tag=$(gh release view -R panchenkoai/rivet --json tagName -q .tagName)
+          gh release download "$tag" -R panchenkoai/rivet -p "rivet-$tag-x86_64-unknown-linux-gnu.tar.gz" -D rivet-dl
+          tar -xzf rivet-dl/*.tar.gz -C rivet-dl
+          find rivet-dl -type f -name rivet -exec cp {} ./rivet-bin \;
+          chmod +x rivet-bin
+      - run: uv run --only-group gate python -m gate --rivet-bin ./rivet-bin --verdicts verdicts.jsonl
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gate-verdicts
+          path: verdicts.jsonl
+          if-no-files-found: ignore
