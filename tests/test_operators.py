@@ -15,8 +15,8 @@ from airflow.exceptions import AirflowException, AirflowFailException, AirflowSk
 from conftest import NEW_FLAGS, SECRET, FakeTI, Rig, fixture
 
 from airflow_provider_rivet import invocation
-from airflow_provider_rivet.invocation import ENV_ALLOWLIST, crashed_retry_allowed
 from airflow_provider_rivet.dags import read_plan_layout
+from airflow_provider_rivet.invocation import ENV_ALLOWLIST, crashed_retry_allowed
 from airflow_provider_rivet.operators import (
     RivetApplyOperator,
     RivetBaseOperator,
@@ -64,8 +64,16 @@ def test_apply_success_on_todays_binary(rig: Rig) -> None:
     assert all(c["cwd"] == str(rig.config_dir.resolve()) for c in rig.calls())
     assert payload["decision"] == "success" and payload["degraded"] == OLD_BATCH
     assert payload["units"] == [
-        {"export": "orders", "table": None, "status": "success", "run_id": "orders_1", "rows": 500, "files": 1,
-         "stop_reason": None, "error": None}
+        {
+            "export": "orders",
+            "table": None,
+            "status": "success",
+            "run_id": "orders_1",
+            "rows": 500,
+            "files": 1,
+            "stop_reason": None,
+            "error": None,
+        }
     ]
     assert Path(payload["stderr_path"]).is_relative_to(rig.state_dir / "logs")
     assert SECRET in Path(payload["stderr_path"]).read_text()
@@ -75,7 +83,10 @@ def test_apply_success_on_todays_binary(rig: Rig) -> None:
 
 
 def test_apply_on_a_binary_with_the_contract_flags_passes_them_and_degrades_nothing(rig: Rig) -> None:
-    rig.scenario(flags=NEW_FLAGS, apply={"summary": {"per_export": [entry("orders", rows=7, files=1, error=None, stop_reason=None, tables=None)]}})
+    rig.scenario(
+        flags=NEW_FLAGS,
+        apply={"summary": {"per_export": [entry("orders", rows=7, files=1, error=None, stop_reason=None, tables=None)]}},
+    )
     payload, _ = rig.run(rig.operator(RivetApplyOperator, export="orders", lock_wait=30))
     apply = rig.argv("apply")
     assert apply[2:] == ["--summary-output", apply[3], "--json-errors", "--no-notify", "--lock-wait", "30"]
@@ -100,7 +111,12 @@ def test_a_coded_refusal_fails_without_retry_and_keeps_the_message_out(rig: Rig)
     payload = ti.store[("task", "return_value")]
     assert payload["decision"] == "fail" and "error_object" in payload["degraded"]
     assert payload["units"][0]["error"] == {
-        "code": "RIVET_SOURCE_CDC_LOG_GAP", "kind": None, "class": "refusal", "exit_code": 5, "retryable": False, "action": None,
+        "code": "RIVET_SOURCE_CDC_LOG_GAP",
+        "kind": None,
+        "class": "refusal",
+        "exit_code": 5,
+        "retryable": False,
+        "action": None,
     }
     assert rig.events("rivet.unit")[0]["class"] == "refusal"
     assert_no_secret(rig, payload)
@@ -108,7 +124,10 @@ def test_a_coded_refusal_fails_without_retry_and_keeps_the_message_out(rig: Rig)
 
 def test_a_contract_refusal_carries_its_action_into_the_exception(rig: Rig) -> None:
     line = fixture("json_errors.json")
-    rig.scenario(flags=NEW_FLAGS, run={"exit": 5, "line": line, "summary": {"per_export": [fixture("run_entry_failed.json"), entry("events", "failed")]}})
+    rig.scenario(
+        flags=NEW_FLAGS,
+        run={"exit": 5, "line": line, "summary": {"per_export": [fixture("run_entry_failed.json"), entry("events", "failed")]}},
+    )
     exc, ti = rig.run(rig.operator(RivetRunOperator))
     assert isinstance(exc, AirflowFailException) and "restore the missing log" in str(exc)
     payload = ti.store[("task", "return_value")]
@@ -240,7 +259,10 @@ def test_one_failed_and_one_successful_export_in_one_summary(rig: Rig) -> None:
     assert not Path(run[4]).exists(), "the summary file is removed after it is read"
     assert isinstance(exc, AirflowFailException) and str(exc) == "generic (orders)"
     payload = ti.store[("task", "return_value")]
-    assert [(u["export"], u["status"], u["rows"]) for u in payload["units"]] == [("users", "success", 500), ("orders", "failed", 0)]
+    assert [(u["export"], u["status"], u["rows"]) for u in payload["units"]] == [
+        ("users", "success", 500),
+        ("orders", "failed", 0),
+    ]
     assert payload["units"][0]["error"] is None and payload["units"][1]["error"]["class"] == "generic"
     assert len(rig.events("rivet.unit")) == 2
     assert_no_secret(rig, payload)
@@ -276,10 +298,25 @@ def test_load_on_todays_binary_runs_a_single_export_copy_of_the_config(rig: Rig)
     text = narrowed.read_text()
     assert "name: users" in text and "name: orders" not in text and "url_env: RIVET_PG_URL" in text
     assert payload["units"] == [
-        {"export": "users", "table": "users", "status": "loaded", "run_id": None, "rows": None, "files": None,
-         "stop_reason": None, "error": None}
+        {
+            "export": "users",
+            "table": "users",
+            "status": "loaded",
+            "run_id": None,
+            "rows": None,
+            "files": None,
+            "stop_reason": None,
+            "error": None,
+        }
     ]
-    assert payload["degraded"] == ["load_filter", "load_result", "load_table_filter", "lock_wait", "no_notify", "state_url_sqlite"]
+    assert payload["degraded"] == [
+        "load_filter",
+        "load_result",
+        "load_table_filter",
+        "lock_wait",
+        "no_notify",
+        "state_url_sqlite",
+    ]
     assert (rig.state_dir / "airflow" / "locks" / "users.lock").exists()
 
 
@@ -305,7 +342,9 @@ def test_the_per_table_tasks_of_one_export_wait_for_the_export_lock(rig: Rig) ->
 
 
 def test_load_on_a_contract_binary_filters_by_flag_and_reads_the_result(rig: Rig) -> None:
-    rig.scenario(flags=NEW_FLAGS, load={"exit": 2, "line": fixture("json_errors_load.json"), "summary": fixture("load_result.json")})
+    rig.scenario(
+        flags=NEW_FLAGS, load={"exit": 2, "line": fixture("json_errors_load.json"), "summary": fixture("load_result.json")}
+    )
     exc, ti = rig.run(rig.operator(RivetLoadOperator, export="events", table="events"))
     load = rig.argv("load")
     assert load[:7] == ["load", "--config", str(rig.copy()), "--export", "events", "--table", "events"]
@@ -333,9 +372,12 @@ def test_a_compaction_rivet_reports_as_skipped_is_an_airflow_skip(rig: Rig) -> N
 
 def test_plan_swaps_the_layout_file_in_only_when_the_builder_can_read_it(rig: Rig) -> None:
     target = rig.tmp / "pg.plan.json"
-    target.write_text("[\"old\"]")
+    target.write_text('["old"]')
     target.chmod(0o640)
-    campaign = {"waves": [{"wave": 1, "exports": ["orders"]}], "ordered_exports": [{"export_name": "orders", "cost_class": "low"}]}
+    campaign = {
+        "waves": [{"wave": 1, "exports": ["orders"]}],
+        "ordered_exports": [{"export_name": "orders", "cost_class": "low"}],
+    }
     layout = [{"export_name": "orders", "prioritization": {"campaign": campaign}}]
     for unusable in ([], [{"export_name": "orders"}], {"not": "a list"}, [{"prioritization": {"campaign": {"waves": "x"}}}]):
         rig.scenario(plan_list=unusable)
@@ -360,18 +402,33 @@ def test_stderr_reaches_the_task_log_only_on_request(rig: Rig) -> None:
 
 
 def test_a_connection_becomes_an_env_url_and_is_never_a_rendered_field(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
-    conn = SimpleNamespace(conn_type="postgres", login="rivet", password="p@ss/w:rd", host="db", port=5432, schema="app",
-                           extra_dejson={"rivet_params": "sslmode=require"})
+    conn = SimpleNamespace(
+        conn_type="postgres",
+        login="rivet",
+        password="p@ss/w:rd",
+        host="db",
+        port=5432,
+        schema="app",
+        extra_dejson={"rivet_params": "sslmode=require"},
+    )
     assert connection_url(conn) == "postgresql://rivet:p%40ss%2Fw%3Ard@db:5432/app?sslmode=require"
-    assert connection_url(SimpleNamespace(conn_type="mssql", login=None, password=None, host="h", port=None, schema="d",
-                                          extra_dejson={})) == "sqlserver://h/d"
-    generic = SimpleNamespace(conn_id="rivet_pg", conn_type="generic", login="u", password="p", host="h", port=1, schema="d", extra_dejson={})
+    assert (
+        connection_url(
+            SimpleNamespace(conn_type="mssql", login=None, password=None, host="h", port=None, schema="d", extra_dejson={})
+        )
+        == "sqlserver://h/d"
+    )
+    generic = SimpleNamespace(
+        conn_id="rivet_pg", conn_type="generic", login="u", password="p", host="h", port=1, schema="d", extra_dejson={}
+    )
     assert connection_url(generic, "postgresql") == "postgresql://u:p@h:1/d"
     monkeypatch.setattr("airflow_provider_rivet.operators.BaseHook.get_connection", lambda conn_id: generic)
     exc, ti = rig.run(rig.operator(RivetRunOperator, export="orders", env={}, env_from_connections={"RIVET_PG_URL": "rivet_pg"}))
     assert isinstance(exc, AirflowFailException) and not rig.calls(), "a connection type that names no rivet scheme is refused"
     assert ti.store[("task", "return_value")]["preflight_refusal"] == "RIVET_AIRFLOW_CONNECTION_SCHEME"
-    explicit = rig.operator(RivetRunOperator, export="orders", env={}, env_from_connections={"RIVET_PG_URL": ("rivet_pg", "postgresql")})
+    explicit = rig.operator(
+        RivetRunOperator, export="orders", env={}, env_from_connections={"RIVET_PG_URL": ("rivet_pg", "postgresql")}
+    )
     rig.run(explicit)
     assert rig.calls()[-1]["env"]["RIVET_PG_URL"] == "postgresql://u:p@h:1/d"
     monkeypatch.setattr("airflow_provider_rivet.operators.BaseHook.get_connection", lambda conn_id: conn)
@@ -425,7 +482,9 @@ def test_log_files_are_private_and_only_the_last_tries_of_a_task_are_kept(rig: R
     assert folder == rig.state_dir / "logs" / "dag" / invocation.hashed_name("task") and folder.name == "task-9aae63ebb719"
     assert not list(folder.glob("*try1.*")) and len(list(folder.glob("*try3.*"))) >= 3, "a try's files go together"
     assert all(mode(f) == 0o600 for f in folder.iterdir())
-    assert all(mode(d) == 0o700 for d in (folder, rig.state_dir / "logs", rig.state_dir / "airflow", rig.state_dir / "airflow" / "dag"))
+    assert all(
+        mode(d) == 0o700 for d in (folder, rig.state_dir / "logs", rig.state_dir / "airflow", rig.state_dir / "airflow" / "dag")
+    )
     other = rig.operator(RivetRunOperator, task_id="other", export="users", log_keep=2)
     rig.run(other, FakeTI(task_id="other"))
     assert all(p.exists() for p in paths[1:]), "another task's files do not count against this one"
@@ -440,9 +499,18 @@ def test_log_files_are_private_and_only_the_last_tries_of_a_task_are_kept(rig: R
 def test_the_subprocess_gets_the_allow_list_and_what_the_operator_declares_and_nothing_else(
     rig: Rig, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    secrets = {"AIRFLOW__CORE__FERNET_KEY": "k", "MY_DB_PASSWORD": "p", "AWS_SECRET_ACCESS_KEY": "a",
-               "GOOGLE_APPLICATION_CREDENTIALS": "/g.json", "AZURE_CLIENT_SECRET": "z", "RIVET_OTHER_URL": "u",
-               "HOMEBREW_GITHUB_API_TOKEN": "h", "LANGSMITH_API_KEY": "l", "PATH_SECRET": "s", "TZ_TOKEN": "t"}
+    secrets = {
+        "AIRFLOW__CORE__FERNET_KEY": "k",
+        "MY_DB_PASSWORD": "p",
+        "AWS_SECRET_ACCESS_KEY": "a",
+        "GOOGLE_APPLICATION_CREDENTIALS": "/g.json",
+        "AZURE_CLIENT_SECRET": "z",
+        "RIVET_OTHER_URL": "u",
+        "HOMEBREW_GITHUB_API_TOKEN": "h",
+        "LANGSMITH_API_KEY": "l",
+        "PATH_SECRET": "s",
+        "TZ_TOKEN": "t",
+    }
     allowed = {"TZ": "UTC", "LC_ALL": "C", "HTTPS_PROXY": "http://proxy:3128", "SSL_CERT_FILE": "/ca.pem"}
     for name, value in {**secrets, **allowed}.items():
         monkeypatch.setenv(name, value)
@@ -450,7 +518,9 @@ def test_the_subprocess_gets_the_allow_list_and_what_the_operator_declares_and_n
     keys = set(rig.calls()[-1]["env_keys"])
     assert {"PATH", "HOME", "RIVET_PG_URL", *allowed} <= keys
     assert not keys & set(secrets), "a variable of the worker that is not on the allow-list must not reach rivet"
-    wide = rig.operator(RivetRunOperator, export="orders", env_passthrough=["RIVET_OTHER_*", "MY_DB_PASSWORD"], cloud_credentials=["aws", "gcp"])
+    wide = rig.operator(
+        RivetRunOperator, export="orders", env_passthrough=["RIVET_OTHER_*", "MY_DB_PASSWORD"], cloud_credentials=["aws", "gcp"]
+    )
     rig.run(wide)
     keys = set(rig.calls()[-1]["env_keys"])
     assert {"RIVET_OTHER_URL", "MY_DB_PASSWORD", "AWS_SECRET_ACCESS_KEY", "GOOGLE_APPLICATION_CREDENTIALS"} <= keys
@@ -478,15 +548,29 @@ def test_exit_0_with_a_failed_unit_in_the_summary_is_a_failed_task(rig: Rig) -> 
 def test_a_task_with_several_failed_units_and_exit_0_is_classified_by_the_worst(rig: Rig) -> None:
     retry = {"class": "retryable", "retryable": True, "exit_code": 2, "code": None, "kind": None, "action": None, "message": "m"}
     refusal = {**retry, "class": "refusal", "retryable": False, "exit_code": 5, "code": "RIVET_X"}
-    mixed = [entry("users", "failed", error=retry), entry("orders", "failed", error=refusal), entry("events", "failed", error=retry)]
+    mixed = [
+        entry("users", "failed", error=retry),
+        entry("orders", "failed", error=refusal),
+        entry("events", "failed", error=retry),
+    ]
     rig.scenario(flags=NEW_FLAGS, run={"exit": 0, "summary": {"per_export": mixed}})
     exc, ti = rig.run(rig.operator(RivetRunOperator))
     assert isinstance(exc, AirflowFailException) and ti.store[("task", "return_value")]["error"]["class"] == "refusal"
     rig.scenario(flags=NEW_FLAGS, run={"exit": 0, "summary": {"per_export": [mixed[0], mixed[2]]}})
     exc, ti = rig.run(rig.operator(RivetRunOperator))
     assert type(exc) is AirflowException and ti.store[("task", "return_value")]["decision"] == "retry"
-    rig.scenario(flags=NEW_FLAGS, load={"exit": 0, "summary": {"run_id": "r", "per_table": [
-        {"export": "users", "table": "users", "status": "failed", "rows": None, "error": refusal, "skip_reason": None}]}})
+    rig.scenario(
+        flags=NEW_FLAGS,
+        load={
+            "exit": 0,
+            "summary": {
+                "run_id": "r",
+                "per_table": [
+                    {"export": "users", "table": "users", "status": "failed", "rows": None, "error": refusal, "skip_reason": None}
+                ],
+            },
+        },
+    )
     exc, _ = rig.run(rig.operator(RivetLoadOperator, export="users", table="users"))
     assert isinstance(exc, AirflowFailException)
 
@@ -499,7 +583,10 @@ def test_a_failures_entry_without_retryable_and_junk_in_the_summary_do_not_raise
     assert isinstance(exc, AirflowFailException), exc
     payload = ti.store[("task", "return_value")]
     assert "result_malformed" in payload["degraded"] and payload["error"]["class"] == "refusal"
-    assert [(u["export"], u["status"], u["error"]["class"]) for u in payload["units"]] == [("orders", "failed", "refusal"), ("users", "failed", "refusal")]
+    assert [(u["export"], u["status"], u["error"]["class"]) for u in payload["units"]] == [
+        ("orders", "failed", "refusal"),
+        ("users", "failed", "refusal"),
+    ]
 
 
 @pytest.mark.parametrize(
@@ -539,8 +626,16 @@ def test_the_error_object_is_found_behind_trailing_stderr_lines(rig: Rig) -> Non
 
 def test_connection_url_keeps_a_lone_password_brackets_ipv6_and_reads_the_oracle_service_name() -> None:
     def conn(**fields: object) -> SimpleNamespace:
-        base = {"conn_id": "c", "conn_type": "mysql", "login": None, "password": None, "host": "h", "port": None,
-                "schema": "d", "extra_dejson": {}}
+        base = {
+            "conn_id": "c",
+            "conn_type": "mysql",
+            "login": None,
+            "password": None,
+            "host": "h",
+            "port": None,
+            "schema": "d",
+            "extra_dejson": {},
+        }
         return SimpleNamespace(**{**base, **fields})
 
     assert connection_url(conn(password="p@ss")) == "mysql://:p%40ss@h/d"
@@ -555,7 +650,9 @@ def test_a_declared_env_value_wins_over_the_workers_value_for_the_same_name(rig:
     monkeypatch.setenv("TZ", "UTC")
     monkeypatch.setenv("RIVET_PG_URL", "postgresql://worker-value/db")
     rig.scenario(record_env=["RIVET_PG_URL", "TZ"])
-    op = rig.operator(RivetRunOperator, export="orders", env={"RIVET_PG_URL": SECRET, "TZ": "Asia/Tokyo"}, env_passthrough=["RIVET_PG_URL"])
+    op = rig.operator(
+        RivetRunOperator, export="orders", env={"RIVET_PG_URL": SECRET, "TZ": "Asia/Tokyo"}, env_passthrough=["RIVET_PG_URL"]
+    )
     rig.run(op)
     assert rig.calls()[-1]["env"] == {"RIVET_PG_URL": SECRET, "TZ": "Asia/Tokyo"}
 
@@ -570,12 +667,19 @@ def test_an_older_wider_log_file_and_directory_are_made_private(rig: Rig) -> Non
         wide.chmod(0o777 if wide.is_dir() else 0o666)
     again = Path(rig.run(op)[0]["stderr_path"])
     assert again == first and mode(first) == 0o600, "a file of the same name left wider by an earlier writer is tightened"
-    assert [mode(d) for d in (first.parent, first.parent.parent, rig.state_dir / "logs", rig.state_dir / "airflow")] == [0o700] * 4
+    assert [mode(d) for d in (first.parent, first.parent.parent, rig.state_dir / "logs", rig.state_dir / "airflow")] == [
+        0o700
+    ] * 4
 
 
 def test_a_path_name_is_readable_and_never_shared_by_two_different_names() -> None:
     name = invocation.path_name
-    assert [name(n) for n in ("orders", "apply.orders_cdc", "manual__2026-10-06", "9x")] == ["orders", "apply.orders_cdc", "manual__2026-10-06", "9x"]
+    assert [name(n) for n in ("orders", "apply.orders_cdc", "manual__2026-10-06", "9x")] == [
+        "orders",
+        "apply.orders_cdc",
+        "manual__2026-10-06",
+        "9x",
+    ]
     cyrillic = ("\u0437\u0430\u043a\u0430\u0437\u044b", "\u043a\u043b\u0438\u0435\u043d\u0442\u044b")
     hostile = ["a:b", "a+b", "a_b", "a b", "A_b", "", ".", "..", ".hidden", "-x", "x" * 300, "x" * 301, *cyrillic]
     hostile += [name(n) for n in ("a:b", *cyrillic)] + ["a/../../b", "a\x00b", "a\nb"]
@@ -605,7 +709,9 @@ def test_two_exports_whose_names_sanitise_to_one_get_their_own_plan_and_are_both
         payload, _ = rig.run(rig.operator(RivetApplyOperator, task_id="t", export=n))
         assert payload["decision"] == "success" and [u["export"] for u in payload["units"]] == [n]
     steps = [(c["argv"][0], c["export"]) for c in rig.calls() if c["argv"][0] != "metrics"]
-    assert steps == [("plan", one), ("apply", one), ("plan", two), ("apply", two)], "each export is planned and applies its own plan"
+    assert steps == [("plan", one), ("apply", one), ("plan", two), ("apply", two)], (
+        "each export is planned and applies its own plan"
+    )
     artifacts = [c["argv"][1] for c in rig.calls() if c["argv"][0] == "apply"]
     assert artifacts[0].lower() != artifacts[1].lower()
     assert [json.loads(Path(a).read_text())["export_name"] for a in artifacts] == [one, two]
@@ -621,7 +727,10 @@ def test_two_exports_whose_names_sanitise_to_one_get_their_own_plan_and_are_both
     [
         [{"dag_id": "\u043f\u0440\u043e\u0434\u0430\u0436\u0438"}, {"dag_id": "\u0441\u043a\u043b\u0430\u0434"}],
         [{"dag_id": "Sales"}, {"dag_id": "sales"}],
-        [{"task_id": "load.\u0437\u0430\u043a\u0430\u0437\u044b"}, {"task_id": "load.\u043a\u043b\u0438\u0435\u043d\u0442\u044b"}],
+        [
+            {"task_id": "load.\u0437\u0430\u043a\u0430\u0437\u044b"},
+            {"task_id": "load.\u043a\u043b\u0438\u0435\u043d\u0442\u044b"},
+        ],
         [{"task_id": "load", "map_index": 1}, {"task_id": "load-1"}],
         [{"task_id": "load", "map_index": 1}, {"task_id": "load.1"}],
         [{"task_id": "load", "map_index": 1}, {"task_id": "load_1"}],
@@ -630,8 +739,18 @@ def test_two_exports_whose_names_sanitise_to_one_get_their_own_plan_and_are_both
         [{"task_id": "Task"}, {"task_id": "task"}],
         [{"run_id": "manual__2026-10-06T00:00:00+00:00"}, {"run_id": "manual__2026-10-06T00_00_00_00_00"}],
     ],
-    ids=["dag-non-ascii", "dag-case", "task-non-ascii", "mapped-task", "mapped-task-dot", "mapped-task-underscore",
-         "mapped-indexes", "two-tasks", "task-case", "run-id"],
+    ids=[
+        "dag-non-ascii",
+        "dag-case",
+        "task-non-ascii",
+        "mapped-task",
+        "mapped-task-dot",
+        "mapped-task-underscore",
+        "mapped-indexes",
+        "two-tasks",
+        "task-case",
+        "run-id",
+    ],
 )
 def test_two_dags_tasks_or_runs_whose_ids_sanitise_to_one_share_no_artifact_log_or_ledger(rig: Rig, ids: list) -> None:
     def ti(which: int, try_number: int = 1) -> FakeTI:
@@ -707,17 +826,23 @@ def test_a_worker_state_url_the_task_does_not_pass_on_is_refused_before_rivet_st
     passed = rig.operator(RivetRunOperator, export="orders", env_passthrough=["RIVET_STATE_URL"])
     payload, _ = rig.run(passed)
     assert payload["decision"] == "success" and "state_url_sqlite" not in payload["degraded"]
-    declared = rig.operator(RivetRunOperator, export="orders", env={"RIVET_PG_URL": SECRET, "RIVET_STATE_URL": "postgresql://other/db"})
+    declared = rig.operator(
+        RivetRunOperator, export="orders", env={"RIVET_PG_URL": SECRET, "RIVET_STATE_URL": "postgresql://other/db"}
+    )
     rig.run(declared)
     assert [c["env"]["RIVET_STATE_URL"] for c in rig.calls()] == [STATE_URL, "postgresql://other/db"]
     monkeypatch.setenv("RIVET_STATE_URL", STATE_URL)
     opted_out, _ = rig.run(rig.operator(RivetRunOperator, export="orders", env={"RIVET_PG_URL": SECRET, "RIVET_STATE_URL": ""}))
-    assert opted_out["decision"] == "success" and "state_url_sqlite" in opted_out["degraded"], "a declared empty value is a decision"
+    assert opted_out["decision"] == "success" and "state_url_sqlite" in opted_out["degraded"], (
+        "a declared empty value is a decision"
+    )
     assert rig.calls()[-1]["env"]["RIVET_STATE_URL"] == ""
     for ignored in ("", " ", "sqlite:///tmp/x.db", "mysql://state-db/x", "Postgres://state-db/x", " postgresql://state-db/x"):
         monkeypatch.setenv("RIVET_STATE_URL", ignored)
         payload, _ = rig.run(rig.operator(RivetRunOperator, export="orders"))
-        assert isinstance(payload, dict) and payload["decision"] == "success", f"rivet does not use {ignored!r} as its state: {payload}"
+        assert isinstance(payload, dict) and payload["decision"] == "success", (
+            f"rivet does not use {ignored!r} as its state: {payload}"
+        )
         assert "state_url_sqlite" in payload["degraded"]
     for used in ("postgres://state-db/x", "postgresql://state-db/x"):
         monkeypatch.setenv("RIVET_STATE_URL", used)
@@ -743,7 +868,9 @@ def tenant_tasks(rig: Rig) -> list:
 
 def files_of(folder: Path) -> dict:
     """Every file below a directory with its bytes."""
-    return {str(p.relative_to(folder)): p.read_bytes() for p in sorted(folder.rglob("*")) if p.is_file() and "logs" not in p.parts}
+    return {
+        str(p.relative_to(folder)): p.read_bytes() for p in sorted(folder.rglob("*")) if p.is_file() and "logs" not in p.parts
+    }
 
 
 def refused_twice(rig: Rig, op: object, artifact: Path, *said: str) -> None:
@@ -766,13 +893,17 @@ def test_two_configs_with_one_export_name_in_one_run_each_plan_and_apply_their_o
         payload, _ = rig.run(op)
         assert payload["decision"] == "success"
     steps = [c["argv"] for c in rig.calls() if c["argv"][0] in ("plan", "apply")]
-    assert [s[0] for s in steps] == ["plan", "apply", "plan", "apply"], "the second config is planned, not served the first one's plan"
+    assert [s[0] for s in steps] == ["plan", "apply", "plan", "apply"], (
+        "the second config is planned, not served the first one's plan"
+    )
     configs = [s[s.index("--config") + 1] for s in steps if s[0] == "plan"]
     artifacts = [Path(s[1]) for s in steps if s[0] == "apply"]
     assert configs == [str(rig.copy(config=Path(op.config))) for op in (one, two)] and configs[0] != configs[1]
     assert artifacts[0] != artifacts[1]
     assert [json.loads(a.read_text())["config_path"] for a in artifacts] == [str(Path(c).resolve()) for c in configs]
-    assert [mode(d) for d in (artifacts[0].parent, artifacts[0].parent.parent)] == [0o700, 0o700], "plans/ and plans/<run>/ are private"
+    assert [mode(d) for d in (artifacts[0].parent, artifacts[0].parent.parent)] == [0o700, 0o700], (
+        "plans/ and plans/<run>/ are private"
+    )
     rig.run(two, FakeTI(task_id=two.task_id, try_number=2))
     steps = [c["argv"] for c in rig.calls() if c["argv"][0] in ("plan", "apply")]
     assert [s[0] for s in steps][4:] == ["apply"] and steps[4][1] == str(artifacts[1]), "a retry replays its own task's plan"
@@ -827,10 +958,15 @@ def test_a_sealed_plan_of_another_config_is_refused_and_refused_again_on_the_ret
     rig.run(two)
     theirs, mine = [Path(c["argv"][1]) for c in rig.calls() if c["argv"][0] == "apply"]
     mine.write_text(theirs.read_text())
-    refused_twice(rig, two, mine, str(rig.copy(config=Path(one.config)).resolve()), str(rig.copy(config=Path(two.config)).resolve()))
+    refused_twice(
+        rig, two, mine, str(rig.copy(config=Path(one.config)).resolve()), str(rig.copy(config=Path(two.config)).resolve())
+    )
     mine.unlink()
     payload, _ = rig.run(two, FakeTI(task_id=two.task_id, try_number=4))
-    assert payload["decision"] == "success" and json.loads(mine.read_text())["config_path"] != json.loads(theirs.read_text())["config_path"]
+    assert (
+        payload["decision"] == "success"
+        and json.loads(mine.read_text())["config_path"] != json.loads(theirs.read_text())["config_path"]
+    )
 
 
 def other_case(rig: Rig) -> Path:
@@ -901,8 +1037,18 @@ def test_another_exports_query_file_edited_between_two_tries_replays_this_export
         {"config_path": "DROP"},
         {"export_name": "DROP", "config_path": "DROP"},
     ],
-    ids=["export-other", "export-case", "export-null", "export-absent", "config-other", "config-null", "config-empty",
-         "config-not-text", "config-absent", "both-absent"],
+    ids=[
+        "export-other",
+        "export-case",
+        "export-null",
+        "export-absent",
+        "config-other",
+        "config-null",
+        "config-empty",
+        "config-not-text",
+        "config-absent",
+        "both-absent",
+    ],
 )
 @pytest.mark.parametrize("expired", [False, True], ids=["unexpired", "expired"])
 def test_a_sealed_plan_with_an_identity_field_foreign_or_missing_is_refused_twice_expired_or_not(
@@ -937,7 +1083,9 @@ def test_the_scratch_files_of_two_tries_tasks_or_runs_are_separate_files(rig: Ri
             rig.run(op, ti)
     for sub in ("run", "apply", "load"):
         scratch = [c["argv"][c["argv"].index("--summary-output") + 1] for c in rig.calls() if c["argv"][0] == sub]
-        assert len(scratch) == 4 and len({s.lower() for s in scratch}) == 4, f"{sub}: a zombie try and its retry would share a result file"
+        assert len(scratch) == 4 and len({s.lower() for s in scratch}) == 4, (
+            f"{sub}: a zombie try and its retry would share a result file"
+        )
         assert not any(Path(s).exists() for s in scratch)
 
 

@@ -18,7 +18,9 @@ def full(error: ErrorObject) -> dict:
 
 
 def test_the_fixture_directory_is_the_repo_contract() -> None:
-    assert (FIXTURES / "xcom_unit.json").is_file(), f"contract fixtures not found at {FIXTURES}: set RIVET_SRC to a rivet checkout"
+    assert (FIXTURES / "xcom_unit.json").is_file(), (
+        f"contract fixtures not found at {FIXTURES}: set RIVET_SRC to a rivet checkout"
+    )
 
 
 def test_a_failed_run_entry_becomes_the_pinned_xcom_unit() -> None:
@@ -71,7 +73,13 @@ def test_no_built_object_is_retryable_unless_it_is_crashed() -> None:
 
 @pytest.mark.parametrize(
     "name",
-    ["json_errors.json", "json_errors_uncoded.json", "json_errors_crashed.json", "json_errors_mixed.json", "json_errors_load.json"],
+    [
+        "json_errors.json",
+        "json_errors_uncoded.json",
+        "json_errors_crashed.json",
+        "json_errors_mixed.json",
+        "json_errors_load.json",
+    ],
 )
 def test_a_contract_line_is_read_and_nothing_is_derived(name: str) -> None:
     line = fixture(name)
@@ -103,5 +111,7 @@ def test_every_degradation_is_documented_in_the_readme_and_every_recorded_key_is
     for key in DEGRADATIONS:
         assert f"| `{key}` |" in readme, f"README has no row for degradation `{key}`"
     source = "".join(p.read_text() for p in (package / "airflow_provider_rivet").glob("*.py"))
-    recorded = set(re.findall(r'degraded\.add\("([a-z_]+)"\)', source)) | set(re.findall(r'\*payload\["degraded"\], "([a-z_]+)"', source))
+    recorded = set(re.findall(r'degraded\.add\("([a-z_]+)"\)', source)) | set(
+        re.findall(r'\*payload\["degraded"\], "([a-z_]+)"', source)
+    )
     assert len(recorded) >= 14 and recorded == set(DEGRADATIONS), recorded ^ set(DEGRADATIONS)

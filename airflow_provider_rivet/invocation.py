@@ -12,10 +12,11 @@ import shutil
 import stat
 import subprocess
 import tempfile
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable, Mapping, Optional, Sequence
+from typing import Any
 
 from . import _yaml
 from .preflight import STATE_URL_ENV, Preflight, PreflightRefusal, run_preflight, state_kind
@@ -44,7 +45,7 @@ _LOG_FILE = re.compile(r"^(?P<attempt>.+)\.[a-z]+\.(?:stderr|stdout)\.log$")
 
 
 def worker_environment(
-    passthrough: Sequence[str] = (), clouds: Sequence[str] = (), environ: Optional[Mapping[str, str]] = None
+    passthrough: Sequence[str] = (), clouds: Sequence[str] = (), environ: Mapping[str, str] | None = None
 ) -> dict[str, str]:
     """The worker's variables a rivet process may inherit: the allow-list, plus the named extras."""
     patterns = [*ENV_ALLOWLIST, *passthrough, *(name for cloud in clouds for name in CLOUD_ENV[cloud])]
@@ -71,7 +72,7 @@ def path_name(*parts: Any) -> str:
     return hashed_name(*texts)
 
 
-def undeclared_state_variables(env: Mapping[str, str], environ: Optional[Mapping[str, str]] = None) -> list[str]:
+def undeclared_state_variables(env: Mapping[str, str], environ: Mapping[str, str] | None = None) -> list[str]:
     """The state variable, when the worker's value selects PostgreSQL state and the task's environment has no entry for it."""
     source = os.environ if environ is None else environ
     return [STATE_URL_ENV] if state_kind(source) == "postgres" and STATE_URL_ENV not in env else []
@@ -99,18 +100,18 @@ class Request:
     command: str
     config: str
     env: Mapping[str, str]
-    export: Optional[str] = None
-    table: Optional[str] = None
+    export: str | None = None
+    table: str | None = None
     rivet_bin: str = "rivet"
-    state_dir: Optional[str] = None
+    state_dir: str | None = None
     deployment: str = "auto"
     extra_args: Sequence[str] = ()
     lock_wait: int = 600
-    plan_file: Optional[str] = None
-    cwd: Optional[str] = None
-    stderr_dir: Optional[str] = None
+    plan_file: str | None = None
+    cwd: str | None = None
+    stderr_dir: str | None = None
     stream_stderr: bool = False
-    log_keep: Optional[int] = 10
+    log_keep: int | None = 10
     label: Sequence[Any] = ("dag", "run", "task", 1)
     upstream_markers: Sequence[str] = ()
 
@@ -121,15 +122,15 @@ class Outcome:
 
     command: str
     units: list[UnitResult] = field(default_factory=list)
-    error: Optional[ErrorObject] = None
-    exit_status: Optional[int] = 0
-    signal: Optional[int] = None
+    error: ErrorObject | None = None
+    exit_status: int | None = 0
+    signal: int | None = None
     degraded: list[str] = field(default_factory=list)
-    stderr_path: Optional[str] = None
+    stderr_path: str | None = None
     argv: list[list[str]] = field(default_factory=list)
-    marker: Optional[str] = None
-    rivet_version: Optional[str] = None
-    skip_reason: Optional[str] = None
+    marker: str | None = None
+    rivet_version: str | None = None
+    skip_reason: str | None = None
 
     @property
     def decision(self) -> str:
@@ -161,24 +162,24 @@ class Outcome:
 class _Step:
     """One finished rivet process."""
 
-    exit_status: Optional[int]
-    signal: Optional[int]
-    line: Optional[dict[str, Any]]
+    exit_status: int | None
+    signal: int | None
+    line: dict[str, Any] | None
     stdout_path: Path
 
 
 class _Session:
     """One task's invocation: its preflight result, working files and collected degradations."""
 
-    def __init__(self, request: Request, pf: Preflight, emit: Emit, on_process: Optional[Callable]) -> None:
+    def __init__(self, request: Request, pf: Preflight, emit: Emit, on_process: Callable | None) -> None:
         self.req = request
         self.pf = pf
         self.emit = emit
         self.on_process = on_process
         self.degraded: set[str] = set()
         self.argvs: list[list[str]] = []
-        self.stderr_path: Optional[str] = None
-        self.tmp: Optional[Path] = None
+        self.stderr_path: str | None = None
+        self.tmp: Path | None = None
         dag, run = (path_name(part) for part in request.label[:2])
         task = hashed_name(request.label[2])
         attempt = f"try{int(request.label[3])}"
@@ -207,7 +208,7 @@ class _Session:
         if self.req.log_keep is not None:
             _prune_logs(self.logs, max(1, self.req.log_keep))
 
-    def config_for(self, only_export: Optional[str]) -> str:
+    def config_for(self, only_export: str | None) -> str:
         """The config path rivet reads: a copy in the state directory, narrowed to one export when asked."""
         source = Path(self.req.config).resolve()
         target_dir = self.pf.state_dir
@@ -251,7 +252,7 @@ class _Session:
             self.degraded.add("lock_wait")
         return flags
 
-    def step(self, name: str, argv: list[str], stdout_to: Optional[Path] = None) -> _Step:
+    def step(self, name: str, argv: list[str], stdout_to: Path | None = None) -> _Step:
         """Run one rivet process with stdout and stderr sent to private files, and read its error line."""
         self.argvs.append(argv)
         stderr_path = self.logs / f"{self.log_name}.{name}.stderr.log"
@@ -276,7 +277,7 @@ class _Session:
         signal = -code if code < 0 else None
         return _Step(None if signal else code, signal, _error_line(text), stdout_path)
 
-    def classify(self, step: _Step) -> Optional[ErrorObject]:
+    def classify(self, step: _Step) -> ErrorObject | None:
         """The process-level error object: read when rivet printed a well-formed one, built from the exit when not."""
         if step.signal is None and step.exit_status == 0:
             return None
@@ -289,7 +290,7 @@ class _Session:
             self.degraded.add("result_malformed")
         return error_from_exit(step.exit_status, step.signal)
 
-    def unit_error(self, step: _Step, own: Any, export: Optional[str], table: Optional[str], shared: ErrorObject) -> ErrorObject:
+    def unit_error(self, step: _Step, own: Any, export: str | None, table: str | None, shared: ErrorObject) -> ErrorObject:
         """A failed unit's object: its own, its `failures[]` entry, or the process-level one (recorded)."""
         failures = (step.line or {}).get("failures")
         candidates = [own] if own is not None else []
@@ -306,7 +307,7 @@ class _Session:
         self.degraded.add("per_unit_error")
         return shared
 
-    def outcome(self, step: _Step, units: list[UnitResult], error: Optional[ErrorObject]) -> Outcome:
+    def outcome(self, step: _Step, units: list[UnitResult], error: ErrorObject | None) -> Outcome:
         """Assemble the task's result and log one structured line per unit; a failed unit fails the task."""
         failed = [u.error for u in units if u.status == "failed" and u.error is not None]
         if error is None and failed:
@@ -384,7 +385,9 @@ def _private_dir(base: Path, *parts: str) -> Path:
             if stat.S_IMODE(os.stat(path).st_mode) != 0o700:
                 os.chmod(path, 0o700)
         except OSError as exc:
-            raise PreflightRefusal("RIVET_AIRFLOW_STATE_DIR_NOT_WRITABLE", f"cannot make {path} private: {type(exc).__name__}") from exc
+            raise PreflightRefusal(
+                "RIVET_AIRFLOW_STATE_DIR_NOT_WRITABLE", f"cannot make {path} private: {type(exc).__name__}"
+            ) from exc
     return path
 
 
@@ -424,14 +427,14 @@ def _tail(path: Path) -> str:
         return handle.read().decode(errors="replace")
 
 
-def copy_name(source: Path, only_export: Optional[str] = None) -> str:
+def copy_name(source: Path, only_export: str | None = None) -> str:
     """The name of a config's copy: its own stem plus a hash of its absolute path, so two sources never share one."""
     digest = hashlib.sha256(str(source).encode()).hexdigest()[:8]
     suffix = f"--{path_name(only_export)}" if only_export is not None else ""
     return f"{source.stem}.{digest}{suffix}{source.suffix or '.yaml'}"
 
 
-def _copy_query_files(config: Mapping[str, Any], source: Path, folder: Path, touched: Optional[str]) -> None:
+def _copy_query_files(config: Mapping[str, Any], source: Path, folder: Path, touched: str | None) -> None:
     """Copy every relative `query_file` to the same relative path beside the config's copy; refuse what rivet would."""
     owners = _read_json(folder / QUERY_OWNERS)
     owners = owners if isinstance(owners, dict) else {}
@@ -442,7 +445,7 @@ def _copy_query_files(config: Mapping[str, Any], source: Path, folder: Path, tou
             continue
         name, ref, origin = entry.get("name"), str(ref), source.parent / str(ref)
 
-        def refuse(why: str) -> None:
+        def refuse(why: str, name: str = name, ref: str = ref) -> None:
             raise PreflightRefusal("RIVET_AIRFLOW_QUERY_FILE", f"export `{name}` of {source}: query_file `{ref}` {why}")
 
         if os.path.isabs(ref) or ".." in Path(ref).parts:
@@ -476,7 +479,7 @@ def _stop(proc: subprocess.Popen) -> None:
             proc.wait()
 
 
-def _error_line(stderr_text: str) -> Optional[dict[str, Any]]:
+def _error_line(stderr_text: str) -> dict[str, Any] | None:
     """The last line of the stderr tail that is a JSON object with `exit_class`: the `--json-errors` line."""
     for raw in reversed(stderr_text.splitlines()):
         raw = raw.strip()
@@ -507,8 +510,8 @@ def _unexpired(artifact: Path) -> bool:
     except (TypeError, KeyError, ValueError):
         return False
     if expires.tzinfo is None:
-        expires = expires.replace(tzinfo=timezone.utc)
-    return expires > datetime.now(timezone.utc)
+        expires = expires.replace(tzinfo=UTC)
+    return expires > datetime.now(UTC)
 
 
 def _plan_inputs(s: _Session, export: str) -> str:
@@ -561,7 +564,7 @@ def _entries(s: _Session, doc: Any, key: str) -> list[dict[str, Any]]:
     return [e for e in entries if isinstance(e, dict)] if isinstance(entries, list) else []
 
 
-def _run_units(s: _Session, step: _Step, summary: Any, error: Optional[ErrorObject]) -> list[UnitResult]:
+def _run_units(s: _Session, step: _Step, summary: Any, error: ErrorObject | None) -> list[UnitResult]:
     """Units of a `run` / `apply` process, from its summary file when it wrote one."""
     entries = _entries(s, summary, "per_export")
     if not entries:
@@ -739,7 +742,7 @@ def _load(s: _Session) -> Outcome:
 _DISPATCH = {"run": _run, "cdc_run": _run, "apply": _apply, "plan": _plan, "load": _load, "compact": _load}
 
 
-def invoke(request: Request, emit: Emit, on_process: Optional[Callable] = None) -> Outcome:
+def invoke(request: Request, emit: Emit, on_process: Callable | None = None) -> Outcome:
     """Preflight, run and classify one rivet task."""
     if request.command not in _DISPATCH:
         raise ValueError(f"unknown rivet command {request.command!r}")
@@ -762,9 +765,7 @@ def invoke(request: Request, emit: Emit, on_process: Optional[Callable] = None) 
         session.close()
 
 
-def crashed_retry_allowed(
-    ledger: Optional[Path], try_number: int, max_tries: int, budget: int
-) -> tuple[bool, Optional[str]]:
+def crashed_retry_allowed(ledger: Path | None, try_number: int, max_tries: int, budget: int) -> tuple[bool, str | None]:
     """Whether a crash on this try is retried, and what is wrong with the ledger when it grants nothing; never raises."""
     if ledger is None:
         return try_number <= budget, None
@@ -775,9 +776,7 @@ def crashed_retry_allowed(
         return False, f"crashed ledger {ledger} cannot be written ({type(exc).__name__}): no crash retry is granted"
     except ValueError:
         seen = None
-    pairs = isinstance(seen, list) and all(
-        isinstance(e, list) and len(e) == 2 and all(type(n) is int for n in e) for e in seen
-    )
+    pairs = isinstance(seen, list) and all(isinstance(e, list) and len(e) == 2 and all(type(n) is int for n in e) for e in seen)
     if not pairs:
         return False, f"crashed ledger {ledger} is unreadable: no crash retry is granted until it is deleted"
     earlier = [t for t, series in seen if series == max_tries and t < try_number]

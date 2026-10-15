@@ -2,14 +2,15 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable, Mapping, Optional
+from collections.abc import Callable, Mapping
+from typing import Any
 
 from .operators import XCOM_KEY
 
 MAX_UNITS = 10
 
 
-def format_failure(payload: Optional[Mapping[str, Any]], *, dag_id: str, task_id: str, run_id: str, log_url: str = "") -> str:
+def format_failure(payload: Mapping[str, Any] | None, *, dag_id: str, task_id: str, run_id: str, log_url: str = "") -> str:
     """A Slack message from the XCom payload: code, class, action and unit; never rivet's error text."""
     lines = [f":x: *{dag_id}.{task_id}* failed (run `{run_id}`)"]
     payload = payload or {}
@@ -49,7 +50,7 @@ def slack_failure_callback(slack_webhook_conn_id: str = "slack_default", **hook_
         ti = context["ti"]
         try:
             payload = ti.xcom_pull(task_ids=ti.task_id, key=XCOM_KEY)
-        except Exception:  # noqa: BLE001 - an alert must still go out when XCom cannot be read
+        except Exception:
             payload = None
         text = format_failure(
             payload if isinstance(payload, dict) else None,

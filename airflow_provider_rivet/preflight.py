@@ -5,9 +5,10 @@ from __future__ import annotations
 import os
 import shutil
 import uuid
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any
 
 from . import _yaml
 from .capabilities import MIN_RIVET_VERSION, Capabilities, probe
@@ -34,9 +35,9 @@ class Preflight:
     caps: Capabilities
     deployment: str
     state_kind: str
-    state_dir: Optional[Path]
+    state_dir: Path | None
     config: dict[str, Any]
-    marker: Optional[str] = None
+    marker: str | None = None
     warnings: list[tuple[str, str]] = field(default_factory=list)
 
     def export_modes(self) -> dict[str, str]:
@@ -70,7 +71,9 @@ def read_config(config_path: str) -> dict[str, Any]:
     try:
         doc = _yaml.load(Path(config_path).read_text())
     except (OSError, _yaml.yaml.YAMLError) as exc:
-        raise PreflightRefusal("RIVET_AIRFLOW_CONFIG_UNREADABLE", f"cannot read config {config_path}: {type(exc).__name__}") from exc
+        raise PreflightRefusal(
+            "RIVET_AIRFLOW_CONFIG_UNREADABLE", f"cannot read config {config_path}: {type(exc).__name__}"
+        ) from exc
     if not isinstance(doc, dict):
         raise PreflightRefusal("RIVET_AIRFLOW_CONFIG_UNREADABLE", f"config {config_path} is not a YAML mapping")
     return doc
@@ -89,7 +92,7 @@ def ensure_marker(state_dir: Path) -> str:
     return value
 
 
-def check_state_dir(state_dir: Optional[str]) -> Path:
+def check_state_dir(state_dir: str | None) -> Path:
     """The declared directory must be absolute, exist and be writable; it is never created here."""
     if not state_dir:
         raise PreflightRefusal(
@@ -108,7 +111,9 @@ def check_state_dir(state_dir: Optional[str]) -> Path:
     return path
 
 
-def check_nothing_left_beside_config(config_path: str, config: dict[str, Any], state_dir: Path, sqlite: bool, export: Optional[str]) -> None:
+def check_nothing_left_beside_config(
+    config_path: str, config: dict[str, Any], state_dir: Path, sqlite: bool, export: str | None
+) -> None:
     """Refuse when state or a CDC checkpoint sits beside the original config and the copy in `state_dir` would not see it."""
     origin = Path(config_path).resolve().parent
     if origin == state_dir.resolve():
@@ -141,9 +146,9 @@ def run_preflight(
     rivet_bin: str,
     config_path: str,
     env: Mapping[str, str],
-    state_dir: Optional[str],
+    state_dir: str | None,
     deployment: str = "auto",
-    export: Optional[str] = None,
+    export: str | None = None,
     cdc: bool = False,
     upstream_markers: tuple[str, ...] = (),
 ) -> Preflight:

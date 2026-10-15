@@ -15,7 +15,7 @@ os.environ["AIRFLOW_HOME"] = tempfile.mkdtemp(prefix="rivet-provider-airflow-hom
 os.environ["AIRFLOW__CORE__LOAD_EXAMPLES"] = "False"
 os.environ["AIRFLOW__CORE__UNIT_TEST_MODE"] = "True"
 
-import pytest  # noqa: E402
+import pytest
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 RIVET_SRC = Path(os.environ.get("RIVET_SRC") or PACKAGE_ROOT.parent / "rivet").resolve()
@@ -155,7 +155,7 @@ class Rig:
         ti = ti or FakeTI(task_id=op.task_id)
         try:
             return op.execute({"ti": ti, "run_id": ti.run_id}), ti
-        except Exception as exc:  # noqa: BLE001 - the exception type is what the tests assert
+        except Exception as exc:
             return exc, ti
 
     def events(self, name: str) -> list[dict]:

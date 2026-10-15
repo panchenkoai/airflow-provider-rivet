@@ -1,0 +1,34 @@
+# Install once: uv run pre-commit install --hook-type pre-commit --hook-type pre-push
+# On commit: ruff (lint + format), gitleaks, basic file checks. On push: the test suite (it reads ../rivet or $RIVET_SRC).
+default_install_hook_types: [pre-commit, pre-push]
+default_stages: [pre-commit]
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v6.0.0
+    hooks:
+      - id: check-yaml
+        exclude: ^gate/stand/airflow-.*\.yaml$
+      - id: check-toml
+      - id: end-of-file-fixer
+      - id: trailing-whitespace
+      - id: check-merge-conflict
+      - id: check-added-large-files
+  - repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.17.1
+    hooks:
+      - id: ruff-check
+        args: [--fix]
+      - id: ruff-format
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
+  - repo: local
+    hooks:
+      - id: pytest
+        name: pytest (uv.lock environment)
+        entry: uv run --locked pytest -q
+        language: system
+        pass_filenames: false
+        always_run: true
+        stages: [pre-push]

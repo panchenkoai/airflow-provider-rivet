@@ -136,7 +136,7 @@ dag = build_batch_dag(
     "rivet_postgres",
     config="/opt/pipelines/postgres.yaml",
     state_dir="/var/lib/rivet/postgres",
-    plan_file="/opt/pipelines/postgres.plan.json",   # or exports=["users", "orders"]
+    plan_file="/opt/pipelines/postgres.plan.json",  # or exports=["users", "orders"]
     compact_exports=["orders"],
     operator_kwargs={"env_from_connections": {"RIVET_PG_URL": "rivet_postgres"}},
 )
@@ -433,7 +433,10 @@ operator warns (`rivet.warning`, `notifications_block`) when it sees the block.
 from airflow_provider_rivet.callbacks import slack_failure_callback
 
 dag = build_batch_dag(
-    "rivet_postgres", config=..., state_dir=..., exports=[...],
+    "rivet_postgres",
+    config=...,
+    state_dir=...,
+    exports=[...],
     default_args={"retries": 2, "on_failure_callback": slack_failure_callback("slack_webhook")},
 )
 ```
@@ -487,4 +490,3 @@ The tests need no rivet binary and no running Airflow: a fake `rivet` script rep
 scenario (and enforces rivet's own `query_file` rule, tied to the Rust source by a test).
 `tests/test_dag_runs.py` runs the builders' DAGs through `dag.test()` against a SQLite metadata
 database created in a throwaway `AIRFLOW_HOME`, with real task instances and trigger rules.
-

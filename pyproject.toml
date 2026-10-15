@@ -28,7 +28,7 @@ dependencies = ["apache-airflow>=2.10"]
 slack = ["apache-airflow-providers-slack>=8.0"]
 
 [dependency-groups]
-dev = ["pytest>=8"]
+dev = ["pytest>=8", "pre-commit>=4", "ruff==0.17.1"]
 
 [project.urls]
 Homepage = "https://github.com/panchenkoai/airflow-provider-rivet"
@@ -47,6 +47,15 @@ packages = ["airflow_provider_rivet"]
 
 [tool.hatch.build.targets.sdist]
 include = ["airflow_provider_rivet", "examples", "README.md", "CHANGELOG.md", "LICENSE"]
+
+[tool.ruff]
+line-length = 130
+target-version = "py312"
+extend-exclude = ["gate/stand/airflow-*.yaml"]
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "RUF100"]
+ignore = ["E501"]  # the formatter owns line length; long string literals stay as written
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -71,10 +71,22 @@ def test_a_two_wave_batch_run_where_rivet_succeeds_everywhere_is_a_success(batch
     state, tasks = two_waves(batch, "run_ok")
     assert tasks.pop("watcher") == SKIPPED
     assert set(tasks.values()) == {OK}, tasks
-    assert sorted(tasks) == sorted([
-        "plan", "apply.a", "apply.b", "apply.wave_1_done", "apply.big", "apply.after_big", "apply.huge",
-        "load.a", "load.b", "load.big", "load.huge", "compact.big",
-    ])
+    assert sorted(tasks) == sorted(
+        [
+            "plan",
+            "apply.a",
+            "apply.b",
+            "apply.wave_1_done",
+            "apply.big",
+            "apply.after_big",
+            "apply.huge",
+            "load.a",
+            "load.b",
+            "load.big",
+            "load.huge",
+            "compact.big",
+        ]
+    )
     assert state == OK
     order = [c for c in batch.ran() if c[0] == "apply"]
     assert order.index(("apply", "big")) < order.index(("apply", "huge")), "heavy exports run one after another"
@@ -85,7 +97,11 @@ def test_a_failed_plan_blocks_everything_downstream_and_fails_the_run(batch: Dag
     batch.scenario(**{"plan:": {"exit": 1, "line": {"error": "bad config", "exit_class": 1}}})
     state, tasks = two_waves(batch, "plan_fails")
     assert tasks["plan"] == FAILED and tasks["watcher"] == FAILED and state == FAILED
-    rivet = {t: s for t, s in tasks.items() if t.split(".")[0] in ("apply", "load", "compact") and "_done" not in t and "after_" not in t}
+    rivet = {
+        t: s
+        for t, s in tasks.items()
+        if t.split(".")[0] in ("apply", "load", "compact") and "_done" not in t and "after_" not in t
+    }
     assert len(rivet) == 9 and set(rivet.values()) == {BLOCKED}, rivet
     assert batch.ran() == [("plan", "")], "nothing but the plan reached rivet"
 
@@ -171,9 +187,7 @@ def test_a_failure_callback_from_default_args_fires_for_the_failed_task_and_not_
 NON_ASCII = ("\u0437\u0430\u043a\u0430\u0437\u044b", "\u043a\u043b\u0438\u0435\u043d\u0442\u044b")
 
 
-@pytest.mark.skipif(
-    AIRFLOW_MAJOR >= 3, reason="Airflow 3 dag.test() cannot run a non-ASCII task id (latin-1 in its API client)"
-)
+@pytest.mark.skipif(AIRFLOW_MAJOR >= 3, reason="Airflow 3 dag.test() cannot run a non-ASCII task id (latin-1 in its API client)")
 def test_two_non_ascii_exports_of_one_dag_are_each_planned_and_extracted(dag_rig: DagRig) -> None:
     exports = "".join(f"  - {{name: {json.dumps(n)}, query: SELECT 1, mode: full}}\n" for n in NON_ASCII)
     dag_rig.config.write_text(f"source:\n  type: postgres\n  url_env: RIVET_PG_URL\nexports:\n{exports}")
@@ -199,7 +213,9 @@ def test_no_password_reaches_the_metadata_database_the_logs_or_an_exception(
     batch: DagRig, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, capfd: pytest.CaptureFixture
 ) -> None:
     monkeypatch.setenv("AIRFLOW_CONN_RIVET_PG", "postgresql://rivet:c0nn-s3cr3t@db.internal:5432/app")
-    batch.scenario(record_env=["RIVET_PG_URL", "RIVET_EXTRA_URL"], leak_env=["RIVET_PG_URL", "RIVET_EXTRA_URL"], **{"apply:b": REFUSED})
+    batch.scenario(
+        record_env=["RIVET_PG_URL", "RIVET_EXTRA_URL"], leak_env=["RIVET_PG_URL", "RIVET_EXTRA_URL"], **{"apply:b": REFUSED}
+    )
     caplog.set_level(logging.DEBUG)
     state, tasks = batch.run_dag(
         "build_batch_dag",

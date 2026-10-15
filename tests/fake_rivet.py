@@ -4,7 +4,7 @@ import json
 import os
 import signal
 import sys
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -118,10 +118,12 @@ def main():
             break
     if sub == "plan" and not play.get("exit"):
         out = value_of(argv, "--output")
-        expires = (datetime.now(timezone.utc) + timedelta(hours=spec.get("plan_expires_hours", 24))).isoformat()
+        expires = (datetime.now(UTC) + timedelta(hours=spec.get("plan_expires_hours", 24))).isoformat()
         if out:
             source = canonical(value_of(argv, "--config"))
-            Path(out).write_text(json.dumps({"export_name": value_of(argv, "--export"), "expires_at": expires, "config_path": source}))
+            Path(out).write_text(
+                json.dumps({"export_name": value_of(argv, "--export"), "expires_at": expires, "config_path": source})
+            )
         else:
             print(json.dumps(spec.get("plan_list", [])))
         return 0

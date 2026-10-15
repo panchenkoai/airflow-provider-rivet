@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 CLASS_BY_EXIT = {
     1: "generic",
@@ -22,13 +22,13 @@ STATUSES = frozenset({"success", "failed", "skipped", "loaded", "compacted"})
 class ErrorObject:
     """The D1 error object; `message` never leaves the worker."""
 
-    code: Optional[str]
-    kind: Optional[str]
+    code: str | None
+    kind: str | None
     class_: str
-    exit_code: Optional[int]
+    exit_code: int | None
     retryable: bool
-    action: Optional[str]
-    message: Optional[str] = None
+    action: str | None
+    message: str | None = None
 
     def to_xcom(self) -> dict[str, Any]:
         """The object as XCom may carry it: every key but `message`."""
@@ -42,7 +42,7 @@ class ErrorObject:
         }
 
     @classmethod
-    def from_contract(cls, obj: Any, message_key: str = "message") -> Optional["ErrorObject"]:
+    def from_contract(cls, obj: Any, message_key: str = "message") -> ErrorObject | None:
         """Read an object rivet printed with the contract's keys; `None` when it is not one."""
         if not isinstance(obj, dict):
             return None
@@ -56,7 +56,7 @@ class ErrorObject:
             return None
         return cls(texts[0], texts[1], class_, exit_code, retryable, texts[2], texts[3])
 
-    def describe(self, export: Optional[str]) -> str:
+    def describe(self, export: str | None) -> str:
         """The exception text: `[code] class: action (export)`, with no error message in it."""
         code = f"[{self.code}] " if self.code else ""
         action = f": {self.action}" if self.action else ""
@@ -64,7 +64,7 @@ class ErrorObject:
         return f"{code}{self.class_}{action}{unit}"
 
 
-def error_from_exit(exit_status: Optional[int], signal: Optional[int]) -> ErrorObject:
+def error_from_exit(exit_status: int | None, signal: int | None) -> ErrorObject:
     """Build the object for a process that printed none, by ADR-0039 D8's table and nothing else."""
     if signal is not None:
         return ErrorObject(None, None, "crashed", None, True, None, f"rivet was killed by signal {signal}")
@@ -78,7 +78,7 @@ def error_from_exit(exit_status: Optional[int], signal: Optional[int]) -> ErrorO
     return ErrorObject(None, None, "generic", 1, False, None, raw)
 
 
-def error_from_line(line: dict[str, Any], exit_status: Optional[int] = None) -> tuple[Optional[ErrorObject], bool]:
+def error_from_line(line: dict[str, Any], exit_status: int | None = None) -> tuple[ErrorObject | None, bool]:
     """Read the `--json-errors` line: (object or `None` when malformed, whether it was derived from `exit_class`)."""
     if "class" in line or "retryable" in line:
         return ErrorObject.from_contract(line, message_key="error"), False
@@ -99,15 +99,15 @@ def worst(errors: list[ErrorObject]) -> ErrorObject:
 class UnitResult:
     """One unit a scheduler reports: a run / apply export, or a load / compact table."""
 
-    export: Optional[str]
-    table: Optional[str] = None
+    export: str | None
+    table: str | None = None
     status: str = "success"
-    run_id: Optional[str] = None
-    rows: Optional[int] = None
-    files: Optional[int] = None
-    stop_reason: Optional[str] = None
-    error: Optional[ErrorObject] = None
-    skip_reason: Optional[str] = field(default=None, compare=False)
+    run_id: str | None = None
+    rows: int | None = None
+    files: int | None = None
+    stop_reason: str | None = None
+    error: ErrorObject | None = None
+    skip_reason: str | None = field(default=None, compare=False)
 
     def to_xcom(self) -> dict[str, Any]:
         """The contract's XCom unit shape (tests/fixtures/scheduler/xcom_unit*.json)."""
