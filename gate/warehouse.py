@@ -195,7 +195,8 @@ def cleanup(cloud: Cloud, stack: str) -> None:
 def sweep(cloud: Cloud) -> list[str]:
     """Remove leftovers of earlier gate runs older than a day, by age only (one bucket and project serve several machines)."""
     removed = []
-    listing = _bq("ls", "--format=json", "--max_results=10000", cloud.project, check=False)
+    # `bq ls <project>` reads the argument as a dataset; the project goes in `--project_id`.
+    listing = _bq("ls", "--format=json", "--max_results=10000", f"--project_id={cloud.project}")
     for ds in json.loads(listing or "[]"):
         name = ds.get("datasetReference", {}).get("datasetId", "")
         if not name.startswith("rivet_tmp_afgate_"):
