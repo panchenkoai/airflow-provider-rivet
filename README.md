@@ -458,6 +458,9 @@ started outside Airflow** (cron, a shell), nor against a second DAG over the sam
 ## Known limits
 
 - The Kubernetes mode has unit tests only (no pod was run).
+- On rivet 0.31.0 the `rows` / `files` of a CDC `run` task leave out its `initial: snapshot`: the first
+  run of a CDC DAG reports 0 rows while the snapshot files hold the whole table (the binary's
+  `--summary-output` counts the stream only; found by the live gate).
 - `load` and `compact` against a warehouse were exercised only through the fake binary.
 - Narrowing a load to one export today means rewriting the config through a YAML reader and
   writer: comments are dropped and YAML anchors are expanded in the copy.
