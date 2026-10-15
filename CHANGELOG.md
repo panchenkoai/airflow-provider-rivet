@@ -5,7 +5,7 @@ rivet binary; its release tags will use the prefix `airflow-v`.
 
 ## 0.1.0 (unreleased)
 
-First cut, against rivet 0.31.0 and the contract of ADR-0039.
+First release, against rivet 0.31.0 and the contract of ADR-0039; Python 3.12+, Airflow 2.10 and 3.x.
 
 - Operators: `RivetApplyOperator`, `RivetRunOperator`, `RivetCdcRunOperator`, `RivetLoadOperator`,
   `RivetCompactOperator`, `RivetPlanOperator`; one invocation module builds argv and env, runs
