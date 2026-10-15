@@ -3,18 +3,21 @@
 Apache Airflow operators and DAG builders that run the [rivet](https://github.com/panchenkoai/rivet)
 binary on the worker as a subprocess and turn its result into Airflow's: retry or stop, which
 unit failed, and what to do about it. The contract it implements is
-[ADR-0039](../../docs/adr/0039-scheduler-contract.md).
+[ADR-0039](https://github.com/panchenkoai/rivet/blob/main/docs/adr/0039-scheduler-contract.md).
 
 Status: first cut, not published to PyPI. It is versioned independently of the binary and checks
 the binary's version at run time (minimum **rivet 0.31.0**; a lower one is refused with both
-versions in the message). Supported: Airflow 2.10+ and 3.x, Python 3.9+.
+versions in the message). Supported: Airflow 2.10+ and 3.x, Python 3.12+ (Airflow 2.10 only on 3.12).
 
 ## Install
 
 ```bash
-pip install -e /path/to/rivet/integrations/airflow            # from a checkout
-pip install -e "/path/to/rivet/integrations/airflow[slack]"   # with the Slack provider
+pip install "airflow-provider-rivet @ git+https://github.com/panchenkoai/airflow-provider-rivet"
+pip install "airflow-provider-rivet[slack] @ git+https://github.com/panchenkoai/airflow-provider-rivet"
 ```
+
+Install it into the Airflow environment with Airflow's own constraints file, so it does not move
+Airflow's pins.
 
 The rivet binary must be on the worker's `PATH`, or pass `rivet_bin="/abs/path/rivet"`.
 
@@ -470,3 +473,16 @@ scenario (and enforces rivet's own `query_file` rule, tied to the Rust source by
 contract fixtures are read from `tests/fixtures/scheduler/` of this repository.
 `tests/test_dag_runs.py` runs the builders' DAGs through `dag.test()` against a SQLite metadata
 database created in a throwaway `AIRFLOW_HOME`, with real task instances and trigger rules.
+
+## Development
+
+```bash
+git clone https://github.com/panchenkoai/rivet ../rivet   # the contract fixtures the tests read
+uv sync                                                   # latest Airflow 3 from uv.lock, plus pytest
+uv run pytest -q
+```
+
+The tests read rivet's scheduler contract fixtures (`tests/fixtures/scheduler/`) and
+`src/config/export.rs` from a rivet checkout: `../rivet` by default, or the path in `RIVET_SRC`.
+CI checks rivet out at the commit in `RIVET_CONTRACT_REF` and runs the suite on Airflow 2.10 and
+3.x under Airflow's constraints files.

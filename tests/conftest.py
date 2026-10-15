@@ -17,7 +17,9 @@ os.environ["AIRFLOW__CORE__UNIT_TEST_MODE"] = "True"
 
 import pytest  # noqa: E402
 
-FIXTURES = Path(__file__).resolve().parents[3] / "tests" / "fixtures" / "scheduler"
+PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+RIVET_SRC = Path(os.environ.get("RIVET_SRC") or PACKAGE_ROOT.parent / "rivet").resolve()
+FIXTURES = RIVET_SRC / "tests" / "fixtures" / "scheduler"
 SECRET = "postgresql://rivet:s3cr3t-pw@db.internal:5432/app"
 NEW_FLAGS = {
     "*": ["--no-notify", "--lock-wait"],

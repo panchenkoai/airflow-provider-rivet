@@ -14,7 +14,7 @@ from .capabilities import MIN_RIVET_VERSION, Capabilities, probe
 
 MARKER_NAME = ".rivet_airflow_marker"
 STATE_DB_NAME = ".rivet_state.db"
-SETUP_GUIDE = "integrations/airflow/README.md#local-worker-setup-guide"
+SETUP_GUIDE = "https://github.com/panchenkoai/airflow-provider-rivet#local-worker-setup-guide"
 STATE_URL_ENV = "RIVET_STATE_URL"
 
 

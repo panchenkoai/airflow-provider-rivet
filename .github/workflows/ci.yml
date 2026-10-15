@@ -1,0 +1,78 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  locked:
+    name: Tests (uv.lock)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          repository: panchenkoai/rivet
+          path: rivet
+          sparse-checkout: |
+            tests/fixtures/scheduler
+            src/config
+      - name: Pin rivet to RIVET_CONTRACT_REF
+        run: git -C rivet fetch --depth 1 origin "$(cat RIVET_CONTRACT_REF)" && git -C rivet checkout --quiet FETCH_HEAD
+      - uses: taiki-e/install-action@v2.87.22
+        with:
+          tool: uv
+      - run: uv sync --locked
+      - run: uv run pytest -q
+        env:
+          RIVET_SRC: rivet
+
+  airflow:
+    name: Airflow ${{ matrix.airflow }} / Python ${{ matrix.python }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { airflow: "2.10.5", python: "3.12" }
+          - { airflow: "3.3.2", python: "3.12" }
+          - { airflow: "3.3.2", python: "3.13" }
+          - { airflow: "3.3.2", python: "3.14" }
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          repository: panchenkoai/rivet
+          path: rivet
+          sparse-checkout: |
+            tests/fixtures/scheduler
+            src/config
+      - name: Pin rivet to RIVET_CONTRACT_REF
+        run: git -C rivet fetch --depth 1 origin "$(cat RIVET_CONTRACT_REF)" && git -C rivet checkout --quiet FETCH_HEAD
+      - uses: taiki-e/install-action@v2.87.22
+        with:
+          tool: uv
+      - name: Install Airflow ${{ matrix.airflow }} under its constraints, then the package
+        run: |
+          uv venv --python ${{ matrix.python }}
+          uv pip install "apache-airflow==${{ matrix.airflow }}" pytest \
+            --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-${{ matrix.airflow }}/constraints-${{ matrix.python }}.txt"
+          uv pip install --no-deps -e .
+      - run: .venv/bin/python -m pytest -q
+        env:
+          RIVET_SRC: rivet
+
+  build:
+    name: Build sdist and wheel
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: taiki-e/install-action@v2.87.22
+        with:
+          tool: uv
+      - run: uv build
+      - run: uvx twine check dist/*
