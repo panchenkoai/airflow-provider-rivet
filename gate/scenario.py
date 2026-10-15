@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import sqlite3
+import json
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -31,7 +31,7 @@ INSERT INTO gate_customers (name, tier) SELECT 'new customer ' || g, 'free' FROM
 INSERT INTO gate_orders (customer_id, amount, status) SELECT 1 + g % 1000, 9.99 * g, 'new' FROM generate_series(1, 100) g;
 UPDATE gate_orders SET status = 'shipped', updated_at = clock_timestamp() WHERE id IN (SELECT id FROM gate_orders ORDER BY id LIMIT 30);
 UPDATE gate_customers SET tier = 'team', updated_at = clock_timestamp() WHERE id IN (SELECT id FROM gate_customers ORDER BY id LIMIT 10);
-DELETE FROM gate_orders WHERE id IN (SELECT id FROM gate_orders ORDER BY id DESC LIMIT 5);
+DELETE FROM gate_orders WHERE id IN (SELECT id FROM gate_orders WHERE id <= 5000 ORDER BY id DESC LIMIT 5);
 """
 CHANGED_OPS = {"gate_customers": {"insert": 20, "update": 10}, "gate_orders": {"insert": 100, "update": 30, "delete": 5}}
 NO_OPS: dict[str, dict[str, int]] = {"gate_customers": {}, "gate_orders": {}}
@@ -67,6 +67,10 @@ exports:
       until_current: true
     destination: {{ type: local, path: /opt/rivet/out/cdc_{state}/ }}
 """
+READ_SQLITE_CURSORS = (
+    "import json, sqlite3; c = sqlite3.connect('file:/opt/rivet/state/sqlite/.rivet_state.db?mode=ro', uri=True); "
+    "print(json.dumps(dict(c.execute('SELECT export_name, last_cursor_value FROM export_state').fetchall())))"
+)
 DAGS = [f"gate_{kind}_{state}" for state in STATES for kind in ("cdc", "batch")]
 RIVET_TASKS = {f"gate_batch_{s}": [f"apply.{s}_{short}" for short, _ in TABLES.values()] for s in STATES} | {
     f"gate_cdc_{s}": ["run"] for s in STATES
@@ -135,11 +139,14 @@ def wait_file(path: Path, timeout: float = 180) -> bool:
 
 
 def stored_cursors(stand: Stand, state: str) -> dict[str, str]:
-    """`export_state.last_cursor_value` by export, read with a plain SQLite / psql client."""
+    """`export_state.last_cursor_value` by export, read with a plain SQLite / psql client.
+
+    The SQLite file is read inside a worker container: a WAL database shares its index through `-shm` memory,
+    which a host process on the far side of a docker VM's file share does not see (measured: "malformed").
+    """
     if state == "sqlite":
-        db = stand.rivet_dir / "state" / "sqlite" / ".rivet_state.db"
-        with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as con:
-            return dict(con.execute("SELECT export_name, last_cursor_value FROM export_state").fetchall())
+        text = stand.compose("exec", "-T", "airflow-worker", "python", "-c", READ_SQLITE_CURSORS).stdout
+        return json.loads(text)
     text = stand.psql("gate-state", "rivet_state", "SELECT export_name, coalesce(last_cursor_value, '') FROM export_state")
     return dict(line.split("|", 1) for line in text.splitlines() if "|" in line)
 

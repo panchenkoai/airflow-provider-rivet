@@ -7,12 +7,17 @@ report: the XCom and the stored cursor are compared with counts and values taken
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from typing import Any
 
 import duckdb
 
 SHOWN = 5
+#: The order of PostgreSQL change events (docs/cdc-bigquery-load.md): the LSN in `__pos`, then `__seq` inside it.
+PG_LSN = (
+    "((('0x' || split_part(json_extract_string(__pos, '$.lsn'), '/', 1))::UBIGINT << 32) + "
+    "('0x' || split_part(json_extract_string(__pos, '$.lsn'), '/', 2))::UBIGINT)"
+)
 
 
 def connect(source_dsn: str | None) -> duckdb.DuckDBPyConnection:
@@ -86,16 +91,19 @@ def cdc_replay(
     source: str,
     columns: Sequence[str],
     key: str,
+    position: str = PG_LSN,
 ) -> list[str]:
-    """The snapshot with every captured change applied in order (run, then `__seq`) equals the source."""
+    """The snapshot with every captured change applied in log order (`position`, then `__seq`) equals the source."""
     cols = ", ".join(columns)
     parts = (
-        [f"SELECT 0 AS run_no, 0 AS seq, 'insert' AS op, {cols} FROM read_parquet({_files(snapshot)}, union_by_name=true)"]
+        [
+            f"SELECT 0 AS run_no, 0::UBIGINT AS pos, 0 AS seq, 'insert' AS op, {cols} FROM read_parquet({_files(snapshot)}, union_by_name=true)"
+        ]
         if snapshot
         else []
     )
     parts += [
-        f"SELECT {n} AS run_no, __seq AS seq, __op AS op, {cols} FROM read_parquet({_files(files)}, union_by_name=true)"
+        f"SELECT {n} AS run_no, {position} AS pos, __seq AS seq, __op AS op, {cols} FROM read_parquet({_files(files)}, union_by_name=true)"
         for n, files in enumerate(stream, start=1)
         if files
     ]
@@ -103,7 +111,7 @@ def cdc_replay(
         return [f"replay of {source}: no snapshot and no change files"]
     events = " UNION ALL BY NAME ".join(f"({p})" for p in parts)
     final = (
-        f"SELECT {cols} FROM (SELECT *, row_number() OVER (PARTITION BY {key} ORDER BY run_no DESC, seq DESC) AS rn "
+        f"SELECT {cols} FROM (SELECT *, row_number() OVER (PARTITION BY {key} ORDER BY run_no DESC, pos DESC, seq DESC) AS rn "
         f"FROM ({events})) WHERE rn = 1 AND op <> 'delete'"
     )
     return _diff(con, final, f"SELECT {cols} FROM {source}", f"replay of {source}")
@@ -128,7 +136,7 @@ def same_count(reported: int, counted: int, what: str) -> list[str]:
 def _instant(value: Any) -> datetime:
     """A timestamp from a datetime or a stored text form; a naive one is UTC (rivet stores the cursor in UTC)."""
     stamp = value if isinstance(value, datetime) else datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    return stamp if stamp.tzinfo else stamp.replace(tzinfo=UTC)
+    return stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
 
 
 def stored_cursor(stored: Any, source_max: Any, what: str) -> list[str]:
