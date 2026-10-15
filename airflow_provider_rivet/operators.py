@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
+import tempfile
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 from urllib.parse import quote
 
+from . import _yaml
 from ._compat import AirflowException, AirflowFailException, AirflowSkipException, BaseHook, BaseOperator
 from .invocation import (
     CLOUD_ENV,
@@ -20,6 +23,7 @@ from .invocation import (
     undeclared_state_variables,
     worker_environment,
 )
+from .connections import cloud_environment
 from .preflight import PreflightRefusal
 
 XCOM_KEY = "return_value"
@@ -80,6 +84,7 @@ class RivetBaseOperator(BaseOperator):
         env_from_connections: Optional[Mapping[str, Any]] = None,
         env_passthrough: Sequence[str] = (),
         cloud_credentials: Sequence[str] = (),
+        connections: Sequence[str] = (),
         deployment: str = "auto",
         extra_args: Optional[Sequence[str]] = None,
         lock_wait: int = 600,
@@ -105,6 +110,7 @@ class RivetBaseOperator(BaseOperator):
         self.env_from_connections = env_from_connections
         self.env_passthrough = tuple(env_passthrough)
         self.cloud_credentials = tuple(cloud_credentials)
+        self.connections = tuple(connections)
         self.deployment = deployment
         self.extra_args = extra_args
         self.lock_wait = lock_wait
@@ -115,9 +121,12 @@ class RivetBaseOperator(BaseOperator):
         self.cwd = cwd
         self._proc: Any = None
 
-    def _environment(self) -> dict[str, str]:
-        """The subprocess environment: the worker's allow-listed names, the declared ones, and URLs from Connections."""
+    def _environment(self, secrets: Path) -> dict[str, str]:
+        """The subprocess environment: the worker's allow-listed names, storage and warehouse Connections, the declared
+        names, and URLs from Connections; key files go to `secrets`, which the task removes when rivet has exited."""
         env = worker_environment(self.env_passthrough, self.cloud_credentials)
+        if self.connections:
+            env.update(cloud_environment([BaseHook.get_connection(c) for c in self.connections], secrets, self._config_doc()))
         env.update({str(k): str(v) for k, v in (self.env or {}).items()})
         for name, ref in (self.env_from_connections or {}).items():
             conn_id, scheme = (ref, None) if isinstance(ref, str) else (ref[0], ref[1])
@@ -132,6 +141,14 @@ class RivetBaseOperator(BaseOperator):
                 "meant for this pipeline",
             )
         return env
+
+    def _config_doc(self) -> dict[str, Any]:
+        """The config as written, for the names a Connection is filed under; empty when it cannot be read here."""
+        try:
+            doc = _yaml.load(Path(self.config).read_text())
+        except (OSError, ValueError, _yaml.yaml.YAMLError):
+            return {}
+        return doc if isinstance(doc, dict) else {}
 
     def _emit(self, record: dict[str, Any]) -> None:
         """Write one structured line to the task log."""
@@ -176,8 +193,16 @@ class RivetBaseOperator(BaseOperator):
         run_id = str(context.get("run_id") or getattr(ti, "run_id", "run"))
         map_index = getattr(ti, "map_index", -1)
         task_part = ti.task_id if map_index in (-1, None) else f"{ti.task_id}[{map_index}]"
+        secrets = Path(tempfile.mkdtemp(prefix="rivet-airflow-secrets-"))
         try:
-            env = self._environment()
+            return self._run_with_secrets(ti, run_id, task_part, secrets)
+        finally:
+            shutil.rmtree(secrets, ignore_errors=True)
+
+    def _run_with_secrets(self, ti: Any, run_id: str, task_part: str, secrets: Path) -> dict[str, Any]:
+        """`execute` with a private folder for the key files of this try."""
+        try:
+            env = self._environment(secrets)
         except PreflightRefusal as refusal:
             self._refuse(ti, refusal)
         request = Request(
