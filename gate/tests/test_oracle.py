@@ -72,11 +72,13 @@ def test_batch_latest_counts_deletes_and_catches_a_lost_update(con, tmp_path: Pa
     assert oracle.batch_latest(con, [run1, lost], "src.public.orders", COLS, "id", "updated_at", deleted=1)
 
 
-def events(con, tmp_path: Path, rows: str) -> str:
-    """A change file with `__op` / `__seq` from a VALUES list of (op, seq, id, status, amount, minute)."""
+def events(con, tmp_path: Path, rows: str, lsn: str = "lsn") -> str:
+    """A change file from a VALUES list of (op, seq, id, status, amount, minute[, lsn]); one transaction unless `lsn` is a column."""
+    names = "op, seq, id, status, amount, m" + (", lsn" if lsn == "lsn_col" else "")
+    pos = "'{\"lsn\":\"0/' || lsn || '\"}'" if lsn == "lsn_col" else "'{\"lsn\":\"0/16B3F28\"}'"
     return write(con, tmp_path / f"e{abs(hash(rows))}.parquet",
-                 "SELECT op AS __op, seq AS __seq, id::INTEGER AS id, status, amount::DECIMAL(12,2) AS amount, "
-                 f"TIMESTAMPTZ '2026-10-15 12:00:00+00' + to_minutes(m) AS updated_at FROM (VALUES {rows}) t(op, seq, id, status, amount, m)")
+                 f"SELECT op AS __op, {pos} AS __pos, seq AS __seq, id::INTEGER AS id, status, amount::DECIMAL(12,2) AS amount, "
+                 f"TIMESTAMPTZ '2026-10-15 12:00:00+00' + to_minutes(m) AS updated_at FROM (VALUES {rows}) t({names})")
 
 
 def test_cdc_replay_and_operations_catch_lost_reordered_and_missing_events(con, tmp_path: Path) -> None:
@@ -94,6 +96,19 @@ def test_cdc_replay_and_operations_catch_lost_reordered_and_missing_events(con, 
     assert oracle.cdc_replay(con, [snap], [[reordered]], "src.public.orders", COLS, "id"), "the older event applied last"
     assert oracle.cdc_replay(con, [], [[good]], "src.public.orders", COLS, "id"), "no snapshot"
     assert oracle.cdc_ops(con, [], {"insert": 0}, "idle") == []
+
+
+def test_cdc_replay_orders_transactions_by_lsn_before_seq(con, tmp_path: Path) -> None:
+    """`__seq` restarts in every transaction: an insert and a later transaction's delete of it, numbered 7 and 0."""
+    snap = initial(con, tmp_path)
+    con.execute("INSERT INTO src.public.orders VALUES (11, 'new', 9.99, TIMESTAMPTZ '2026-10-15 12:01:00+00')")
+    con.execute("DELETE FROM src.public.orders WHERE id = 11")
+    good = events(con, tmp_path, "('insert', 7, 11, 'new', 9.99, 1, 'A0'), ('delete', 0, 11, 'new', 9.99, 1, 'B0')", lsn="lsn_col")
+    assert oracle.cdc_replay(con, [snap], [[good]], "src.public.orders", COLS, "id") == []
+    swapped = events(con, tmp_path, "('insert', 7, 11, 'new', 9.99, 1, 'B0'), ('delete', 0, 11, 'new', 9.99, 1, 'A0')", lsn="lsn_col")
+    assert oracle.cdc_replay(con, [snap], [[swapped]], "src.public.orders", COLS, "id"), "the delete logged before the insert"
+    hi = events(con, tmp_path, "('insert', 7, 11, 'new', 9.99, 1, 'FFFFFFF0'), ('delete', 0, 11, 'new', 9.99, 1, '100000000')", lsn="lsn_col")
+    assert oracle.cdc_replay(con, [snap], [[hi]], "src.public.orders", COLS, "id") == [], "LSNs compare as numbers, not text"
 
 
 def test_counts_cursor_and_overlap() -> None:

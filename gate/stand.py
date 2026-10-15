@@ -116,6 +116,7 @@ class Stand:
                     "rivet/state/sqlite", "rivet/state/pg"):
             (self.dir / sub).mkdir(parents=True)
         shutil.copy2(HERE / "stand" / f"airflow-{self.flavor.version}.yaml", self.dir / "docker-compose.yaml")
+        (self.dir / ".env").write_text("")
         shutil.copy2(HERE / "stand" / "dags" / "rivet_gate.py", self.dir / "dags" / "rivet_gate.py")
         services = "\n".join(f"  {s}:\n    <<: *rivet" + ('\n    ports: !override ["127.0.0.1::8080"]' if s == self.flavor.ui_service else "")
                              for s in self.flavor.services)

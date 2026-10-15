@@ -31,6 +31,9 @@ slack = ["apache-airflow-providers-slack>=8.0"]
 dev = ["pytest>=8"]
 gate = ["duckdb>=1.1", "pytz", "pytest>=8"]
 
+[tool.uv]
+required-version = ">=0.6.3"
+
 [project.urls]
 Homepage = "https://github.com/panchenkoai/airflow-provider-rivet"
 Source = "https://github.com/panchenkoai/airflow-provider-rivet"
