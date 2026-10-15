@@ -994,3 +994,13 @@ def test_pruning_removes_only_this_tasks_own_files_and_never_an_older_layouts(ri
     assert not any(p.parent in {m.parent for m in mine} for p in old), "the new layout's folder is never an older layout's folder"
     readme = (Path(__file__).resolve().parents[1] / "README.md").read_text()
     assert "Upgrading a state directory" in readme
+
+
+def test_an_unchanged_config_copy_is_not_replaced_while_another_task_may_read_it(tmp_path: Path) -> None:
+    target = tmp_path / "copy.yaml"
+    invocation._write_atomic(target, b"a: 1\n")
+    inode = target.stat().st_ino
+    invocation._write_atomic(target, b"a: 1\n")
+    assert target.stat().st_ino == inode, "the same bytes were renamed over the file a parallel task reads"
+    invocation._write_atomic(target, b"a: 2\n")
+    assert target.read_bytes() == b"a: 2\n" and oct(target.stat().st_mode & 0o777) == "0o600"
