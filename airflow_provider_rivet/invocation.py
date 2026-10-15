@@ -346,7 +346,16 @@ class _Session:
 
 
 def _write_atomic(path: Path, data: bytes) -> str:
-    """Write a 0600 file by temp file and rename, so parallel tasks never read a partial copy."""
+    """Write a 0600 file by temp file and rename, so parallel tasks never read a partial copy.
+
+    A copy that already holds these bytes is left alone: a rename over a file another task is opening reads as
+    "not found" on a docker VM file share or NFS (measured: `rivet plan` refused its config on Airflow 3).
+    """
+    try:
+        if path.read_bytes() == data:
+            return str(path)
+    except OSError:
+        pass
     fd, tmp = tempfile.mkstemp(dir=path.parent, prefix=f".{path.name}.")
     with os.fdopen(fd, "wb") as handle:
         handle.write(data)
