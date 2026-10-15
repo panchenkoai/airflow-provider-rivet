@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Mapping, Sequence
 from pathlib import Path
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any
 from urllib.parse import quote
 
 from ._compat import AirflowException, AirflowFailException, AirflowSkipException, BaseHook, BaseOperator
@@ -27,7 +28,7 @@ _SCHEMES = {"postgres": "postgresql", "mssql": "sqlserver", "mongo": "mongodb"}
 RIVET_SCHEMES = ("postgresql", "postgres", "mysql", "sqlserver", "mongodb", "mongodb+srv", "oracle")
 
 
-def connection_url(conn: Any, scheme: Optional[str] = None) -> str:
+def connection_url(conn: Any, scheme: str | None = None) -> str:
     """A rivet URL from an Airflow Connection's fields, credentials percent-encoded; an unknown scheme is refused."""
     extra = getattr(conn, "extra_dejson", None) or {}
     scheme = scheme or extra.get("rivet_scheme") or _SCHEMES.get(conn.conn_type, conn.conn_type)
@@ -71,23 +72,23 @@ class RivetBaseOperator(BaseOperator):
         self,
         *,
         config: str,
-        export: Optional[str] = None,
-        table: Optional[str] = None,
-        state_dir: Optional[str] = None,
-        plan_file: Optional[str] = None,
+        export: str | None = None,
+        table: str | None = None,
+        state_dir: str | None = None,
+        plan_file: str | None = None,
         rivet_bin: str = "rivet",
-        env: Optional[Mapping[str, str]] = None,
-        env_from_connections: Optional[Mapping[str, Any]] = None,
+        env: Mapping[str, str] | None = None,
+        env_from_connections: Mapping[str, Any] | None = None,
         env_passthrough: Sequence[str] = (),
         cloud_credentials: Sequence[str] = (),
         deployment: str = "auto",
-        extra_args: Optional[Sequence[str]] = None,
+        extra_args: Sequence[str] | None = None,
         lock_wait: int = 600,
         crashed_retries: int = 1,
-        stderr_dir: Optional[str] = None,
+        stderr_dir: str | None = None,
         stream_stderr: bool = False,
-        log_keep: Optional[int] = 10,
-        cwd: Optional[str] = None,
+        log_keep: int | None = 10,
+        cwd: str | None = None,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)

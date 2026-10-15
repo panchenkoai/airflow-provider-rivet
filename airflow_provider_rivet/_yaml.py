@@ -33,7 +33,7 @@ for _tag, _rx, _first in _CORE:
 
 def load(text: str) -> Any:
     """Parse config text."""
-    return yaml.load(text, Loader=ConfigLoader)  # noqa: S506 - a SafeLoader subclass
+    return yaml.load(text, Loader=ConfigLoader)
 
 
 def dump(doc: Any) -> str:

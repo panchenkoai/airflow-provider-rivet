@@ -1,0 +1,7 @@
+# The default rules, plus the fake credentials the tests use on purpose.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "test fixtures: fake secrets that the tests assert never leak"
+paths = ['''^tests/''', '''^gate/tests/''']

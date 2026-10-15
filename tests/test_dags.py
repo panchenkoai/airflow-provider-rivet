@@ -8,13 +8,12 @@ from importlib import metadata
 from pathlib import Path
 
 import pytest
+from conftest import fixture
 
 from airflow_provider_rivet import __version__, get_provider_info
 from airflow_provider_rivet.callbacks import format_failure
 from airflow_provider_rivet.dags import build_batch_dag, build_cdc_dag, read_plan_layout
 from airflow_provider_rivet.operators import RivetApplyOperator, RivetRunOperator, RivetRunWatcher, RivetWaveBarrier
-
-from conftest import fixture
 
 
 def edges(dag: object) -> set[tuple[str, str]]:
@@ -63,16 +62,38 @@ def test_the_plan_layout_orders_waves_and_marks_the_heavy_exports(plan_file: str
 def test_batch_dag_has_three_groups_and_per_table_chains(plan_file: str) -> None:
     dag = build_batch_dag("b", config="/c/pg.yaml", state_dir="/state", plan_file=plan_file, compact_exports=["big"])
     assert sorted(dag.task_ids) == sorted(
-        ["plan", "apply.a", "apply.b", "apply.wave_2_done", "apply.big", "apply.after_big", "apply.huge",
-         "load.a", "load.b", "load.big", "load.huge", "compact.big", "watcher"]
+        [
+            "plan",
+            "apply.a",
+            "apply.b",
+            "apply.wave_2_done",
+            "apply.big",
+            "apply.after_big",
+            "apply.huge",
+            "load.a",
+            "load.b",
+            "load.big",
+            "load.huge",
+            "compact.big",
+            "watcher",
+        ]
     )
     assert set(dag.task_group.children) == {"plan", "apply", "load", "compact", "watcher"}
     assert edges(dag) == {
-        ("plan", "apply.a"), ("plan", "apply.b"), ("plan", "apply.big"), ("plan", "apply.huge"),
-        ("apply.a", "apply.wave_2_done"), ("apply.b", "apply.wave_2_done"),
-        ("apply.wave_2_done", "apply.big"), ("apply.wave_2_done", "apply.huge"),
-        ("apply.big", "apply.after_big"), ("apply.after_big", "apply.huge"),
-        ("apply.a", "load.a"), ("apply.b", "load.b"), ("apply.big", "load.big"), ("apply.huge", "load.huge"),
+        ("plan", "apply.a"),
+        ("plan", "apply.b"),
+        ("plan", "apply.big"),
+        ("plan", "apply.huge"),
+        ("apply.a", "apply.wave_2_done"),
+        ("apply.b", "apply.wave_2_done"),
+        ("apply.wave_2_done", "apply.big"),
+        ("apply.wave_2_done", "apply.huge"),
+        ("apply.big", "apply.after_big"),
+        ("apply.after_big", "apply.huge"),
+        ("apply.a", "load.a"),
+        ("apply.b", "load.b"),
+        ("apply.big", "load.big"),
+        ("apply.huge", "load.huge"),
         ("load.big", "compact.big"),
     } | {(t, "watcher") for t in dag.task_ids if t != "watcher"}
 
@@ -151,8 +172,10 @@ def test_cdc_dag_is_one_run_then_load_and_compact_per_table() -> None:
     assert sorted(dag.task_ids) == ["compact.orders", "compact.users", "load.orders", "load.users", "run", "watcher"]
     assert set(dag.task_group.children) == {"run", "load", "compact", "watcher"}
     assert edges(dag) == {
-        ("run", "load.orders"), ("run", "load.users"),
-        ("load.orders", "compact.orders"), ("load.users", "compact.users"),
+        ("run", "load.orders"),
+        ("run", "load.users"),
+        ("load.orders", "compact.orders"),
+        ("load.users", "compact.users"),
     } | {(t, "watcher") for t in dag.task_ids if t != "watcher"}
     assert dag.get_task("watcher").trigger_rule == "one_failed"
     for table in ("orders", "users"):
@@ -165,7 +188,11 @@ def test_cdc_dag_is_one_run_then_load_and_compact_per_table() -> None:
 
 
 def test_cdc_dag_without_compact_or_load() -> None:
-    assert sorted(build_cdc_dag("c", config="c", export="e", tables=["t"], compact=False).task_ids) == ["load.t", "run", "watcher"]
+    assert sorted(build_cdc_dag("c", config="c", export="e", tables=["t"], compact=False).task_ids) == [
+        "load.t",
+        "run",
+        "watcher",
+    ]
     assert sorted(build_cdc_dag("c2", config="c", export="e", tables=[], load=False).task_ids) == ["run", "watcher"]
 
 

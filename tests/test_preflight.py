@@ -7,7 +7,6 @@ import os
 import subprocess
 from pathlib import Path
 
-import pytest
 from airflow.exceptions import AirflowFailException
 from conftest import NEW_FLAGS, RIVET_SRC, FakeTI, Rig
 
@@ -63,10 +62,16 @@ def test_a_local_worker_needs_an_existing_writable_state_directory(rig: Rig) -> 
     missing = str(rig.tmp / "never-created")
     assert refused(rig, rig.operator(RivetApplyOperator, export="orders", state_dir=missing)) == "RIVET_AIRFLOW_STATE_DIR_MISSING"
     assert not os.path.exists(missing), "the directory is never created by a task"
-    assert refused(rig, rig.operator(RivetApplyOperator, export="orders", state_dir="relative/dir")) == "RIVET_AIRFLOW_STATE_DIR_MISSING"
+    assert (
+        refused(rig, rig.operator(RivetApplyOperator, export="orders", state_dir="relative/dir"))
+        == "RIVET_AIRFLOW_STATE_DIR_MISSING"
+    )
     locked = rig.tmp / "locked"
     locked.mkdir(mode=0o500)
-    assert refused(rig, rig.operator(RivetApplyOperator, export="orders", state_dir=str(locked))) == "RIVET_AIRFLOW_STATE_DIR_NOT_WRITABLE"
+    assert (
+        refused(rig, rig.operator(RivetApplyOperator, export="orders", state_dir=str(locked)))
+        == "RIVET_AIRFLOW_STATE_DIR_NOT_WRITABLE"
+    )
 
 
 def test_a_task_that_sees_another_state_directory_than_its_upstream_is_refused(rig: Rig) -> None:
@@ -99,7 +104,10 @@ def test_a_missing_binary_config_or_export_is_refused(rig: Rig) -> None:
     op = RivetApplyOperator(task_id="task", config=str(rig.config), export="orders", rivet_bin="rivet-not-installed")
     exc, _ = rig.run(op)
     assert isinstance(exc, AirflowFailException) and "RIVET_AIRFLOW_BINARY_MISSING" in str(exc)
-    assert refused(rig, rig.operator(RivetApplyOperator, export="orders", config=str(rig.tmp / "nope.yaml"))) == "RIVET_AIRFLOW_CONFIG_UNREADABLE"
+    assert (
+        refused(rig, rig.operator(RivetApplyOperator, export="orders", config=str(rig.tmp / "nope.yaml")))
+        == "RIVET_AIRFLOW_CONFIG_UNREADABLE"
+    )
     assert refused(rig, rig.operator(RivetApplyOperator, export="not_in_config")) == "RIVET_AIRFLOW_EXPORT_UNKNOWN"
 
 
@@ -155,7 +163,9 @@ def test_a_relative_query_file_stays_relative_and_is_copied_beside_the_materiali
 def test_the_fake_binary_refuses_a_query_file_by_rivets_own_rule(rig: Rig) -> None:
     source = (RIVET_SRC / "src" / "config" / "export.rs").read_text()
     tree = ast.parse((Path(__file__).parent / "fake_rivet.py").read_text())
-    rules = next(ast.literal_eval(n.value) for n in tree.body if isinstance(n, ast.Assign) and n.targets[0].id == "QUERY_FILE_RULES")
+    rules = next(
+        ast.literal_eval(n.value) for n in tree.body if isinstance(n, ast.Assign) and n.targets[0].id == "QUERY_FILE_RULES"
+    )
     assert len(rules) == 3 and all(rule in source for rule in rules), "the fake's refusal texts are rivet's"
     outside = rig.tmp / "outside.sql"
     outside.write_text("SELECT 1")
@@ -228,7 +238,9 @@ def test_a_state_database_left_beside_the_original_config_is_refused_until_it_is
 
 
 def test_a_cdc_checkpoint_left_beside_the_original_config_is_refused_until_it_is_moved(rig: Rig) -> None:
-    rig.config.write_text(rig.config.read_text().replace("    mode: cdc\n", "    mode: cdc\n    cdc:\n      checkpoint: ckpt/orders.ckpt\n"))
+    rig.config.write_text(
+        rig.config.read_text().replace("    mode: cdc\n", "    mode: cdc\n    cdc:\n      checkpoint: ckpt/orders.ckpt\n")
+    )
     (rig.config_dir / "ckpt").mkdir()
     (rig.config_dir / "ckpt" / "orders.ckpt").write_text("lsn")
     for _cycle in (1, 2):
@@ -245,7 +257,9 @@ def test_a_cdc_checkpoint_left_beside_the_original_config_is_refused_until_it_is
 
 
 def test_a_relative_destination_path_is_left_as_written_and_resolves_against_the_working_directory(rig: Rig) -> None:
-    rig.config.write_text(rig.config.read_text().replace("    mode: full\n", "    mode: full\n    destination: {type: local, path: ./out/}\n", 1))
+    rig.config.write_text(
+        rig.config.read_text().replace("    mode: full\n", "    mode: full\n    destination: {type: local, path: ./out/}\n", 1)
+    )
     rig.run(rig.operator(RivetRunOperator, export="orders"))
     assert "path: ./out/" in rig.copy().read_text() and rig.calls()[-1]["cwd"] == str(rig.config_dir.resolve())
     rig.run(rig.operator(RivetRunOperator, export="orders", cwd=str(rig.tmp.resolve())))

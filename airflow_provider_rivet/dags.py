@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any
 
 from ._compat import DAG, TaskGroup
 from .invocation import PLAN_ERRORS, plan_layout
@@ -60,14 +61,14 @@ def build_batch_dag(
     dag_id: str,
     *,
     config: str,
-    state_dir: Optional[str] = None,
-    plan_file: Optional[str] = None,
-    exports: Optional[Sequence[str]] = None,
+    state_dir: str | None = None,
+    plan_file: str | None = None,
+    exports: Sequence[str] | None = None,
     refresh_plan: bool = True,
     extract: str = "apply",
     load: bool = True,
     compact_exports: Sequence[str] = (),
-    operator_kwargs: Optional[Mapping[str, Any]] = None,
+    operator_kwargs: Mapping[str, Any] | None = None,
     **dag_kwargs: Any,
 ) -> DAG:
     """plan -> apply / load / compact groups, chained per export: apply.X >> load.X >> compact.X."""
@@ -91,9 +92,9 @@ def build_batch_dag(
         plan = RivetPlanOperator(task_id="plan", plan_file=plan_file, **common) if plan_file and refresh_plan else None
         apply_tasks: dict[str, Any] = {}
         with TaskGroup(group_id="apply"):
-            wave_done: Optional[Any] = None
+            wave_done: Any | None = None
             for index, wave in enumerate(waves):
-                heavy_done: Optional[Any] = None
+                heavy_done: Any | None = None
                 for name in wave["exports"]:
                     task = extract_cls(task_id=name, export=name, **common)
                     apply_tasks[name] = task
@@ -128,10 +129,10 @@ def build_cdc_dag(
     config: str,
     export: str,
     tables: Sequence[str],
-    state_dir: Optional[str] = None,
+    state_dir: str | None = None,
     load: bool = True,
     compact: bool = True,
-    operator_kwargs: Optional[Mapping[str, Any]] = None,
+    operator_kwargs: Mapping[str, Any] | None = None,
     **dag_kwargs: Any,
 ) -> DAG:
     """One `run` task for the stream, then load.T >> compact.T per captured table."""
