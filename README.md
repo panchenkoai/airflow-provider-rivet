@@ -461,22 +461,6 @@ started outside Airflow** (cron, a shell), nor against a second DAG over the sam
 ## Development
 
 ```bash
-uv venv --python 3.12 .venv
-uv pip install --python .venv/bin/python "apache-airflow==2.10.5" \
-  --constraint https://raw.githubusercontent.com/apache/airflow/constraints-2.10.5/constraints-3.12.txt
-uv pip install --python .venv/bin/python --no-deps -e . pytest
-.venv/bin/python -m pytest
-```
-
-The tests need no rivet binary and no running Airflow: a fake `rivet` script replays each
-scenario (and enforces rivet's own `query_file` rule, tied to the Rust source by a test), and the
-contract fixtures are read from `tests/fixtures/scheduler/` of this repository.
-`tests/test_dag_runs.py` runs the builders' DAGs through `dag.test()` against a SQLite metadata
-database created in a throwaway `AIRFLOW_HOME`, with real task instances and trigger rules.
-
-## Development
-
-```bash
 git clone https://github.com/panchenkoai/rivet ../rivet   # the contract fixtures the tests read
 uv sync                                                   # latest Airflow 3 from uv.lock, plus pytest
 uv run pytest -q
@@ -486,3 +470,9 @@ The tests read rivet's scheduler contract fixtures (`tests/fixtures/scheduler/`)
 `src/config/export.rs` from a rivet checkout: `../rivet` by default, or the path in `RIVET_SRC`.
 CI checks rivet out at the commit in `RIVET_CONTRACT_REF` and runs the suite on Airflow 2.10 and
 3.x under Airflow's constraints files.
+
+The tests need no rivet binary and no running Airflow: a fake `rivet` script replays each
+scenario (and enforces rivet's own `query_file` rule, tied to the Rust source by a test).
+`tests/test_dag_runs.py` runs the builders' DAGs through `dag.test()` against a SQLite metadata
+database created in a throwaway `AIRFLOW_HOME`, with real task instances and trigger rules.
+
