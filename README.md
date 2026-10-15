@@ -28,9 +28,6 @@ COPY --from=ghcr.io/panchenkoai/rivet:v0.31.0 /usr/local/bin/rivet /usr/local/bi
 RUN pip install --no-cache-dir airflow-provider-rivet
 ```
 
-Install it into the Airflow environment with Airflow's own constraints file, so it does not move
-Airflow's pins.
-
 The rivet binary must be on the worker's `PATH`, or pass `rivet_bin="/abs/path/rivet"`.
 
 ## Works today / needs a newer rivet
