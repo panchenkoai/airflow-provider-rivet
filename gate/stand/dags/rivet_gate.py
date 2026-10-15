@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 from airflow_provider_rivet.dags import build_batch_dag, build_cdc_dag
 
 ROOT = "/opt/rivet"
@@ -39,4 +41,37 @@ for state in ("sqlite", "pg"):
         load=False,
         operator_kwargs=cdc_kwargs,
         tags=["rivet", "gate"],
+    )
+
+
+# The warehouse leg: GCS, then BigQuery / Snowflake / ClickHouse, every credential from a Connection.
+WAREHOUSE_CONNECTIONS = {
+    "bigquery": ["gate_gcp"],
+    "snowflake": ["gate_gcp", "gate_snowflake"],
+    "clickhouse": ["gate_gcp", "gate_clickhouse"],
+}
+for wh in filter(None, os.environ.get("GATE_WAREHOUSES", "").split(",")):
+    kwargs = {
+        "cwd": f"{ROOT}/out",
+        "env_from_connections": dict(SOURCE),
+        "env": {"RIVET_STATE_URL": ""},
+        "connections": WAREHOUSE_CONNECTIONS[wh],
+    }
+    globals()[f"gate_wh_{wh}_batch"] = build_batch_dag(
+        f"gate_wh_{wh}_batch",
+        config=f"{ROOT}/configs/wh_{wh}_batch.yaml",
+        state_dir=f"{ROOT}/state/wh_{wh}",
+        exports=[f"{wh}_customers", f"{wh}_orders"],
+        compact_exports=[f"{wh}_customers", f"{wh}_orders"],
+        operator_kwargs=kwargs,
+        tags=["rivet", "gate", "warehouse", wh],
+    )
+    globals()[f"gate_wh_{wh}_cdc"] = build_cdc_dag(
+        f"gate_wh_{wh}_cdc",
+        config=f"{ROOT}/configs/wh_{wh}_cdc.yaml",
+        export=f"{wh}_cdc",
+        tables=["gate_customers", "gate_orders"],
+        state_dir=f"{ROOT}/state/wh_{wh}",
+        operator_kwargs=kwargs,
+        tags=["rivet", "gate", "warehouse", wh],
     )

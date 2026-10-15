@@ -7,7 +7,7 @@ report: the XCom and the stored cursor are compared with counts and values taken
 from __future__ import annotations
 
 from collections.abc import Mapping, Sequence
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from typing import Any
 
 import duckdb
@@ -136,7 +136,7 @@ def same_count(reported: int, counted: int, what: str) -> list[str]:
 def _instant(value: Any) -> datetime:
     """A timestamp from a datetime or a stored text form; a naive one is UTC (rivet stores the cursor in UTC)."""
     stamp = value if isinstance(value, datetime) else datetime.fromisoformat(str(value).replace("Z", "+00:00"))
-    return stamp if stamp.tzinfo else stamp.replace(tzinfo=timezone.utc)
+    return stamp if stamp.tzinfo else stamp.replace(tzinfo=UTC)
 
 
 def stored_cursor(stored: Any, source_max: Any, what: str) -> list[str]:

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 
 import pytest
@@ -10,7 +10,7 @@ import pytest
 from gate import oracle
 
 COLS = ["id", "status", "amount", "updated_at"]
-T0 = datetime(2026, 10, 15, 12, 0, tzinfo=timezone.utc)
+T0 = datetime(2026, 10, 15, 12, 0, tzinfo=UTC)
 
 
 @pytest.fixture
@@ -141,11 +141,8 @@ def test_cdc_replay_orders_transactions_by_lsn_before_seq(con, tmp_path: Path) -
 
 def test_counts_cursor_and_overlap() -> None:
     assert oracle.same_count(5, 5, "x") == [] and oracle.same_count(5, 4, "x")
-    assert (
-        oracle.stored_cursor("2026-10-15T12:01:00.123456", datetime(2026, 10, 15, 12, 1, 0, 123456, tzinfo=timezone.utc), "c")
-        == []
-    )
-    assert oracle.stored_cursor("2026-10-15T12:01:00.123455", datetime(2026, 10, 15, 12, 1, 0, 123456, tzinfo=timezone.utc), "c")
+    assert oracle.stored_cursor("2026-10-15T12:01:00.123456", datetime(2026, 10, 15, 12, 1, 0, 123456, tzinfo=UTC), "c") == []
+    assert oracle.stored_cursor("2026-10-15T12:01:00.123455", datetime(2026, 10, 15, 12, 1, 0, 123456, tzinfo=UTC), "c")
     assert oracle.stored_cursor(None, T0, "c")
     outer = ("2026-10-15T12:00:00Z", "2026-10-15T12:00:30Z")
     assert oracle.inside([("2026-10-15T12:00:05Z", "2026-10-15T12:00:10Z")], outer, "o") == []

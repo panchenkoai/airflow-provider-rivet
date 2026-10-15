@@ -28,6 +28,14 @@ STATE_CONN = {
     "extra": {"rivet_params": "sslmode=require"},
 }
 SOURCE_DSN = "host=127.0.0.1 port={port} dbname=rivet user=rivet password=rivet"
+CH_PASSWORD = "gate-loader-pw"
+
+
+def write_env_file(path: Path, values: dict[str, str]) -> None:
+    """A 0600 env file docker compose reads (empty when the warehouse leg is off)."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as handle:
+        handle.writelines(f"{k}={v}\n" for k, v in values.items())
 
 
 @dataclass(frozen=True)
@@ -73,6 +81,8 @@ x-rivet: &rivet
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
     AIRFLOW_CONN_RIVET_GATE_SOURCE: postgresql://rivet:rivet@gate-source:5432/rivet
     AIRFLOW_CONN_RIVET_GATE_STATE: '{state_conn}'
+    GATE_WAREHOUSES: '{warehouses}'
+  env_file: [gate-connections.env]
   volumes:
     - {rivet_dir}:/opt/rivet
 services:
@@ -88,6 +98,11 @@ services:
     environment: {{ POSTGRES_USER: rivet, POSTGRES_PASSWORD: rivet, POSTGRES_DB: rivet_state }}
     command: ["bash", "-c", "install -d -o postgres -g postgres -m 700 /ssl && openssl req -new -x509 -days 2 -nodes -subj /CN=gate-state -out /ssl/server.crt -keyout /ssl/server.key && chown postgres:postgres /ssl/server.crt /ssl/server.key && chmod 600 /ssl/server.key && exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/ssl/server.crt -c ssl_key_file=/ssl/server.key"]
     healthcheck: {{ test: ["CMD", "pg_isready", "-U", "rivet"], interval: 5s, retries: 20 }}
+  gate-clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    environment: {{ CLICKHOUSE_USER: loader, CLICKHOUSE_PASSWORD: {ch_password}, CLICKHOUSE_DB: gate, CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1" }}
+    ulimits: {{ nofile: {{ soft: 262144, hard: 262144 }} }}
+    ports: ["127.0.0.1::8123"]
 """
 
 
@@ -104,7 +119,14 @@ def sh(
 class Stand:
     """A compose project under `work/<version>`: Airflow from the official compose plus the gate overlay."""
 
-    def __init__(self, version: str, rivet_bin: Path, work: Path) -> None:
+    def __init__(
+        self,
+        version: str,
+        rivet_bin: Path,
+        work: Path,
+        warehouses: tuple[str, ...] = (),
+        connections: dict[str, str] | None = None,
+    ) -> None:
         self.flavor = FLAVORS[version]
         self.rivet_bin = rivet_bin
         self.dir = work / f"airflow-{version}"
@@ -113,6 +135,9 @@ class Stand:
         self.image = f"rivet-gate-airflow:{version}"
         self.ui_port = 0
         self.source_dsn = ""
+        self.clickhouse_port = 0
+        self.warehouses = warehouses
+        self.connections = connections or {}
         self._token: str | None = None
 
     def compose(self, *args: str, **kw: Any) -> subprocess.CompletedProcess:
@@ -172,8 +197,16 @@ class Stand:
             for s in self.flavor.services
         )
         (self.dir / "docker-compose.gate.yaml").write_text(
-            OVERLAY.format(image=self.image, state_conn=json.dumps(STATE_CONN), rivet_dir=self.rivet_dir, services=services)
+            OVERLAY.format(
+                image=self.image,
+                state_conn=json.dumps(STATE_CONN),
+                rivet_dir=self.rivet_dir,
+                services=services,
+                warehouses=",".join(self.warehouses),
+                ch_password=CH_PASSWORD,
+            )
         )
+        write_env_file(self.dir / "gate-connections.env", self.connections)
 
     def down(self) -> None:
         """Remove the project's containers and volumes (a leftover from an earlier run too)."""
@@ -188,6 +221,7 @@ class Stand:
         self.compose("up", "-d", timeout=1800)
         self.ui_port = self.host_port(self.flavor.ui_service, 8080)
         self.source_dsn = SOURCE_DSN.format(port=self.host_port("gate-source", 5432))
+        self.clickhouse_port = self.host_port("gate-clickhouse", 8123)
         deadline = time.monotonic() + 900
         while True:
             try:

@@ -7,13 +7,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import secrets
 import shutil
 import sys
 import tempfile
+import time
 from pathlib import Path
 
-from .scenario import Verdicts, play
+from .scenario import TABLES, Verdicts, play
 from .stand import FLAVORS, Stand
+from .warehouse import WAREHOUSES, Cloud, Leg, connections, sweep
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -23,6 +26,17 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--work", type=Path, help="working directory (default: a fresh temporary one)")
     ap.add_argument("--verdicts", type=Path, help="write one JSON line per graded cell")
     ap.add_argument("--keep", action="store_true", help="leave the stacks up and the working directory in place")
+    ap.add_argument("--warehouses", default="", help="comma-separated: bigquery,snowflake,clickhouse (the warehouse leg)")
+    ap.add_argument("--gcp-keyfile", type=Path, help="GCP credential JSON for the gate_gcp Connection (service account or ADC)")
+    ap.add_argument("--gcs-bucket", default="rivet_data_test")
+    ap.add_argument("--bq-project", default="rivet-data-tool")
+    ap.add_argument("--bq-location", default="US")
+    ap.add_argument(
+        "--sf-connection", default="rivet", help="local `snow` connection whose login the gate_snowflake Connection copies"
+    )
+    ap.add_argument("--sf-warehouse", default="RIVET_LOAD_TEST")
+    ap.add_argument("--sf-database", default="RIVET_LOAD_TEST")
+    ap.add_argument("--sf-integration", default="RIVET_GCS")
     ap.add_argument("--sabotage", choices=["drop-delta-file"], help="break one output on purpose: the gate must go red")
     args = ap.parse_args(argv)
 
@@ -30,19 +44,42 @@ def main(argv: list[str] | None = None) -> int:
     unknown = sorted(set(versions) - set(FLAVORS))
     if unknown:
         ap.error(f"unknown Airflow version(s) {unknown}; known: {sorted(FLAVORS)}")
+    warehouses = tuple(w for w in args.warehouses.split(",") if w)
+    if set(warehouses) - set(WAREHOUSES):
+        ap.error(f"unknown warehouse(s) {sorted(set(warehouses) - set(WAREHOUSES))}; known: {list(WAREHOUSES)}")
+    cloud = None
+    if warehouses:
+        keyfile = args.gcp_keyfile or Path.home() / ".config/gcloud/application_default_credentials.json"
+        tag = time.strftime("%m%d%H%M") + secrets.token_hex(2)
+        cloud = Cloud(
+            keyfile,
+            args.gcs_bucket,
+            args.bq_project,
+            args.bq_location,
+            args.sf_connection,
+            args.sf_warehouse,
+            args.sf_database,
+            args.sf_integration,
+            tag,
+        )
+        print(f"warehouse leg {list(warehouses)}, tag {tag}; swept: {sweep(cloud)}", flush=True)
     work = args.work or Path(tempfile.mkdtemp(prefix="rivet-airflow-gate-"))
     work.mkdir(parents=True, exist_ok=True)
     rows: list[dict[str, str]] = []
     for version in versions:
-        stand = Stand(version, args.rivet_bin.resolve(), work.resolve())
+        conns = connections(cloud) if cloud else {}
+        stand = Stand(version, args.rivet_bin.resolve(), work.resolve(), warehouses, conns)
+        leg = Leg(cloud, version, TABLES) if cloud else None
         verdicts = Verdicts(version)
         try:
             verdicts.guard("stand-up", stand.up)
             if not verdicts.rows:
-                verdicts.guard("scenario", lambda: play(stand, verdicts, args.sabotage))
+                verdicts.guard("scenario", play, stand, verdicts, args.sabotage, leg)
         finally:
             if not args.keep:
                 verdicts.guard("teardown", stand.down)
+                if leg:
+                    verdicts.guard("cloud-cleanup", leg.cleanup)
         rows += verdicts.rows
     if not args.keep and args.work is None:
         shutil.rmtree(work, ignore_errors=True)
