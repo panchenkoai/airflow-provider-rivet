@@ -6,7 +6,7 @@ import dataclasses
 import re
 
 import pytest
-from conftest import FIXTURES, fixture
+from conftest import FIXTURES, PACKAGE_ROOT, fixture
 
 from airflow_provider_rivet.capabilities import DEGRADATIONS
 from airflow_provider_rivet.result import CLASSES, ErrorObject, UnitResult, error_from_exit, error_from_line
@@ -18,7 +18,7 @@ def full(error: ErrorObject) -> dict:
 
 
 def test_the_fixture_directory_is_the_repo_contract() -> None:
-    assert (FIXTURES / "xcom_unit.json").is_file(), f"contract fixtures not found at {FIXTURES}"
+    assert (FIXTURES / "xcom_unit.json").is_file(), f"contract fixtures not found at {FIXTURES}: set RIVET_SRC to a rivet checkout"
 
 
 def test_a_failed_run_entry_becomes_the_pinned_xcom_unit() -> None:
@@ -98,7 +98,7 @@ def test_the_exception_text_has_code_class_action_and_unit_and_no_message() -> N
 
 
 def test_every_degradation_is_documented_in_the_readme_and_every_recorded_key_is_a_degradation() -> None:
-    package = FIXTURES.parents[2] / "integrations" / "airflow"
+    package = PACKAGE_ROOT
     readme = (package / "README.md").read_text()
     for key in DEGRADATIONS:
         assert f"| `{key}` |" in readme, f"README has no row for degradation `{key}`"

@@ -8,25 +8,33 @@ dynamic = ["version"]
 description = "Apache Airflow operators and DAG builders that run the rivet binary on the worker"
 readme = "README.md"
 license = { file = "LICENSE" }
-requires-python = ">=3.9"
+requires-python = ">=3.12"
 authors = [{ name = "Andrii Panchenko" }]
 keywords = ["airflow", "airflow-provider", "rivet", "etl", "cdc"]
 classifiers = [
     "Development Status :: 3 - Alpha",
     "Framework :: Apache Airflow",
     "Framework :: Apache Airflow :: Provider",
+    "License :: OSI Approved :: MIT License",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Typing :: Typed",
 ]
 dependencies = ["apache-airflow>=2.10"]
 
 [project.optional-dependencies]
 slack = ["apache-airflow-providers-slack>=8.0"]
-test = ["pytest>=8"]
+
+[dependency-groups]
+dev = ["pytest>=8"]
 
 [project.urls]
-Homepage = "https://github.com/panchenkoai/rivet/tree/main/integrations/airflow"
-Source = "https://github.com/panchenkoai/rivet"
+Homepage = "https://github.com/panchenkoai/airflow-provider-rivet"
+Source = "https://github.com/panchenkoai/airflow-provider-rivet"
+Issues = "https://github.com/panchenkoai/airflow-provider-rivet/issues"
+rivet = "https://github.com/panchenkoai/rivet"
 
 [project.entry-points.apache_airflow_provider]
 provider_info = "airflow_provider_rivet:get_provider_info"

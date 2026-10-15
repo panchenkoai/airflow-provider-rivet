@@ -9,7 +9,7 @@ from pathlib import Path
 
 import pytest
 from airflow.exceptions import AirflowFailException
-from conftest import FIXTURES, NEW_FLAGS, FakeTI, Rig
+from conftest import NEW_FLAGS, RIVET_SRC, FakeTI, Rig
 
 from airflow_provider_rivet import _yaml
 from airflow_provider_rivet.capabilities import probe
@@ -153,7 +153,7 @@ def test_a_relative_query_file_stays_relative_and_is_copied_beside_the_materiali
 
 
 def test_the_fake_binary_refuses_a_query_file_by_rivets_own_rule(rig: Rig) -> None:
-    source = (FIXTURES.parents[2] / "src" / "config" / "export.rs").read_text()
+    source = (RIVET_SRC / "src" / "config" / "export.rs").read_text()
     tree = ast.parse((Path(__file__).parent / "fake_rivet.py").read_text())
     rules = next(ast.literal_eval(n.value) for n in tree.body if isinstance(n, ast.Assign) and n.targets[0].id == "QUERY_FILE_RULES")
     assert len(rules) == 3 and all(rule in source for rule in rules), "the fake's refusal texts are rivet's"
