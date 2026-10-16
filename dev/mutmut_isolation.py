@@ -10,7 +10,7 @@ would then be shared across concurrent workers:
 
 A mutant can also turn a loop unbounded in memory (`_yaml.substitute` with `i = None` scans the same `${` forever,
 growing its output list): mutmut's CPU-time limit comes too late, and on a CI runner the kernel's OOM killer then
-takes the runner itself. So each worker's data segment is capped (`MUTANTS_MEM_LIMIT_MB`, default 2048): the mutant
+takes the runner itself. So each worker's data segment is capped (`MUTANTS_MEM_LIMIT_MB`, default 3072: the cap is on the virtual data segment, where glibc reserves an arena per thread): the mutant
 dies with MemoryError, which is a detection, and the run goes on.
 
 So each process gets a base temp of its own, and Airflow's ORM is pointed at `apr-mutmut-<pid>.db` once the session
@@ -37,7 +37,7 @@ _OWNED: list[Path] = []
 @pytest.hookimpl(tryfirst=True)
 def pytest_configure(config: pytest.Config) -> None:
     """Before the tmp_path factory exists: a base temp directory and a memory cap of this process."""
-    cap = int(os.environ.get("MUTANTS_MEM_LIMIT_MB", "2048")) << 20
+    cap = int(os.environ.get("MUTANTS_MEM_LIMIT_MB", "3072")) << 20
     _, hard = resource.getrlimit(resource.RLIMIT_DATA)
     resource.setrlimit(resource.RLIMIT_DATA, (cap if hard == resource.RLIM_INFINITY else min(cap, hard), hard))
     base = Path(tempfile.gettempdir()) / f"apr-mutmut-{os.getpid()}"
@@ -47,7 +47,15 @@ def pytest_configure(config: pytest.Config) -> None:
 
 
 def pytest_collection_finish(session: pytest.Session) -> None:
-    """Before any fixture runs: this process's own metadata database."""
+    """Before any fixture runs: this process's own metadata database, and the mutated package for child Pythons."""
+    # tests/test_retry.py and tests/test_process_io.py run the operator in a child Python (a task process the test
+    # kills). That child imported the package installed in the environment, the unmutated source, so the guards those
+    # tests exist for (PR_SET_PDEATHSIG, the lock passed to rivet, stop-before-step, on_kill) were never mutation
+    # tested. The child inherits MUTANT_UNDER_TEST; with the mutated tree first on its path it runs the mutant too.
+    import airflow_provider_rivet
+
+    root = str(Path(airflow_provider_rivet.__file__).resolve().parents[1])
+    os.environ["PYTHONPATH"] = os.pathsep.join([root, *filter(None, [os.environ.get("PYTHONPATH")])])
     if not os.environ.get("AIRFLOW_HOME"):
         return  # the suite's conftest sets it before Airflow is imported; nothing to isolate without it
     db = Path(tempfile.gettempdir()) / f"apr-mutmut-{os.getpid()}.db"
