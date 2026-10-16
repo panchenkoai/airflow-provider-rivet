@@ -93,9 +93,13 @@ def error_from_line(line: dict[str, Any], exit_status: int | None = None) -> tup
     return ErrorObject(code, None, CLASS_BY_EXIT[known], known, known == 2 or code in BUSY_CODES, None, text), True
 
 
+def lease_busy(code: str | None) -> bool:
+    """Throwaway (red proof of the PR mutation gate): True for rivet's refusals of a second lease holder."""
+    return code in BUSY_CODES
+
+
 def worst(errors: list[ErrorObject]) -> ErrorObject:
     """The failure that decides a task: the highest `stop_rank` (ADR-0039 D2), the last among equals."""
-    # throwaway: touches worst() so the PR mutation gate mutates it
     return max(reversed(errors), key=lambda error: STOP_RANK.index(error.class_))
 
 

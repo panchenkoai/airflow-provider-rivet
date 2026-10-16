@@ -115,3 +115,9 @@ def test_every_degradation_is_documented_in_the_readme_and_every_recorded_key_is
         re.findall(r'\*payload\["degraded"\], "([a-z_]+)"', source)
     )
     assert len(recorded) >= 14 and recorded == set(DEGRADATIONS), recorded ^ set(DEGRADATIONS)
+
+
+def test_throwaway_lease_busy_names_only_the_busy_codes() -> None:
+    from airflow_provider_rivet.result import lease_busy
+
+    assert lease_busy("RIVET_LOAD_TABLE_BUSY") is True and lease_busy("RIVET_X") is False
