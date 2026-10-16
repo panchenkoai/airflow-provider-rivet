@@ -9,7 +9,6 @@ import tempfile
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote
 
 from ._compat import (
     AirflowException,
@@ -19,7 +18,7 @@ from ._compat import (
     BaseHook,
     BaseOperator,
 )
-from .connections import cloud_environment
+from .connections import EnvSpec, build_environment, connection_url  # noqa: F401  (connection_url is re-exported)
 from .invocation import (
     CLOUD_ENV,
     Outcome,
@@ -27,37 +26,10 @@ from .invocation import (
     crashed_retry_allowed,
     invoke,
     path_name,
-    undeclared_state_variables,
-    worker_environment,
 )
 from .preflight import PreflightRefusal, read_config
 
 XCOM_KEY = "return_value"
-_SCHEMES = {"postgres": "postgresql", "mssql": "sqlserver", "mongo": "mongodb"}
-RIVET_SCHEMES = ("postgresql", "postgres", "mysql", "sqlserver", "mongodb", "mongodb+srv", "oracle")
-
-
-def connection_url(conn: Any, scheme: str | None = None) -> str:
-    """A rivet URL from an Airflow Connection's fields, credentials percent-encoded; an unknown scheme is refused."""
-    extra = getattr(conn, "extra_dejson", None) or {}
-    scheme = scheme or extra.get("rivet_scheme") or _SCHEMES.get(conn.conn_type, conn.conn_type)
-    if scheme not in RIVET_SCHEMES:
-        raise PreflightRefusal(
-            "RIVET_AIRFLOW_CONNECTION_SCHEME",
-            f"connection `{getattr(conn, 'conn_id', '?')}` has conn_type `{conn.conn_type}`, which names no rivet URL "
-            f"scheme; pass the scheme as (conn_id, scheme) or set the connection extra `rivet_scheme` to one of {RIVET_SCHEMES}",
-        )
-    auth = quote(conn.login or "", safe="")
-    if conn.password:
-        auth += ":" + quote(conn.password, safe="")
-    auth += "@" if auth else ""
-    host = conn.host or ""
-    if ":" in host and not host.startswith("["):
-        host = f"[{host}]"
-    port = f":{conn.port}" if conn.port else ""
-    database = (extra.get("service_name") if scheme == "oracle" else None) or conn.schema or ""
-    params = f"?{extra['rivet_params']}" if extra.get("rivet_params") else ""
-    return f"{scheme}://{auth}{host}{port}/{quote(str(database), safe='')}{params}"
 
 
 def get_connection(conn_id: str) -> Any:
@@ -140,25 +112,20 @@ class RivetBaseOperator(BaseOperator):
         self._proc: Any = None
 
     def _environment(self, secrets: Path) -> dict[str, str]:
-        """The subprocess environment: the worker's allow-listed names, storage and warehouse Connections, the declared
-        names, and URLs from Connections; key files go to `secrets`, which the task removes when rivet has exited."""
-        env = worker_environment(self.env_passthrough, self.cloud_credentials)
-        if self.connections:
-            env.update(cloud_environment([get_connection(c) for c in self.connections], secrets, self._config_doc()))
-        env.update({str(k): str(v) for k, v in (self.env or {}).items()})
-        for name, ref in (self.env_from_connections or {}).items():
-            conn_id, scheme = (ref, None) if isinstance(ref, str) else (ref[0], ref[1])
-            env[name] = connection_url(get_connection(conn_id), scheme)
-        for name in undeclared_state_variables(env, os.environ):
-            raise PreflightRefusal(
-                "RIVET_AIRFLOW_STATE_ENV_NOT_PASSED",
-                f"the worker's environment sets {name} to a PostgreSQL state and this task would not pass it to rivet, which would then "
-                f"run on an empty SQLite state and treat every export as a first run. Either inherit the worker's "
-                f'value with env_passthrough=["{name}"], or give the task its own with '
-                f'env_from_connections={{"{name}": "<conn_id>"}} (or `env`); unset it on the worker if it is not '
-                "meant for this pipeline",
-            )
-        return env
+        """The subprocess environment (`connections.build_environment`), with every Connection looked up here; key
+        files go to `secrets`, which the task removes when rivet has exited."""
+        urls = {
+            name: ((ref, None) if isinstance(ref, str) else (ref[0], ref[1]))
+            for name, ref in (self.env_from_connections or {}).items()
+        }
+        spec = EnvSpec(
+            passthrough=self.env_passthrough,
+            clouds=self.cloud_credentials,
+            env=self.env or {},
+            urls={name: (get_connection(conn_id), scheme) for name, (conn_id, scheme) in urls.items()},
+            config=self._config_doc() if self.connections else {},
+        )
+        return build_environment(os.environ, spec, [get_connection(c) for c in self.connections], secrets)
 
     def _config_doc(self) -> dict[str, Any]:
         """The config as written, for the names a Connection is filed under; read by the preflight's reader, so a config
