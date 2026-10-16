@@ -543,8 +543,6 @@ started outside Airflow** (cron, a shell), nor against a second DAG over the sam
   gate"), which reads each warehouse back through a second client and compares it with the source.
 - On Snowflake and ClickHouse a compact task is green as `compacted` while rivet merged nothing
   (see "Storage and warehouse connections").
-- Narrowing a load to one export today means rewriting the config through a YAML reader and
-  writer: comments are dropped and YAML anchors are expanded in the copy.
 - With `load_table_filter` degraded, the per-table tasks of a multi-table CDC export each load
   the whole export; the first does the work, the others find the ledger up to date.
 - `rivet apply` prints no result today, so a successful apply task reads its counts from
