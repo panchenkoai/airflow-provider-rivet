@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from . import _yaml
-from .capabilities import MIN_RIVET_VERSION, Capabilities, probe
+from .capabilities import MIN_RIVET_VERSION, Capabilities, ProbeFailed, probe
 
 MARKER_NAME = ".rivet_airflow_marker"
 STATE_DB_NAME = ".rivet_state.db"
@@ -72,22 +72,49 @@ def resolve_binary(rivet_bin: str, env: Mapping[str, str]) -> str:
     return found
 
 
-def read_config(
+def binary_unanswering(exc: ProbeFailed) -> PreflightRefusal:
+    """The refusal for a binary that does not answer a probe, before the preflight or while argv is built."""
+    return PreflightRefusal("RIVET_AIRFLOW_BINARY_MISSING", f"the rivet binary does not answer its probes: {exc}")
+
+
+def read_config_source(
     config_path: str, env: Mapping[str, str] | None = None, params: Mapping[str, str] | None = None
 ) -> tuple[dict[str, Any], str, Callable[[str], str | None]]:
-    """Parse the config as rivet will (D06: `${name}` from `-p` params, then the task's env, spliced into the text
-    first); the document, the raw text and the resolver; a refusal when it is missing or not a mapping."""
+    """The one reader of the config: the document as rivet builds it (D06: `${name}` from `-p` params, then `env`,
+    spliced into the text first; D07: serde_yaml_ng's scalars), the raw text and the resolver.
+
+    A refusal like a missing file for text that is not UTF-8, nesting past Python's recursion limit, a scalar Python
+    cannot convert, or a wrong shape: `exports` must be a list of mappings whose `name` is a scalar (read as its text,
+    D07: `name: 2024` is the export `2024`, as rivet reads a plain scalar into its string field).
+    """
     value_of = _yaml.resolver(env or {}, params or {})
     try:
         text = Path(config_path).read_bytes().decode("utf-8")
         doc, _ = _yaml.resolve_and_load(text, value_of)
-    except (OSError, ValueError, _yaml.yaml.YAMLError) as exc:
+    except (OSError, ValueError, RecursionError, _yaml.yaml.YAMLError) as exc:
         raise PreflightRefusal(
             "RIVET_AIRFLOW_CONFIG_UNREADABLE", f"cannot read config {config_path}: {type(exc).__name__}"
         ) from exc
     if not isinstance(doc, dict):
         raise PreflightRefusal("RIVET_AIRFLOW_CONFIG_UNREADABLE", f"config {config_path} is not a YAML mapping")
+    exports = doc.get("exports")
+    if exports is not None and not isinstance(exports, list):
+        raise PreflightRefusal("RIVET_AIRFLOW_CONFIG_UNREADABLE", f"config {config_path}: `exports` is not a list")
+    for i, entry in enumerate(exports or []):
+        if not isinstance(entry, dict):
+            raise PreflightRefusal("RIVET_AIRFLOW_CONFIG_UNREADABLE", f"config {config_path}: `exports[{i}]` is not a mapping")
+        if "name" in entry and (entry["name"] is None or isinstance(entry["name"], list | dict)):
+            raise PreflightRefusal(
+                "RIVET_AIRFLOW_CONFIG_UNREADABLE", f"config {config_path}: `exports[{i}].name` is not a scalar"
+            )
     return doc, text, value_of
+
+
+def read_config(
+    config_path: str, env: Mapping[str, str] | None = None, params: Mapping[str, str] | None = None
+) -> dict[str, Any]:
+    """The config document as rivet builds it (`read_config_source`)."""
+    return read_config_source(config_path, env, params)[0]
 
 
 def refuse_unresolved(config_path: str, what: str, value: str) -> None:
@@ -181,15 +208,15 @@ def run_preflight(
     binary = resolve_binary(rivet_bin, env)
     try:
         caps = probe(binary)
-    except (OSError, RuntimeError) as exc:
-        raise PreflightRefusal("RIVET_AIRFLOW_BINARY_MISSING", str(exc)) from exc
+    except ProbeFailed as exc:
+        raise binary_unanswering(exc) from exc
     if not caps.new_enough():
         floor = ".".join(str(n) for n in MIN_RIVET_VERSION)
         raise PreflightRefusal(
             "RIVET_AIRFLOW_BINARY_TOO_OLD",
             f"rivet {caps.version_text} at {binary} is older than {floor}, the minimum this package runs",
         )
-    config, text, value_of = read_config(config_path, env, _yaml.params_of(extra_args))
+    config, text, value_of = read_config_source(config_path, env, _yaml.params_of(extra_args))
     where = detect_deployment(env, deployment)
     kind = state_kind(env)
     result = Preflight(binary, caps, where, kind, None, config, config_text=text, value_of=value_of)

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from types import SimpleNamespace
+
 import pytest
 from airflow.exceptions import AirflowFailException
 from conftest import FakeTI, Rig
@@ -211,3 +213,22 @@ def test_the_placeholder_grammar_is_rivets() -> None:
         "D": "5",
         "E": "6",
     }
+
+
+@pytest.mark.parametrize("how", ["env", "param"])
+def test_d06_a_templated_load_password_env_resolves_for_the_connection(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, how: str
+) -> None:
+    """D06 on the Connection side: `_config_doc` read `load.password_env: ${CH_PW_VAR}` unresolved, so the ClickHouse
+    Connection's password went to a variable literally named `${CH_PW_VAR}` and never to the one rivet reads."""
+    ch = SimpleNamespace(
+        conn_id="ch", conn_type="clickhouse", login="loader", password="pw", host="ch", port=None, schema=None, extra_dejson={}
+    )
+    monkeypatch.setattr("airflow_provider_rivet.operators.BaseHook.get_connection", lambda conn_id: ch)
+    rig.config.write_text(rig.config.read_text() + "load:\n  target: clickhouse\n  password_env: ${CH_PW_VAR}\n")
+    rig.scenario(record_env=["CH_PASSWORD"], leak_env=[])
+    env = {"RIVET_PG_URL": "x", "CH_PW_VAR": "CH_PASSWORD"} if how == "env" else {"RIVET_PG_URL": "x"}
+    extra = {} if how == "env" else {"extra_args": ["-p", "CH_PW_VAR=CH_PASSWORD"]}
+    payload, _ = rig.run(rig.operator(RivetRunOperator, export="orders", connections=["ch"], env=env, **extra))
+    assert isinstance(payload, dict), payload
+    assert rig.calls()[-1]["env"]["CH_PASSWORD"] == "pw", "the password must reach the variable the config names"
