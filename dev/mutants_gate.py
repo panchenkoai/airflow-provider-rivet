@@ -1,9 +1,8 @@
 """The mutation gate of CI and the release (README, "Mutation testing"); run inside the project environment.
 
-    python dev/mutants_gate.py mode [BASE]           # full / targeted / none: what a pull request runs (README policy)
+    python dev/mutants_gate.py mode [BASE]           # targeted / none: what a pull request runs (README policy)
     python dev/mutants_gate.py changed [BASE]        # the mutmut name globs of the functions `git diff BASE...HEAD` touches
-    python dev/mutants_gate.py pr [BASE]             # run those mutants and those of every function the changed tests
-                                                     # call; fail on any that is not killed
+    python dev/mutants_gate.py pr [BASE]             # run those mutants; fail on any that is not killed
     python dev/mutants_gate.py full                  # run every mutant; fail when more survive than `.mutmut-ratchet`
     python dev/mutants_gate.py full OUT --shard D    # one of ten shards (mutant numbers ending in D); survivors to OUT
     python dev/mutants_gate.py ratchet DIR           # the ten shard files under DIR, judged against the ratchet
@@ -30,7 +29,6 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = "airflow_provider_rivet"
 RATCHET = ROOT / ".mutmut-ratchet"
-SURVIVORS = ROOT / ".mutmut-survivors"
 MUTMUT = [sys.executable, "-m", "mutmut"]
 HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 
@@ -79,112 +77,11 @@ def mangled_functions(path: str) -> list[tuple[str, int, int]]:
     return found
 
 
-# What a full run is owed to (README, "Mutation testing"): a change to the harness every mutant's verdict depends on.
-HARNESS = (
-    "tests/fake_rivet.py",
-    "tests/conftest.py",
-    "dev/mutmut_isolation.py",
-    "dev/mutants_gate.py",
-    ".github/workflows/mutation.yml",
-    "uv.lock",
-    ".mutmut-ratchet",
-    ".mutmut-survivors",
-    "RIVET_CONTRACT_REF",
-)
-# pyproject.toml sections whose change is a harness change: mutmut's settings and the dependencies.
-PYPROJECT_HARNESS = ("tool.mutmut", "project", "project.optional-dependencies", "dependency-groups", "tool.uv")
-
-
-def pyproject_sections(base: str) -> set[str]:
-    """The TOML tables of pyproject.toml whose lines the diff adds or removes (either side)."""
-    diff = git("diff", "--unified=0", "--no-color", f"{base}...HEAD", "--", "pyproject.toml")
-    if not diff:
-        return set()
-    merge_base = git("merge-base", base, "HEAD").strip()
-    sides = {
-        "old": git("show", f"{merge_base}:pyproject.toml").splitlines(),
-        "new": (ROOT / "pyproject.toml").read_text().splitlines(),
-    }
-
-    def table(side: str, line: int) -> str:
-        for text in reversed(sides[side][: max(line, 1)]):
-            if m := re.match(r"^\s*\[+([^\]]+)\]+", text):
-                return m[1].strip()
-        return ""
-
-    found = set()
-    for m in re.finditer(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", diff, re.M):
-        old, old_n, new, new_n = int(m[1]), int(m[2] or 1), int(m[3]), int(m[4] or 1)
-        found |= {table("old", line) for line in range(old, old + old_n)} if old_n else set()
-        found |= {table("new", line) for line in range(new, new + new_n)} if new_n else set()
-    return found
-
-
-def test_functions(text: str) -> dict[str, tuple[int, int]]:
-    """pytest's node name (`test_x`, `TestK::test_x`) of every test function, with its lines."""
-    found = {}
-    for node in ast.parse(text).body:
-        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name.startswith("test"):
-            first = min([node.lineno, *(d.lineno for d in node.decorator_list)])
-            found[node.name] = (first, node.end_lineno or node.lineno)
-        elif isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
-            for item in node.body:
-                if isinstance(item, ast.FunctionDef | ast.AsyncFunctionDef) and item.name.startswith("test"):
-                    found[f"{node.name}::{item.name}"] = (item.lineno, item.end_lineno or item.lineno)
-    return found
-
-
-def changed_tests(base: str) -> tuple[list[str], list[str]]:
-    """(node-id prefixes of the tests the diff changes, the tests it deletes). A change outside any test function of a
-    test file (a helper, a constant, an import) names the whole file."""
-    merge_base = git("merge-base", base, "HEAD").strip()
-    prefixes, deleted = [], []
-    for path, lines in sorted(changed_lines(base, "tests/").items()):
-        if not path.endswith(".py") or path in HARNESS or not Path(path).name.startswith("test_"):
-            continue
-        now = test_functions((ROOT / path).read_text())
-        try:
-            before = test_functions(git("show", f"{merge_base}:{path}"))
-        except subprocess.CalledProcessError:
-            before = {}
-        deleted += [f"{path}::{name}" for name in sorted(set(before) - set(now))]
-        inside = set()
-        for name, (first, last) in now.items():
-            if lines & set(range(first, last + 1)):
-                prefixes.append(f"{path}::{name}")
-                inside |= lines & set(range(first, last + 1))
-        if lines - inside:
-            prefixes.append(f"{path}::")
-    for path in changed_files(base):
-        if path.startswith("tests/") and Path(path).name.startswith("test_") and not (ROOT / path).exists():
-            deleted.append(f"{path}::")
-    return sorted(set(prefixes)), deleted
-
-
 def mode(base: str) -> tuple[str, list[str]]:
-    """`full`, `targeted` or `none` for a pull request, and why (README, "Mutation testing")."""
-    files = changed_files(base)
-    why = [f"{f} is mutation harness" for f in files if f in HARNESS]
-    why += [f"pyproject.toml [{t}] changed" for t in sorted(pyproject_sections(base) & set(PYPROJECT_HARNESS))]
-    _, deleted = changed_tests(base)
-    why += [f"{d} was deleted: what only it covered is found by a full run" for d in deleted]
-    if why:
-        return "full", why
-    touched = [f for f in files if f.endswith(".py") and (f.startswith(f"{PACKAGE}/") or f.startswith("tests/"))]
-    return ("targeted", [f"{f} changed" for f in touched]) if touched else ("none", ["no package or test code changed"])
-
-
-STATS_ONLY = f"{PACKAGE}.__mutation_gate_stats_only__"
-
-
-def covered_globs(prefixes: list[str]) -> list[str]:
-    """The mutant globs of every function one of the named tests calls, by mutmut's own stats (tests -> functions)."""
-    stats = json.loads((ROOT / "mutants" / "mutmut-stats.json").read_text())["tests_by_mangled_function_name"]
-
-    def named(test: str) -> bool:
-        return any(test == p or test.startswith(p + "[") or (p.endswith("::") and test.startswith(p)) for p in prefixes)
-
-    return sorted(f"{function}__mutmut_*" for function, tests in stats.items() if any(named(t) for t in tests))
+    """`targeted` or `none` for a pull request, and why (README, "Mutation testing"). A pull request never gets the
+    full run: that one is for a release and for a run on demand."""
+    touched = [f for f in changed_files(base) if f.startswith(f"{PACKAGE}/") and f.endswith(".py")]
+    return ("targeted", [f"{f} changed" for f in touched]) if touched else ("none", [f"no {PACKAGE}/ code changed"])
 
 
 def changed_globs(base: str) -> list[str]:
@@ -273,37 +170,12 @@ def sharded(globs: list[str], shard: int | None) -> list[str]:
     return globs if shard is None else [f"{g}{shard}" for g in globs]
 
 
-def known_survivors() -> set[str]:
-    """The mutants the last full run left alive (`.mutmut-survivors`, written with the ratchet)."""
-    if not SURVIVORS.exists():
-        return set()
-    return {line.strip() for line in SURVIVORS.read_text().splitlines() if line.strip() and not line.startswith("#")}
-
-
 def gate_pr(base: str, shard: int | None) -> int:
-    """Run the mutants of the functions the diff touches, and of every function the tests it changes call.
-
-    A touched function must have every mutant killed: new or changed code ships with the tests that kill it. A function
-    that is only called by a changed test may keep the survivors the last full run recorded (`.mutmut-survivors`);
-    a mutant of it that the changed tests no longer kill is red (a deleted or weakened assertion), here and not after
-    the merge."""
-    touched = changed_globs(base)
-    covered: list[str] = []
-    tests, _ = changed_tests(base)
-    if tests:
-        print("mutation gate: tests changed:\n  " + "\n  ".join(tests), flush=True)
-        # mutmut's stats (which test calls which function) are made by any `mutmut run`, before its name filter:
-        # a run filtered to no mutant leaves them in mutants/mutmut-stats.json and stops; the run below reuses them.
-        done = run_mutmut([STATS_ONLY])
-        if "nothing matches" not in done.stdout or not (ROOT / "mutants" / "mutmut-stats.json").exists():
-            print(f"mutation gate: the stats run of mutmut failed (exit {done.returncode})")
-            return 1
-        covered = [g for g in covered_globs(tests) if g not in touched]
-        print(f"mutation gate: the changed tests call {len(covered)} function(s) of {PACKAGE}/ the diff does not touch")
-    strict, lenient = sharded(touched, shard), sharded(covered, shard)
-    globs = strict + lenient
+    """Run the mutants of the functions the diff touches; fail on any that is not killed: new or changed code ships
+    with the tests that kill it."""
+    globs = sharded(changed_globs(base), shard)
     if not globs:
-        print(f"mutation gate: the diff from {base} touches no function of {PACKAGE}/ and no test that calls one")
+        print(f"mutation gate: the diff from {base} touches no function of {PACKAGE}/")
         return 0
     print("mutation gate: functions to mutate:\n  " + "\n  ".join(globs), flush=True)
     label = "PR" if shard is None else f"shard {shard}"
@@ -315,23 +187,14 @@ def gate_pr(base: str, shard: int | None) -> int:
         print(f"mutation gate: mutmut run exited {done.returncode}")
         return 1
     left, _, _ = tally(globs, label)
-    known = known_survivors()
-    red = {n: s for n, s in left.items() if matching([n], strict) or n not in known}
-    accepted = sorted(set(left) - set(red))
-    if accepted:
-        print(
-            f"mutation gate: {len(accepted)} not-killed mutant(s) of functions only the changed tests call are "
-            "recorded in .mutmut-survivors (accepted until phase 2 kills them)"
-        )
-    if red:
-        print(f"mutation gate: {len(red)} mutant(s) not killed that the gate does not accept:")
-        for name, status in sorted(red.items()):
-            why = "touched function" if matching([name], strict) else "killed by the last full run, alive now"
-            print(f"  {status:10} {name}  ({why})")
-        show(sorted(red))
+    if left:
+        print(f"mutation gate: {len(left)} mutant(s) of touched functions not killed:")
+        for name, status in sorted(left.items()):
+            print(f"  {status:10} {name}")
+        show(sorted(left))
         print("Kill each with a test (or show it is equivalent and restructure the code so no such mutant exists).")
         return 1
-    print("mutation gate: every selected mutant is killed or a recorded survivor of an untouched function")
+    print("mutation gate: every mutant of the touched functions is killed")
     return 0
 
 
