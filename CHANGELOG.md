@@ -67,3 +67,23 @@ Changed before the first release, after review (see the README sections named):
   a callback in `default_args` fires once per failed task.
 - `connection_url`: a password without a login, IPv6 hosts, Oracle `service_name`, an encoded
   database name. The version has one source, `airflow_provider_rivet/__init__.py`.
+
+The environment built from Connections, after the 2026-10 bug hunt (`connections.build_environment`
+is now the one place rivet's environment is assembled; README "Storage and warehouse connections"):
+
+- A storage Connection that supplies a credential replaces the worker's variables of its kind
+  (`cloud_credentials`, `env_passthrough`): the worker's `AWS_SESSION_TOKEN` no longer rides beside
+  a Connection's static keys, nor its Azure account key beside a Connection's SAS token. (D12)
+- An AWS Connection with `role_arn`, `assume_role_*`, `profile_name` or keys in extras is refused
+  (`RIVET_AIRFLOW_CONNECTION_UNSUPPORTED`) instead of running as the worker's identity. (D13)
+- Snowflake: with a private key, the Connection's password reaches `snow` as
+  `PRIVATE_KEY_PASSPHRASE` (D14); a base64 `private_key_content` is decoded to PEM, and content
+  that is neither is refused (D15); the extra `region` is written to the `snow` connection (D19);
+  `config.toml` is written as TOML, so a non-BMP or control character in any field reads back
+  unchanged (D20).
+- `connection_url` maps the standard extras with a URL form (PostgreSQL `sslmode`, MongoDB `srv`,
+  `authSource`, ...) and refuses `iam`, `redshift`, `unix_socket` (D21); only a real IPv6 literal
+  is bracketed, with its zone encoded as `%25` (D23).
+- A ClickHouse Connection without a host is refused (`RIVET_AIRFLOW_CONNECTION_INCOMPLETE`)
+  instead of becoming `http://None`. (D22)
+- README: an Azure config reads `account_name: ${AZURE_STORAGE_ACCOUNT}`. (D32)
