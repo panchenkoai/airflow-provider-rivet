@@ -170,9 +170,42 @@ def sharded(globs: list[str], shard: int | None) -> list[str]:
     return globs if shard is None else [f"{g}{shard}" for g in globs]
 
 
+def mutated_line(name: str) -> tuple[str, int] | None:
+    """(source path, line) a mutant changes: the first line where its function in mutmut's tree differs from the
+    function's `__mutmut_orig` copy, counted from the function's `def` in the source (mutmut copies the body as written).
+    `None` when the copies cannot be found."""
+    module, _, mangled = name.rpartition("__mutmut_")[0].partition(".")[2].partition(".")
+    path = f"{PACKAGE}/{module}.py"
+    mutated = ROOT / "mutants" / path
+    if not mutated.is_file():
+        return None
+    text = mutated.read_text()
+    found = {
+        node.name: ast.get_source_segment(text, node).splitlines()
+        for node in ast.walk(ast.parse(text))
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name.startswith(mangled)
+    }
+    orig, mutant = found.get(f"{mangled}__mutmut_orig"), found.get(f"{mangled}__mutmut_{name.rpartition('__mutmut_')[2]}")
+    tree = ast.parse((ROOT / path).read_text())
+    defs = {f"x_{n.name}": n.lineno for n in tree.body if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)}
+    defs |= {
+        f"xǁ{c.name}ǁ{n.name}": n.lineno
+        for c in tree.body
+        if isinstance(c, ast.ClassDef)
+        for n in c.body
+        if isinstance(n, ast.FunctionDef | ast.AsyncFunctionDef)
+    }
+    first = defs.get(mangled)  # the `def` line, below any decorator
+    if orig is None or mutant is None or first is None:
+        return None
+    offset = next((i for i, (a, b) in enumerate(zip(orig[1:], mutant[1:], strict=False), 1) if a != b), len(orig) - 1)
+    return path, first + offset
+
+
 def gate_pr(base: str, shard: int | None) -> int:
-    """Run the mutants of the functions the diff touches; fail on any that is not killed: new or changed code ships
-    with the tests that kill it."""
+    """Run the mutants of the functions the diff touches; fail on any not killed that mutates a line the diff changes:
+    new or changed code ships with the tests that kill it. A survivor elsewhere in a touched function was there before
+    the pull request; it is listed, not failed."""
     globs = sharded(changed_globs(base), shard)
     if not globs:
         print(f"mutation gate: the diff from {base} touches no function of {PACKAGE}/")
@@ -187,14 +220,19 @@ def gate_pr(base: str, shard: int | None) -> int:
         print(f"mutation gate: mutmut run exited {done.returncode}")
         return 1
     left, _, _ = tally(globs, label)
-    if left:
-        print(f"mutation gate: {len(left)} mutant(s) of touched functions not killed:")
-        for name, status in sorted(left.items()):
-            print(f"  {status:10} {name}")
-        show(sorted(left))
+    changed = changed_lines(base)
+    where = {name: mutated_line(name) for name in left}
+    red = sorted(n for n, at in where.items() if at is None or at[1] in changed.get(at[0], set()))
+    for name in sorted(set(left) - set(red)):
+        print(f"  {left[name]:10} {name}  (line {where[name][1]}, not changed by this pull request)")
+    if red:
+        print(f"mutation gate: {len(red)} mutant(s) on changed lines not killed:")
+        for name in red:
+            print(f"  {left[name]:10} {name}")
+        show(red)
         print("Kill each with a test (or show it is equivalent and restructure the code so no such mutant exists).")
         return 1
-    print("mutation gate: every mutant of the touched functions is killed")
+    print("mutation gate: every mutant on a changed line is killed")
     return 0
 
 
