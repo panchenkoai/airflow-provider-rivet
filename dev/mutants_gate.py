@@ -76,7 +76,7 @@ def changed_globs(base: str) -> list[str]:
     for path, lines in sorted(changed_lines(base).items()):
         if not (ROOT / path).is_file():
             continue
-        module = path.removesuffix(".py").replace("/", ".")
+        module = path.removesuffix(".py").removesuffix("/__init__").replace("/", ".")
         for name, first, last in mangled_functions(path):
             if lines & set(range(first, last + 1)):
                 globs.append(f"{module}.{name}__mutmut_*")
