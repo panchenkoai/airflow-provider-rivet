@@ -5,6 +5,8 @@ name: Mutation
 # - pull request: the mutants of every function the PR touches; any one not killed fails the job.
 # - push to main, nightly, on demand, and the release (release.yml calls this workflow on the tagged commit): every
 #   mutant; fails when more are not killed than `.mutmut-ratchet` allows.
+# Ten shards (the mutants whose number ends in 0, 1, ... 9) run in parallel: a surviving mutant of a function every
+# test passes through runs the whole suite, so one runner would need most of a day for the package.
 
 on:
   pull_request:
@@ -28,10 +30,14 @@ env:
 
 jobs:
   changed:
-    name: Mutants of the touched functions
+    name: Mutants of the touched functions (shard ${{ matrix.shard }})
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
     steps:
       - uses: actions/checkout@v7
         with:
@@ -56,13 +62,17 @@ jobs:
           key: mutation-${{ runner.os }}-${{ hashFiles('uv.lock', '.python-version') }}-${{ env.MUTMUT }}
       - run: uv sync --locked
       - name: Every mutant of the functions this PR touches is killed
-        run: uv run --with "$MUTMUT" python dev/mutants_gate.py pr "origin/${{ github.base_ref }}"
+        run: uv run --with "$MUTMUT" python dev/mutants_gate.py pr "origin/${{ github.base_ref }}" --shard ${{ matrix.shard }}
 
   full:
-    name: Every mutant, against the ratchet
+    name: Every mutant (shard ${{ matrix.shard }})
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/checkout@v7
@@ -84,13 +94,23 @@ jobs:
             .venv
           key: mutation-${{ runner.os }}-${{ hashFiles('uv.lock', '.python-version') }}-${{ env.MUTMUT }}
       - run: uv sync --locked
-      - name: Not-killed mutants stay within .mutmut-ratchet
-        run: uv run --with "$MUTMUT" python dev/mutants_gate.py full
-      - name: Survivor list
-        if: always()
-        run: uv run --with "$MUTMUT" mutmut results > mutmut-results.txt || true
+      - name: The shard's mutants
+        run: uv run --with "$MUTMUT" python dev/mutants_gate.py full "not-killed-${{ matrix.shard }}.json" --shard ${{ matrix.shard }}
       - uses: actions/upload-artifact@v4
-        if: always()
         with:
-          name: mutmut-results-${{ github.sha }}
-          path: mutmut-results.txt
+          name: mutation-shard-${{ matrix.shard }}
+          path: not-killed-${{ matrix.shard }}.json
+
+  ratchet:
+    name: Every mutant, against the ratchet
+    needs: full
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: mutation-shard-*
+          path: shards
+      - name: Not-killed mutants stay within .mutmut-ratchet
+        run: python3 dev/mutants_gate.py ratchet shards

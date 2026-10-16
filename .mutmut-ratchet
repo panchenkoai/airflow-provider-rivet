@@ -1,0 +1,4 @@
+# The most mutants of airflow_provider_rivet/ that may survive the full mutation run (dev/mutants_gate.py; README,
+# "Mutation testing"). Lower it whenever tests kill survivors; raising it needs a dated line here saying which
+# mutants are accepted and why.
+99999

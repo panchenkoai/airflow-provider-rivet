@@ -646,6 +646,8 @@ CI (`.github/workflows/mutation.yml`, on Linux, through `dev/mutants_gate.py`):
   tests that kill its mutants.
 - **push to main, nightly, on demand**: every mutant; the job prints `survivors N <= ratchet M` and fails when N
   exceeds the number in `.mutmut-ratchet`.
+- Both run as ten parallel shards (the mutants whose number ends in 0 ... 9): a survivor of a function every test
+  passes through (`_Session.step`) runs the whole suite, so one runner would need most of a day.
 - **release**: `release.yml` runs the same full job on the tagged commit itself before it builds, so no version is
   published from a commit whose mutants were not counted.
 
