@@ -120,4 +120,4 @@ def test_every_degradation_is_documented_in_the_readme_and_every_recorded_key_is
 def test_throwaway_lease_busy_names_only_the_busy_codes() -> None:
     from airflow_provider_rivet.result import lease_busy
 
-    lease_busy("RIVET_LOAD_TABLE_BUSY"), lease_busy("RIVET_X")
+    assert lease_busy("RIVET_LOAD_TABLE_BUSY") is True and lease_busy("RIVET_X") is False
