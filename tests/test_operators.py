@@ -1367,3 +1367,28 @@ def test_a_narrowed_copy_keeps_the_recipes_the_streams_backfill_reads(rig: Rig, 
     rig.run(rig.operator(RivetLoadOperator, export=export, table="orders"))
     names = [e["name"] for e in yaml.safe_load(rig.copy(export).read_text())["exports"]]
     assert names == kept, "a stream without its backfill recipes is refused by rivet: RIVET_CONFIG_CDC_SHAPE_INVALID"
+
+
+FAILED_ROW = {"run_id": "l1", "per_table": [{"export": "orders", "table": "users", "status": "failed", "error": None}]}
+
+
+def test_a_failed_table_row_without_its_error_fails_the_task_on_exit_zero(rig: Rig) -> None:
+    """The row's error is the process-level one, built from the exit when rivet printed none; without it the failed
+    unit had no error and the task ended success (mutants _load 139 / 140 / 150)."""
+    rig.scenario(flags=NEW_FLAGS, load={"summary": FAILED_ROW})
+    exc, ti = rig.run(rig.operator(RivetLoadOperator, export="orders", table="users"))
+    payload = ti.store[("task", "return_value")]
+    assert type(exc) is AirflowFailException and payload["decision"] == "fail"
+    (unit,) = payload["units"]
+    assert unit["status"] == "failed" and unit["error"]["class"] == "generic"
+    assert payload["degraded"] == ["exit_zero_failed_unit", "state_url_sqlite"], "one failed unit: no per_unit_error"
+
+
+def test_a_failed_table_row_without_its_error_takes_the_printed_process_error(rig: Rig) -> None:
+    """With a printed retryable line the row's error IS that line, so the task is retried (mutant _load 140)."""
+    line = {"class": "retryable", "retryable": True, "exit_code": 2, "exit_class": 2, "code": "RIVET_NET", "error": "reset"}
+    rig.scenario(flags=NEW_FLAGS, load={"exit": 2, "line": line, "summary": FAILED_ROW})
+    exc, ti = rig.run(rig.operator(RivetLoadOperator, export="orders", table="users"))
+    payload = ti.store[("task", "return_value")]
+    assert type(exc) is AirflowException and payload["decision"] == "retry"
+    assert (payload["units"][0]["error"]["code"], payload["units"][0]["error"]["class"]) == ("RIVET_NET", "retryable")
