@@ -74,6 +74,15 @@ Changed before the first release, after review (see the README sections named):
   signatures). ("Storage and warehouse connections", "DAG builders", "Operators")
 - `build_batch_dag(exports=[])` raises `ValueError`; the watcher carries no failure callback, so
   a callback in `default_args` fires once per failed task.
+- The config is read as rivet reads it. `${name}` is resolved from `-p` and the task's env before
+  the guards look at `mode`, `name` and `cdc.checkpoint` (a templated CDC mode passed the
+  CDC-on-pod guard; a templated checkpoint was looked for under its literal name); an unresolved
+  mode counts as `cdc`, an unresolved name or checkpoint is refused
+  (`RIVET_AIRFLOW_CONFIG_UNRESOLVED`). Scalars follow serde_yaml_ng: `08` / `09` no longer crash
+  the preflight, `017` is not 15, and `name: 2024` is found. The single-export copy for load /
+  compact is cut out of the original text instead of re-serialised, so a quoted `'${SECRET}'`
+  keeps its quotes; a text that cannot be cut safely is refused
+  (`RIVET_AIRFLOW_CONFIG_NARROW_UNSAFE`). (D06, D07, D09)
 - `connection_url`: a password without a login, IPv6 hosts, Oracle `service_name`, an encoded
   database name. The version has one source, `airflow_provider_rivet/__init__.py`.
 - `slack_failure_callback` on a mapped task reports its own index's code and class; it said "no
@@ -119,9 +128,11 @@ is now the one place rivet's environment is assembled; README "Storage and wareh
 - A Connection id no backend defines (`env_from_connections`, `connections`) is refused,
   `RIVET_AIRFLOW_CONNECTION_MISSING`, with the refusal in XCom; it was retried with no XCom.
 - A config that is not UTF-8, nests too deep, holds a scalar Python cannot convert, or whose
-  `exports` is not a list of mappings with a string `name`, is refused
-  `RIVET_AIRFLOW_CONFIG_UNREADABLE`; it crashed with a traceback and was retried. The
-  Connection resolution reads the config through the same reader.
+  `exports` is not a list of mappings with a scalar `name` (read as its text: `name: 2024` is the
+  export `2024`), is refused `RIVET_AIRFLOW_CONFIG_UNREADABLE`; it crashed with a traceback and
+  was retried. The Connection resolution reads the config through the same reader, with `${...}`
+  resolved from `-p` and the task's env, so a templated `load.password_env` / `load.connection`
+  names the variable rivet reads.
 - A rivet binary whose `--version` or `<sub> --help` probe fails or times out, in the preflight
   or while argv is built, is refused `RIVET_AIRFLOW_BINARY_MISSING` with the refusal in XCom; it
   raised a raw `RuntimeError` / `TimeoutExpired` and was retried.
