@@ -705,8 +705,8 @@ When mutants run (`.github/workflows/mutation.yml`, on Linux, through `dev/mutan
 | change | what runs | fails when |
 |---|---|---|
 | a pull request changes `airflow_provider_rivet/` code | the mutants of every function it touches | any of them is not killed |
-| a pull request changes a test file | also the mutants of every function the changed tests call (mutmut's own stats, tests → functions): a deleted or weakened assertion goes red on the pull request, not after the merge | any of them is not killed |
-| a pull request deletes a test, or changes the shared harness: `tests/fake_rivet.py`, `tests/conftest.py`, `dev/mutmut_isolation.py`, `dev/mutants_gate.py`, `.github/workflows/mutation.yml`, `.mutmut-ratchet`, `RIVET_CONTRACT_REF`, `uv.lock`, pyproject's `[tool.mutmut]` / dependency tables | the full run | more mutants survive than `.mutmut-ratchet` |
+| a pull request changes a test file | also the mutants of every function the changed tests call (mutmut's own stats, tests → functions) | one of them that the last full run killed is alive (not in `.mutmut-survivors`): a deleted or weakened assertion goes red on the pull request, not after the merge |
+| a pull request deletes a test, or changes the shared harness: `tests/fake_rivet.py`, `tests/conftest.py`, `dev/mutmut_isolation.py`, `dev/mutants_gate.py`, `.github/workflows/mutation.yml`, `.mutmut-ratchet`, `.mutmut-survivors`, `RIVET_CONTRACT_REF`, `uv.lock`, pyproject's `[tool.mutmut]` / dependency tables | the full run | more mutants survive than `.mutmut-ratchet` |
 | a release (`release.yml` runs it on the tagged commit before it builds) | the full run | as above: nothing is published from a commit whose mutants were not counted |
 | on demand (workflow_dispatch) | the full run | as above |
 
@@ -717,6 +717,8 @@ graded every mutant exactly once (`sum(tested) == total`) and `survivors N <= ra
 every test passes through (`_Session.step`) runs the whole suite, so one runner would need most of a day.
 
 Moving the ratchet: it changes only through a full run, and a pull request that edits `.mutmut-ratchet` gets one.
+`.mutmut-survivors` lists the survivors of that run by name (the ratchet job uploads it as `mutmut-survivors`); the
+two are committed together.
 Lowering it (after tests kill survivors) is an ordinary PR; raising it needs a dated comment line in that file saying
 which mutants are accepted and why.
 

@@ -4,14 +4,16 @@ name: Mutation
 # so the PR_SET_PDEATHSIG test runs. When mutants run:
 # 1. A pull request that changes airflow_provider_rivet/ code: the mutants of every function it touches.
 # 2. A pull request that changes a test file: also the mutants of every function those changed tests call (mutmut's
-#    own stats, tests -> functions), so a deleted or weakened assertion goes red on the pull request. A pull request
+#    own stats, tests -> functions). A mutant of such a function that the last full run killed and that is alive now
+#    (not in `.mutmut-survivors`) fails: a deleted or weakened assertion goes red on the pull request. A pull request
 #    that deletes a test runs case 3 instead: what only that test covered is found by a full run.
 # 3. A pull request that changes the shared harness (tests/fake_rivet.py, tests/conftest.py, dev/mutmut_isolation.py,
-#    dev/mutants_gate.py, this file, .mutmut-ratchet, RIVET_CONTRACT_REF, uv.lock, or pyproject.toml's [tool.mutmut] /
+#    dev/mutants_gate.py, this file, .mutmut-ratchet, .mutmut-survivors, RIVET_CONTRACT_REF, uv.lock, or pyproject.toml's [tool.mutmut] /
 #    dependency tables): the full run, judged against `.mutmut-ratchet`.
 # 4. A release (release.yml calls this workflow on the tagged commit): the full run.
 # 5. On demand (workflow_dispatch): the full run. There is no run on push to main and no nightly run.
-# In cases 1 and 2 any mutant not killed fails the job. The ratchet changes only through a full run (3, 4 or 5).
+# In case 1 any mutant of a touched function not killed fails the job. The ratchet (and the survivor list beside it)
+# changes only through a full run (3, 4 or 5).
 # Ten shards (the mutants whose number ends in 0, 1, ... 9) run in parallel: a surviving mutant of a function every
 # test passes through runs the whole suite, so one runner would need most of a day for the package.
 
@@ -132,3 +134,8 @@ jobs:
           path: shards
       - name: The shards graded every mutant once, and no more survive than .mutmut-ratchet allows
         run: python3 dev/mutants_gate.py ratchet shards
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutmut-survivors
+          path: shards/mutmut-survivors.txt

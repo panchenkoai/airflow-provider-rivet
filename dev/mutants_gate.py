@@ -30,6 +30,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 PACKAGE = "airflow_provider_rivet"
 RATCHET = ROOT / ".mutmut-ratchet"
+SURVIVORS = ROOT / ".mutmut-survivors"
 MUTMUT = [sys.executable, "-m", "mutmut"]
 HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 
@@ -87,6 +88,7 @@ HARNESS = (
     ".github/workflows/mutation.yml",
     "uv.lock",
     ".mutmut-ratchet",
+    ".mutmut-survivors",
     "RIVET_CONTRACT_REF",
 )
 # pyproject.toml sections whose change is a harness change: mutmut's settings and the dependencies.
@@ -271,10 +273,22 @@ def sharded(globs: list[str], shard: int | None) -> list[str]:
     return globs if shard is None else [f"{g}{shard}" for g in globs]
 
 
+def known_survivors() -> set[str]:
+    """The mutants the last full run left alive (`.mutmut-survivors`, written with the ratchet)."""
+    if not SURVIVORS.exists():
+        return set()
+    return {line.strip() for line in SURVIVORS.read_text().splitlines() if line.strip() and not line.startswith("#")}
+
+
 def gate_pr(base: str, shard: int | None) -> int:
-    """Run the mutants of the functions the diff touches and of every function the tests it changes call; every one
-    must be killed (a deleted or weakened assertion turns red here, not after the merge)."""
-    globs = changed_globs(base)
+    """Run the mutants of the functions the diff touches, and of every function the tests it changes call.
+
+    A touched function must have every mutant killed: new or changed code ships with the tests that kill it. A function
+    that is only called by a changed test may keep the survivors the last full run recorded (`.mutmut-survivors`);
+    a mutant of it that the changed tests no longer kill is red (a deleted or weakened assertion), here and not after
+    the merge."""
+    touched = changed_globs(base)
+    covered: list[str] = []
     tests, _ = changed_tests(base)
     if tests:
         print("mutation gate: tests changed:\n  " + "\n  ".join(tests), flush=True)
@@ -284,31 +298,40 @@ def gate_pr(base: str, shard: int | None) -> int:
         if "nothing matches" not in done.stdout or not (ROOT / "mutants" / "mutmut-stats.json").exists():
             print(f"mutation gate: the stats run of mutmut failed (exit {done.returncode})")
             return 1
-        covered = covered_globs(tests)
-        print(f"mutation gate: the changed tests call {len(covered)} function(s) of {PACKAGE}/", flush=True)
-        globs = sorted(set(globs) | set(covered))
-    globs = sharded(globs, shard)
+        covered = [g for g in covered_globs(tests) if g not in touched]
+        print(f"mutation gate: the changed tests call {len(covered)} function(s) of {PACKAGE}/ the diff does not touch")
+    strict, lenient = sharded(touched, shard), sharded(covered, shard)
+    globs = strict + lenient
     if not globs:
         print(f"mutation gate: the diff from {base} touches no function of {PACKAGE}/ and no test that calls one")
         return 0
     print("mutation gate: functions to mutate:\n  " + "\n  ".join(globs), flush=True)
-    label = "touched functions" if shard is None else f"shard {shard}"
+    label = "PR" if shard is None else f"shard {shard}"
     done = run_mutmut(globs, label, globs)
     if done.returncode != 0:
         if "nothing matches" in done.stdout:
-            print("mutation gate: the touched functions have no mutants in this shard")
+            print("mutation gate: the selected functions have no mutants in this shard")
             return 0
         print(f"mutation gate: mutmut run exited {done.returncode}")
         return 1
     left, _, _ = tally(globs, label)
-    if left:
-        print(f"mutation gate: {len(left)} mutant(s) of the touched functions not killed:")
-        for name, status in sorted(left.items()):
-            print(f"  {status:10} {name}")
-        show(sorted(left))
+    known = known_survivors()
+    red = {n: s for n, s in left.items() if matching([n], strict) or n not in known}
+    accepted = sorted(set(left) - set(red))
+    if accepted:
+        print(
+            f"mutation gate: {len(accepted)} not-killed mutant(s) of functions only the changed tests call are "
+            "recorded in .mutmut-survivors (accepted until phase 2 kills them)"
+        )
+    if red:
+        print(f"mutation gate: {len(red)} mutant(s) not killed that the gate does not accept:")
+        for name, status in sorted(red.items()):
+            why = "touched function" if matching([name], strict) else "killed by the last full run, alive now"
+            print(f"  {status:10} {name}  ({why})")
+        show(sorted(red))
         print("Kill each with a test (or show it is equivalent and restructure the code so no such mutant exists).")
         return 1
-    print("mutation gate: every mutant of the touched functions is killed")
+    print("mutation gate: every selected mutant is killed or a recorded survivor of an untouched function")
     return 0
 
 
@@ -396,6 +419,8 @@ def gate_ratchet(folder: Path) -> int:
     left: dict[str, str] = {}
     for doc in docs.values():
         left.update(doc["not_killed"])
+    (folder / "mutmut-survivors.txt").write_text("".join(f"{name}\n" for name in sorted(left)))
+    print(f"mutation gate: the {len(left)} survivors are in {folder / 'mutmut-survivors.txt'} (for .mutmut-survivors)")
     return judge(left)
 
 
