@@ -1,4 +1,6 @@
 # The most mutants of airflow_provider_rivet/ that may survive the full mutation run (dev/mutants_gate.py; README,
 # "Mutation testing"). Lower it whenever tests kill survivors; raising it needs a dated line here saying which
 # mutants are accepted and why.
-99999
+# 2026-10-16: baseline of the first full run (GitHub Actions run 38889642607, Linux, mutmut 3.8.0): 1078 of 5254
+# mutants not killed (1070 survived, 2 no tests, 6 segfault = memory-runaway loops under the per-worker cap).
+1078
