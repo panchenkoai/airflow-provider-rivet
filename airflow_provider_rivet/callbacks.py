@@ -1,14 +1,14 @@
-"""Failure alerting through Airflow: a one-line Slack title per failed task, and its full trace in a thread.
+"""Failure alerting through Airflow: a one-line Slack title per failed task, and its error text in a thread.
 
 With a bot token (`SlackHook`, a `slack` Connection) the channel gets the title, the run id and the task-log link; the
-trace (the Airflow traceback and rivet's stderr of the failed step, redacted, size-capped) is a reply in that message's
-thread. An incoming webhook (`SlackWebhookHook`) cannot thread: it posts the title and a capped trace as one message.
+error text (rivet's error line of the failed step, else the exception's message; redacted, capped) is a reply in that
+message's thread. An incoming webhook (`SlackWebhookHook`) cannot thread: it posts title and error text as one message.
 """
 
 from __future__ import annotations
 
+import json
 import logging
-import traceback
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -16,12 +16,11 @@ from typing import Any
 from .operators import XCOM_KEY
 
 MAX_UNITS = 10
-# a reply holds the trace as a code block up to this size; a longer one becomes a file snippet in the thread
+# the thread's code block; a webhook message carries title and link too, and stays under Slack's 4000
 THREAD_TEXT_LIMIT = 3500
-# a webhook message has no thread and no file: title, context and the trace together stay under Slack's 4000
-WEBHOOK_TRACE_LIMIT = 3000
-# the snippet file, and how much of rivet's stderr file is read (its end: the failure is the last thing it wrote)
-FILE_LIMIT = 200_000
+WEBHOOK_TEXT_LIMIT = 3000
+# how much of the end of rivet's stderr file is read for its error lines
+STDERR_TAIL = 65_536
 # a child of Airflow's task logger: the line lands in the task log on Airflow 2 and 3 alike
 log = logging.getLogger("airflow.task.rivet_slack")
 
@@ -103,79 +102,49 @@ def _redact(text: str) -> str:
     return str(redact(text))
 
 
-def _tail(text: str, budget: int) -> str:
-    """The end of a text in at most `budget` characters, saying how much was cut from its start."""
-    if len(text) <= budget:
-        return text
-    marker = f"… {len(text) - budget} characters cut …\n"
-    return marker + text[len(text) - max(budget - len(marker), 0) :]
+def _rivet_errors(payload: Mapping[str, Any]) -> list[str]:
+    """rivet's error lines in the failed step's stderr file: its `--json-errors` objects, else `Error:` lines.
 
-
-def _stderr_of(payload: Mapping[str, Any]) -> tuple[str, str, bool] | None:
-    """(path, text, whether its start was not read) of the failed step's stderr file; None when there is none."""
+    Only the end of the file is read: the error is the last thing rivet writes.
+    """
     path = payload.get("stderr_path")
     if not path:
-        return None
+        return []
     try:
         with open(path, "rb") as f:
-            size = f.seek(0, 2)
-            f.seek(max(size - FILE_LIMIT, 0))
-            data = f.read()
-    except OSError as exc:
-        return path, f"(not readable on the worker: {type(exc).__name__})", False
-    return path, data.decode("utf-8", errors="replace").rstrip(), size > FILE_LIMIT
+            f.seek(max(f.seek(0, 2) - STDERR_TAIL, 0))
+            lines = f.read().decode("utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+    found, plain = [], []
+    for line in lines:
+        try:
+            obj = json.loads(line)
+        except ValueError:
+            obj = None
+        if isinstance(obj, dict):
+            text = obj.get("error") if isinstance(obj.get("error"), str) else obj.get("message")
+            if isinstance(text, str) and text:
+                code = obj.get("code")
+                found.append(f"[{code}] {text}" if isinstance(code, str) and code and code not in text else text)
+        elif line.lstrip().lower().startswith("error:"):
+            plain.append(line.strip())
+    return found or plain  # the human `Error:` line repeats the object when both are printed
 
 
-def _exception_text(exception: Any) -> str:
-    if isinstance(exception, BaseException):
-        return "".join(traceback.format_exception(type(exception), exception, exception.__traceback__)).rstrip()
-    return str(exception).rstrip() if exception else ""
+def format_error_text(payload: Mapping[str, Any] | None, *, exception: Any = None, limit: int, log_url: str = "") -> str:
+    """The thread's text: rivet's error line(s) of the failed step, else the exception's message; redacted, capped.
 
-
-def _summary_lines(payload: Mapping[str, Any]) -> list[str]:
-    """The failed units in plain text (the trace is a code block: no mrkdwn in it)."""
-    if not payload:
-        return ["no rivet result was published for this try (the task died outside the operator)"]
-    lines = []
-    if payload.get("preflight_refusal"):
-        lines.append(f"refused before rivet started: {payload['preflight_refusal']}")
-    for unit in _failed_units(payload)[:MAX_UNITS]:
-        error = unit["error"]
-        name = (unit.get("export") or "(process)") + (f" / {unit['table']}" if unit.get("table") else "")
-        cls, retry = error.get("class"), _retry_word(error)
-        lines.append(f"{name}: {error.get('code') or '-'} {cls + ' ' if cls and cls != retry else ''}({retry})")
-        if error.get("action"):
-            lines.append(f"  action: {error['action']}")
-    return lines
-
-
-def format_trace(payload: Mapping[str, Any] | None, *, exception: Any = None, limit: int, log_url: str = "") -> str:
-    """The thread's text: the failed units, the Airflow traceback, rivet's stderr; redacted, at most `limit` characters.
-
-    The traceback gets a third of the room when there is a stderr file; each keeps its end. When anything is cut the
-    last line says so and points at the task log.
+    No traceback and no other stderr. When the text is cut, the last line says so and points at the task log.
     """
-    payload = payload or {}
+    lines = _rivet_errors(payload or {})
+    if not lines and exception is not None:
+        lines = [str(exception) or type(exception).__name__]
+    text = _redact("\n".join(lines) or "no error text: the task failed without a rivet result or an exception")
+    if len(text) <= limit:
+        return text
     tail = f"\n… truncated, full log: {log_url or 'the task log'}"
-    parts = ["\n".join(_summary_lines(payload))]
-    room = limit - len(tail) - len(parts[0]) - 2
-    tb, stderr = _exception_text(exception), _stderr_of(payload)
-    cut = bool(stderr and stderr[2])
-    if tb:
-        label = "--- Airflow traceback ---\n"
-        budget = max((room // 3 if stderr else room) - len(label), 0)
-        cut |= len(tb) > budget
-        parts.append(label + _tail(tb, budget))
-        room -= len(parts[-1]) + 2
-    if stderr:
-        label = f"--- rivet stderr: {stderr[0]} ---\n"
-        budget = max(room - len(label), 0)
-        cut |= len(stderr[1]) > budget
-        parts.append(label + _tail(stderr[1], budget))
-    text = _redact("\n\n".join(parts))
-    if len(text) > limit - len(tail):
-        text, cut = text[: max(limit - len(tail), 0)], True
-    return text + tail if cut else text
+    return text[: max(limit - len(tail), 0)] + tail
 
 
 def _mrkdwn(text: str) -> str:
@@ -207,8 +176,8 @@ class _Alert:
         link = f" · <{self.log_url}|task log>" if self.log_url else ""
         return f"run `{_mrkdwn(self.run_id)}`{link}"
 
-    def trace(self, limit: int) -> str:
-        return format_trace(self.payload, exception=self.exception, limit=limit, log_url=self.log_url)
+    def error_text(self, limit: int) -> str:
+        return format_error_text(self.payload, exception=self.exception, limit=limit, log_url=self.log_url)
 
 
 def slack_failure_callback(
@@ -216,9 +185,9 @@ def slack_failure_callback(
 ) -> Callable[[Any], None]:
     """An `on_failure_callback` that posts a failed rivet task to Slack.
 
-    With `channel` (a channel id, `C…`): `conn_id` is a `slack` Connection holding a bot token (scopes `chat:write`,
-    `files:write`); the title goes to the channel and the trace into its thread. Without it: `conn_id` is a
-    `slackwebhook` Connection and title and trace go out as one message.
+    With `channel` (a channel id, `C…`): `conn_id` is a `slack` Connection holding a bot token (scope `chat:write`);
+    the title goes to the channel and the error text into its thread. Without it: `conn_id` is a `slackwebhook`
+    Connection and title and error text go out as one message.
     """
 
     def notify(context: Any) -> None:
@@ -247,10 +216,10 @@ def slack_failure_callback(
 
 
 def _post_webhook(alert: _Alert, conn_id: str, hook_kwargs: Mapping[str, Any]) -> None:
-    """Title, context and the capped trace as one message: a webhook returns no `ts` to thread under."""
+    """Title, context and the error text as one message: a webhook returns no `ts` to thread under."""
     from airflow.providers.slack.hooks.slack_webhook import SlackWebhookHook
 
-    text = f":x: *{_mrkdwn(alert.title)}*\n{alert.context_line}\n{_code_block(alert.trace(WEBHOOK_TRACE_LIMIT))}"
+    text = f":x: *{_mrkdwn(alert.title)}*\n{alert.context_line}\n{_code_block(alert.error_text(WEBHOOK_TEXT_LIMIT))}"
     # the hook raises on any answer but 200; the line says the alert was posted, and what Slack answered
     response = SlackWebhookHook(slack_webhook_conn_id=conn_id, **hook_kwargs).send(text=text)
     status = getattr(response, "status_code", None)
@@ -259,7 +228,7 @@ def _post_webhook(alert: _Alert, conn_id: str, hook_kwargs: Mapping[str, Any]) -
 
 
 def _post_threaded(alert: _Alert, conn_id: str, channel: str, hook_kwargs: Mapping[str, Any]) -> None:
-    """The title to the channel, then the trace as a reply in its thread: a code block, or a file when it is long."""
+    """The title to the channel, then the error text as a code block in its thread."""
     from airflow.providers.slack.hooks.slack import SlackHook
 
     client = SlackHook(slack_conn_id=conn_id, **hook_kwargs).client
@@ -271,28 +240,12 @@ def _post_threaded(alert: _Alert, conn_id: str, channel: str, hook_kwargs: Mappi
     # slack_sdk raises SlackApiError on any `ok: false`: reaching the next line means Slack accepted the message
     top = client.chat_postMessage(channel=channel, text=title, blocks=blocks)
     ts, where = top["ts"], top.get("channel") or channel
-    trace, how = alert.trace(FILE_LIMIT), "message"
-    if len(trace) > THREAD_TEXT_LIMIT:
-        try:
-            client.files_upload_v2(
-                channel=where,
-                thread_ts=ts,
-                content=trace,
-                filename=f"{alert.dag_id}.{alert.task}.trace.txt",
-                title=f"{title}: trace",
-            )
-            how = "file"
-        except Exception as exc:  # no `files:write`, or uploads disabled: the capped trace still reaches the thread
-            log.warning("Slack trace file for %s.%s not uploaded (%s); posting it capped", alert.dag_id, alert.task, exc)
-            trace = alert.trace(THREAD_TEXT_LIMIT)
-    if how == "message":
-        client.chat_postMessage(channel=where, thread_ts=ts, text=_code_block(trace))
+    client.chat_postMessage(channel=where, thread_ts=ts, text=_code_block(alert.error_text(THREAD_TEXT_LIMIT)))
     log.info(
-        "Slack alert for %s.%s posted to channel %s (ts %s) through connection `%s`; its trace is a %s in the thread",
+        "Slack alert for %s.%s posted to channel %s (ts %s) through connection `%s`, its error text in the thread",
         alert.dag_id,
         alert.task,
         where,
         ts,
         conn_id,
-        how,
     )

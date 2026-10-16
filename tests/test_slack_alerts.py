@@ -1,8 +1,10 @@
-"""Slack alerts: the title, the trace in its thread, the webhook fallback, the README samples and the example DAGs."""
+"""Slack alerts: the title, the error text in its thread, the webhook fallback, the setup guide and the example DAGs."""
 
 from __future__ import annotations
 
 import logging
+import re
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -11,8 +13,7 @@ from typing import Any
 import pytest
 from conftest import DagRig, FakeTI
 
-from airflow_provider_rivet import callbacks
-from airflow_provider_rivet.callbacks import format_failure, format_title, format_trace, slack_failure_callback
+from airflow_provider_rivet.callbacks import format_error_text, format_failure, format_title, slack_failure_callback
 
 ROOT = Path(__file__).resolve().parents[1]
 EXAMPLE = ROOT / "examples" / "rivet_slack_alerts.py"
@@ -55,7 +56,6 @@ def test_a_retryable_class_is_not_said_twice() -> None:
     text = format_failure(RETRYABLE, dag_id="d", task_id="t", run_id="r")
     assert "• *users*: `RIVET_PLAN_SOURCE_UNREADABLE` (retryable)" in text.splitlines(), text
     assert "`RIVET_SOURCE_CDC_LOG_GAP` `refusal` (not retryable)" in format_failure(REFUSAL, dag_id="d", task_id="t", run_id="r")
-    assert "users: RIVET_PLAN_SOURCE_UNREADABLE (retryable)" in format_trace(RETRYABLE, limit=4000).splitlines()
 
 
 def raised(message: str) -> BaseException:
@@ -77,46 +77,60 @@ def planted() -> Any:
     return PLANTED
 
 
-def test_the_trace_holds_the_units_the_traceback_and_rivets_stderr_with_secrets_masked(tmp_path: Path, planted: str) -> None:
-    stderr = tmp_path / "try1.apply.stderr.log"
-    stderr.write_text(f"connecting to postgresql://u:{planted}@db/app\nerror: source unreadable\n")
-    payload = {**RETRYABLE, "stderr_path": str(stderr)}
-    text = format_trace(payload, exception=raised(f"rivet failed with {planted}"), limit=4000, log_url="http://af/log")
-    assert text.splitlines()[0] == "users: RIVET_PLAN_SOURCE_UNREADABLE (retryable)"
-    assert "--- Airflow traceback ---\nTraceback (most recent call last):" in text and "in raised" in text
-    assert f"--- rivet stderr: {stderr} ---\n" in text and text.endswith("error: source unreadable")
-    assert planted not in text and text.count("***") == 2, text
-    assert "truncated" not in text
+# rivet 04c4a712's `--json-errors` line for a source nobody listens on (a stand's plan.stderr.log, 2026-10-16)
+UNREADABLE_LINE = (
+    '{"error":"plan \'users\': the source could not be read, so no plan was written (`rivet apply` would fail on it): '
+    "nothing is listening on 127.0.0.1:1 — check the port in `url:` and that the server is up (driver: error connecting "
+    'to server: Connection refused (os error 111))","exit_class":2,"code":"RIVET_PLAN_SOURCE_UNREADABLE"}'
+)
+UNREADABLE_TEXT = (
+    "[RIVET_PLAN_SOURCE_UNREADABLE] plan 'users': the source could not be read, so no plan was written (`rivet apply` "
+    "would fail on it): nothing is listening on 127.0.0.1:1 — check the port in `url:` and that the server is up "
+    "(driver: error connecting to server: Connection refused (os error 111))"
+)
+REFUSED_EXCEPTION = "[RIVET_AIRFLOW_EXPORT_UNKNOWN] config /opt/rivet/configs/postgres_batch.yaml has no export `no_such_export`"
 
 
-def test_a_long_trace_keeps_the_end_of_each_part_and_says_where_the_rest_is(tmp_path: Path) -> None:
-    stderr = tmp_path / "s.log"
-    stderr.write_text("".join(f"line {i}\n" for i in range(5000)) + "error: the last line\n")
-    text = format_trace(
-        {**RETRYABLE, "stderr_path": str(stderr)}, exception=raised("x" * 9000), limit=3000, log_url="http://af/l"
-    )
-    assert len(text) <= 3000
-    assert text.endswith("error: the last line\n… truncated, full log: http://af/l"), text[-200:]
-    assert "--- Airflow traceback ---\n… " in text and "characters cut …\nxxx" in text, "each part keeps its end"
-    assert text.startswith("users: RIVET_PLAN_SOURCE_UNREADABLE (retryable)\n")
+def stderr_file(tmp_path: Path, *lines: str) -> str:
+    path = tmp_path / "try1.plan.stderr.log"
+    path.write_text("".join(line + "\n" for line in lines))
+    return str(path)
+
+
+def test_the_thread_text_is_rivets_error_line_only_not_its_other_stderr_nor_the_traceback(tmp_path: Path) -> None:
+    path = stderr_file(tmp_path, "warning: SQLite state is single-host", "  at some frame", UNREADABLE_LINE)
+    text = format_error_text({**RETRYABLE, "stderr_path": path}, exception=raised("operator text"), limit=3500)
+    assert text == UNREADABLE_TEXT
+
+
+def test_a_human_error_line_is_taken_when_rivet_printed_no_object(tmp_path: Path) -> None:
+    path = stderr_file(tmp_path, "warning: something", "Error: config file 'x.yaml': unknown field `exprots`")
+    text = format_error_text({**RETRYABLE, "stderr_path": path}, limit=3500)
+    assert text == "Error: config file 'x.yaml': unknown field `exprots`"
+
+
+@pytest.mark.parametrize("payload", [PREFLIGHT, CRASHED, None, {**RETRYABLE, "stderr_path": "/nonexistent/stderr.log"}])
+def test_without_a_rivet_error_line_the_thread_text_is_the_exception_message_not_its_traceback(payload: Any) -> None:
+    text = format_error_text(payload, exception=raised(REFUSED_EXCEPTION), limit=3500)
+    assert text == REFUSED_EXCEPTION
+
+
+def test_the_error_text_is_redacted_and_capped_with_a_pointer_to_the_task_log(tmp_path: Path, planted: str) -> None:
+    line = '{"error":"cannot convert value ' + planted + " " + "x" * 5000 + '","code":"RIVET_SOURCE_VALUE_UNREPRESENTABLE"}'
+    text = format_error_text({**REFUSAL, "stderr_path": stderr_file(tmp_path, line)}, limit=3500, log_url="http://af/l")
+    assert planted not in text and text.startswith("[RIVET_SOURCE_VALUE_UNREPRESENTABLE] cannot convert value *** xxx")
+    assert len(text) == 3500 and text.endswith("x\n… truncated, full log: http://af/l")
 
 
 class Client:
     """slack_sdk's `WebClient` as the callback uses it: every call recorded, `chat_postMessage` answers a `ts`."""
 
-    def __init__(self, upload_fails: bool = False) -> None:
+    def __init__(self) -> None:
         self.calls: list[tuple[str, dict]] = []
-        self.upload_fails = upload_fails
 
     def chat_postMessage(self, **kwargs: Any) -> dict:
         self.calls.append(("chat_postMessage", kwargs))
         return {"ok": True, "channel": "C0123", "ts": f"1760612345.00010{len(self.calls)}"}
-
-    def files_upload_v2(self, **kwargs: Any) -> dict:
-        self.calls.append(("files_upload_v2", kwargs))
-        if self.upload_fails:
-            raise RuntimeError("missing_scope")
-        return {"ok": True}
 
 
 def fake_slack(monkeypatch: pytest.MonkeyPatch, client: Client | None = None, sent: list | None = None) -> None:
@@ -157,13 +171,14 @@ def failed_context(payload: dict, exception: BaseException | None = None) -> dic
     return {"ti": ti, "run_id": "manual__1", "exception": exception}
 
 
-def test_the_bot_posts_the_title_then_the_trace_as_a_code_block_in_its_thread(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+def test_the_bot_posts_the_title_then_the_error_text_as_a_code_block_in_its_thread(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, tmp_path: Path
 ) -> None:
     client = Client()
     fake_slack(monkeypatch, client)
     caplog.set_level(logging.INFO)
-    slack_failure_callback("slack_bot", channel="C0123")(failed_context(RETRYABLE, raised("boom <x> & y")))
+    payload = {**RETRYABLE, "stderr_path": stderr_file(tmp_path, UNREADABLE_LINE.replace("127.0.0.1:1", "<db> & co"))}
+    slack_failure_callback("slack_bot", channel="C0123")(failed_context(payload, raised("operator text")))
     (first, top), (second, reply) = client.calls
     assert first == second == "chat_postMessage"
     assert top["channel"] == "C0123" and top["text"] == "d.apply.users — RIVET_PLAN_SOURCE_UNREADABLE (retryable)"
@@ -175,40 +190,16 @@ def test_the_bot_posts_the_title_then_the_trace_as_a_code_block_in_its_thread(
         },
     ]
     assert "thread_ts" not in top and reply["thread_ts"] == "1760612345.000101" and reply["channel"] == "C0123"
-    text = reply["text"]
-    assert text.startswith("```\nusers: RIVET_PLAN_SOURCE_UNREADABLE (retryable)\n") and text.endswith("\n```"), text
-    assert "RuntimeError: boom &lt;x&gt; &amp; y" in text, "Slack's control characters are escaped"
+    escaped = UNREADABLE_TEXT.replace("127.0.0.1:1", "&lt;db&gt; &amp; co")
+    assert reply["text"] == f"```\n{escaped}\n```", "Slack's control characters are escaped, nothing else is in it"
     lines = [r.getMessage() for r in caplog.records if r.name == "airflow.task.rivet_slack"]
     assert lines == [
-        "Slack alert for d.apply.users posted to channel C0123 (ts 1760612345.000101) through connection `slack_bot`;"
-        " its trace is a message in the thread"
+        "Slack alert for d.apply.users posted to channel C0123 (ts 1760612345.000101) through connection `slack_bot`,"
+        " its error text in the thread"
     ]
 
 
-@pytest.mark.parametrize("upload_fails", [False, True])
-def test_a_trace_longer_than_a_message_goes_to_the_thread_as_a_file_or_capped_when_the_upload_fails(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, upload_fails: bool
-) -> None:
-    stderr = tmp_path / "s.log"
-    stderr.write_text("".join(f"line {i}\n" for i in range(3000)) + "error: the last line\n")
-    client = Client(upload_fails=upload_fails)
-    fake_slack(monkeypatch, client)
-    slack_failure_callback("slack_bot", channel="C0123")(failed_context({**RETRYABLE, "stderr_path": str(stderr)}))
-    names = [name for name, _ in client.calls]
-    if not upload_fails:
-        assert names == ["chat_postMessage", "files_upload_v2"]
-        upload = client.calls[1][1]
-        assert upload["thread_ts"] == "1760612345.000101" and upload["channel"] == "C0123"
-        assert upload["filename"] == "d.apply.users.trace.txt" and upload["content"].endswith("error: the last line")
-        assert "line 0\n" in upload["content"], "the file holds the whole trace"
-    else:
-        assert names == ["chat_postMessage", "files_upload_v2", "chat_postMessage"]
-        reply = client.calls[2][1]
-        assert reply["thread_ts"] == "1760612345.000101" and len(reply["text"]) <= callbacks.THREAD_TEXT_LIMIT + 8
-        assert reply["text"].endswith("… truncated, full log: http://af/dags/d/runs/r/tasks/apply.users\n```")
-
-
-def test_the_webhook_fallback_sends_title_link_and_capped_trace_as_one_message(
+def test_the_webhook_fallback_sends_title_link_and_error_text_as_one_message(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, planted: str
 ) -> None:
     sent: list[tuple[str, str]] = []
@@ -216,22 +207,48 @@ def test_the_webhook_fallback_sends_title_link_and_capped_trace_as_one_message(
     caplog.set_level(logging.INFO)
     slack_failure_callback("slack_rivet")(failed_context(PREFLIGHT, raised(f"refused {planted}")))
     [(conn_id, text)] = sent
-    head, link, fence, summary = text.split("\n")[:4]
-    assert conn_id == "slack_rivet" and head == ":x: *d.apply.users — RIVET_AIRFLOW_EXPORT_UNKNOWN (final)*"
-    assert link == "run `manual__1` · <http://af/dags/d/runs/r/tasks/apply.users|task log>"
-    assert (fence, summary) == ("```", "refused before rivet started: RIVET_AIRFLOW_EXPORT_UNKNOWN")
-    assert text.endswith("```") and planted not in text and len(text) < 4000
+    assert conn_id == "slack_rivet"
+    assert text.split("\n") == [
+        ":x: *d.apply.users — RIVET_AIRFLOW_EXPORT_UNKNOWN (final)*",
+        "run `manual__1` · <http://af/dags/d/runs/r/tasks/apply.users|task log>",
+        "```",
+        "refused ***",
+        "```",
+    ]
     lines = [r.getMessage() for r in caplog.records if r.name == "airflow.task.rivet_slack"]
     assert lines == ["Slack alert for d.apply.users sent through connection `slack_rivet`: HTTP 200 ok"], lines
 
 
-def test_the_readme_shows_the_title_and_thread_the_callback_writes() -> None:
-    """The walkthrough's sample title and trace are the formatter's output, byte for byte, so they cannot drift."""
-    readme = (ROOT / "README.md").read_text()
-    for payload, task in ((PREFLIGHT, "apply.no_such_export"), (RETRYABLE, "apply.users")):
+GUIDE = ROOT / "docs" / "slack.md"
+
+
+def test_the_guide_shows_the_title_and_thread_text_the_callback_writes(tmp_path: Path) -> None:
+    """The guide's sample titles and thread texts are the formatter's output, byte for byte, so they cannot drift."""
+    guide = GUIDE.read_text()
+    retryable = {**RETRYABLE, "stderr_path": stderr_file(tmp_path, UNREADABLE_LINE)}
+    for payload, task, exception in (
+        (PREFLIGHT, "apply.no_such_export", raised(REFUSED_EXCEPTION)),
+        (retryable, "apply.users", raised("[RIVET_PLAN_SOURCE_UNREADABLE] retryable (users)")),
+    ):
         title = format_title(payload, dag_id="rivet_slack_test", task_id=task)
-        assert f"> :x: **{title}**\n" in readme, title
-        assert f"```text\n{format_trace(payload, limit=4000)}\n" in readme
+        assert f"> :x: **{title}**\n" in guide, title
+        assert f"```text\n{format_error_text(payload, exception=exception, limit=3500)}\n```" in guide
+
+
+def test_every_code_snippet_of_the_guide_parses_and_its_python_runs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The guide's commands are valid shell, and its Python builds what it says on this Airflow version."""
+    blocks = re.findall(r"^```(\w+)\n(.*?)^```$", GUIDE.read_text(), re.M | re.S)
+    kinds = [kind for kind, _ in blocks]
+    assert kinds.count("python") >= 2 and kinds.count("bash") >= 4, kinds
+    for kind, body in blocks:
+        if kind == "bash":
+            out = subprocess.run(["bash", "-n"], input=body, capture_output=True, text=True)
+            assert out.returncode == 0, (body, out.stderr)
+        elif kind == "python":
+            namespace: dict = {}
+            exec(compile(body, "docs/slack.md", "exec"), namespace)
+            callbacks_ = [v for k, v in namespace.items() if k in ("dag", "run")]
+            assert callbacks_, body
 
 
 EXAMPLE_RUNNER = """\
@@ -276,4 +293,19 @@ def test_each_example_dag_fails_on_its_first_try_and_sends_one_alert_through_the
     assert len(messages) == 1, "one alert per failed task, none for the watcher, no retry before it"
     conn_id, text = messages[0].split("\n", 1)
     assert conn_id == "slack_test" and text.startswith(f":x: *{name}.{task} — {title}*\n"), text
-    assert "--- Airflow traceback ---" in text
+    assert text.endswith("\n```") and "Traceback" not in text, text
+
+
+def test_the_fake_slack_hooks_have_the_shape_of_the_slack_providers_hooks() -> None:
+    """The fakes above stand in for the real hooks: CI installs the provider under Airflow's constraints and checks them."""
+    import inspect
+
+    slack = pytest.importorskip("airflow.providers.slack.hooks.slack")
+    webhook = pytest.importorskip("airflow.providers.slack.hooks.slack_webhook")
+    from slack_sdk import WebClient
+
+    assert "slack_conn_id" in inspect.signature(slack.SlackHook.__init__).parameters
+    assert hasattr(slack.SlackHook, "client"), "the bot path takes the WebClient from `SlackHook.client`"
+    assert {"channel", "text", "blocks", "thread_ts"} <= set(inspect.signature(WebClient.chat_postMessage).parameters)
+    assert "slack_webhook_conn_id" in inspect.signature(webhook.SlackWebhookHook.__init__).parameters
+    assert "text" in inspect.signature(webhook.SlackWebhookHook.send).parameters

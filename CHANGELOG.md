@@ -18,12 +18,12 @@ First release, against rivet 0.31.0 and the contract of ADR-0039; Python 3.12+, 
   PostgreSQL state and refuses CDC), state directory checks, a warning for `notifications:`.
 - Secrecy: XCom and the task log never carry the error message; raw stderr goes to a file.
 - `slack_failure_callback` for the Slack provider: a one-line title per failed task,
-  `dag.task — <rivet code> (final|retryable)` (or the exception's class), with the run id and the
-  task-log link; with a bot token and `channel=` the full trace (failed units, Airflow traceback,
-  rivet's stderr of the failed step; through Airflow's secrets masker, size-capped, a file when
-  long) is a reply in its thread; with an incoming webhook, title and capped trace are one message.
-  The task log says what was sent and what Slack answered. ("Slack alerts", with a walkthrough and
-  `examples/rivet_slack_alerts.py`.)
+  `dag.task — <rivet code> (final|retryable)` (else the exception's class), with the run id and
+  the task-log link; with a bot token and `channel=` the error text (rivet's error line for the
+  failed step, else the exception's message; through Airflow's secrets masker, capped) is a code
+  block in its thread; with an incoming webhook, title and error text are one message. The task
+  log says what was sent and what Slack answered. Setup guide `docs/slack.md`, test DAGs
+  `examples/rivet_slack_alerts.py`.
 - `connections=[conn_id, ...]` on every operator: storage and warehouse credentials from Airflow
   Connections of kind gcp, aws, azure, snowflake and clickhouse (the connection type, or the
   extra `rivet_kind`); key files are written `0600` into a private folder removed when the task
