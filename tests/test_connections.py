@@ -250,12 +250,16 @@ def test_d20_every_snowflake_field_round_trips_through_toml(tmp_path: Path) -> N
         assert all(read[k] == text for k in TOML_SAFE_FIELDS if text), f"case {i} did not round-trip"
 
 
-def test_d22_a_clickhouse_connection_without_a_host_is_refused(tmp_path: Path) -> None:
-    """D22: an empty host became `http://None`, a DNS failure at load time instead of a refusal before rivet."""
-    for host in (None, ""):
-        with pytest.raises(PreflightRefusal) as refused:
-            cloud_environment([conn("ch", "clickhouse", host=host, login="u")], tmp_path)
-        assert refused.value.code == "RIVET_AIRFLOW_CONNECTION_INCOMPLETE"
+@pytest.mark.parametrize("host", [None, ""])
+def test_d22_a_connection_without_a_host_is_refused(tmp_path: Path, host: str | None) -> None:
+    """D22: an empty ClickHouse host became `http://None`, a DNS failure at load time instead of a refusal before rivet;
+    a database Connection without one became `postgresql://u:p@/d`, and the driver dialled its default socket."""
+    with pytest.raises(PreflightRefusal) as refused:
+        cloud_environment([conn("ch", "clickhouse", host=host, login="u")], tmp_path)
+    assert refused.value.code == "RIVET_AIRFLOW_CONNECTION_INCOMPLETE" and "`ch` has no host" in str(refused.value)
+    with pytest.raises(PreflightRefusal) as refused:
+        connection_url(conn("pg", "postgres", host=host, login="u", password="p", schema="d"))
+    assert refused.value.code == "RIVET_AIRFLOW_CONNECTION_INCOMPLETE" and "`pg` has no host" in str(refused.value)
     v6 = cloud_environment([conn("ch", "clickhouse", host="fd00::5", port=8123)], tmp_path)
     assert v6["RIVET_CLICKHOUSE_URL"] == "http://[fd00::5]:8123"
 
