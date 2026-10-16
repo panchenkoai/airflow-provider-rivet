@@ -635,7 +635,11 @@ dev/mutants.sh python dev/mutants_gate.py pr  # what the PR job runs: the mutant
 server that only collected the tests (`process_isolation = "forkserver"`), and `dev/mutmut_isolation.py` gives each
 worker its own Airflow metadata database, dags folder and pytest base temp: on one shared SQLite file the
 `airflow_db` fixture's `resetdb` of one worker would kill another worker's DAG runs and count its mutant as
-detected. A timeout is not a detection: a cluster of timeouts in one function is a finding about its loop or wait.
+detected. It also caps each worker's memory (a mutant can loop while growing a list, and on a CI runner the OOM
+killer then takes the runner), hands the mutated tree to the child Pythons of `tests/test_retry.py` and
+`tests/test_process_io.py` (the task processes those tests kill), and has mutmut select those tests for every
+mutant, since a child's calls are invisible to mutmut's test selection. A timeout is not a detection: a cluster of
+timeouts in one function is a finding about its loop or wait.
 mutmut does not mutate a decorated function (`Outcome.decision`, `_prctl`, `_export_lock`): their behaviour is
 held by tests alone.
 
