@@ -19,7 +19,8 @@ from pathlib import Path
 from typing import Any
 
 from . import _yaml
-from .preflight import STATE_URL_ENV, Preflight, PreflightRefusal, run_preflight, state_kind
+from .capabilities import ProbeFailed
+from .preflight import STATE_URL_ENV, Preflight, PreflightRefusal, binary_unanswering, run_preflight, state_kind
 from .result import STATUSES, ErrorObject, UnitResult, error_from_exit, error_from_line, worst
 
 Emit = Callable[[dict[str, Any]], None]
@@ -743,9 +744,17 @@ _DISPATCH = {"run": _run, "cdc_run": _run, "apply": _apply, "plan": _plan, "load
 
 
 def invoke(request: Request, emit: Emit, on_process: Callable | None = None) -> Outcome:
-    """Preflight, run and classify one rivet task."""
+    """Preflight, run and classify one rivet task; a probe of the binary that fails at any point is a refusal."""
     if request.command not in _DISPATCH:
         raise ValueError(f"unknown rivet command {request.command!r}")
+    try:
+        return _invoke(request, emit, on_process)
+    except ProbeFailed as exc:
+        raise binary_unanswering(exc) from exc
+
+
+def _invoke(request: Request, emit: Emit, on_process: Callable | None) -> Outcome:
+    """`invoke` with the probes' failures still raw: the binary's `<sub> --help` is read lazily while argv is built."""
     pf = run_preflight(
         rivet_bin=request.rivet_bin,
         config_path=request.config,
