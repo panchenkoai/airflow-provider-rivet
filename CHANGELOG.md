@@ -18,6 +18,11 @@ First release, against rivet 0.31.0 and the contract of ADR-0039; Python 3.12+, 
   PostgreSQL state and refuses CDC), state directory checks, a warning for `notifications:`.
 - Secrecy: XCom and the task log never carry the error message; raw stderr goes to a file.
 - `slack_failure_callback` for the Slack provider's webhook hook.
+- `connections=[conn_id, ...]` on every operator: storage and warehouse credentials from Airflow
+  Connections of kind gcp, aws, azure, snowflake and clickhouse (the connection type, or the
+  extra `rivet_kind`); key files are written `0600` into a private folder removed when the task
+  ends, and an unknown kind or two Connections of one kind are refused before rivet starts.
+  ("Storage and warehouse connections")
 - Every fallback taken against a binary that lacks a contract feature is recorded as
   `degraded` in the task's result and listed in the README.
 
@@ -63,6 +68,10 @@ Changed before the first release, after review (see the README sections named):
 - A `RIVET_STATE_URL` in the worker's environment that rivet would use (it starts with
   `postgres`) and that the task would not pass to rivet is refused before rivet starts
   (`RIVET_AIRFLOW_STATE_ENV_NOT_PASSED`). A declared value, also an empty one, is not refused.
+- The README said a Snowflake or ClickHouse compact task "is skipped"; on rivet 0.31.0 it ends
+  `compacted` having merged nothing. It now says so, documents `build_cdc_dag(compact=False)` for
+  those warehouses, and names every operator and builder parameter (a test holds the lists to the
+  signatures). ("Storage and warehouse connections", "DAG builders", "Operators")
 - `build_batch_dag(exports=[])` raises `ValueError`; the watcher carries no failure callback, so
   a callback in `default_args` fires once per failed task.
 - `connection_url`: a password without a login, IPv6 hosts, Oracle `service_name`, an encoded
