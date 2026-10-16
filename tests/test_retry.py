@@ -9,7 +9,6 @@ import os
 import signal
 import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
 
@@ -137,13 +136,45 @@ def test_g1b_a_new_try_series_plans_and_applies_again(rig: Rig) -> None:
 # --- G2: two tries of one export at once ---------------------------------------------------------------------------------
 
 
-def test_g2_a_retry_while_the_earlier_try_still_runs_rivet_starts_nothing_and_is_retried(rig: Rig) -> None:
+TASK_PROCESS = r"""
+import json, sys, tempfile
+from pathlib import Path
+sys.path.insert(0, sys.argv[2])
+tmp = Path(sys.argv[1])
+(tmp / "tmp").mkdir(exist_ok=True)
+tempfile.tempdir = str(tmp / "tmp")
+from conftest import FakeTI, Rig
+from airflow_provider_rivet import operators
+spec = json.loads(sys.argv[3])
+rig = Rig(tmp)
+rig.scenario(**spec["scenario"])
+op = rig.operator(getattr(operators, spec["operator"]), **spec["kwargs"])
+op.execute({"ti": FakeTI(max_tries=2), "run_id": FakeTI().run_id})
+"""
+
+
+def task_process(
+    tmp: Path, scenario: dict, operator: str = "RivetApplyOperator", **kwargs: object
+) -> tuple[subprocess.Popen, Rig]:
+    """A task process: one operator run in a child Python (a zombie try, or one the test SIGKILLs as an OOM kill would),
+    and a rig over its bin, config and state directory for the try the test runs beside it."""
+    work = tmp / "task"
+    work.mkdir()
+    script = tmp / "task.py"
+    script.write_text(TASK_PROCESS)
+    tests = str(Path(__file__).resolve().parent)
+    spec = {"operator": operator, "kwargs": kwargs or {"export": "orders"}, "scenario": scenario}
+    proc = subprocess.Popen([sys.executable, str(script), str(work), tests, json.dumps(spec)], cwd=tests)
+    rig = Rig.__new__(Rig)
+    rig.tmp, rig.bin, rig.state_dir, rig.config, rig.records = work, work / "bin", work / "state", work / "cfg" / "pg.yaml", []
+    return proc, rig
+
+
+def test_g2_a_retry_while_the_earlier_try_still_runs_rivet_starts_nothing_and_is_retried(tmp_path: Path) -> None:
     """G2 (a): a zombie try's rivet apply still runs (held here by a sleeping fake) when the retry starts: the retry
     waits `lock_wait` seconds for the export's lock, starts no rivet process and ends retryable, never failed."""
-    started = rig.tmp / "started"
-    rig.scenario(flags=NEW_FLAGS, apply={"sleep": 60, "started": str(started), "summary": FULL})
-    holder = threading.Thread(target=rig.run, args=(rig.operator(RivetApplyOperator, export="orders"), FakeTI(max_tries=2)))
-    holder.start()
+    started = tmp_path / "started"
+    proc, rig = task_process(tmp_path, {"flags": NEW_FLAGS, "apply": {"sleep": 60, "started": str(started), "summary": FULL}})
     pid = int(wait_for(started))
     try:
         retry, ti = rig.run(rig.operator(RivetApplyOperator, export="orders", lock_wait=1), FakeTI(try_number=2, max_tries=2))
@@ -154,15 +185,14 @@ def test_g2_a_retry_while_the_earlier_try_still_runs_rivet_starts_nothing_and_is
         assert payload["decision"] == "retry" and payload["busy"] == "RIVET_AIRFLOW_EXPORT_BUSY"
     finally:
         os.kill(pid, signal.SIGKILL)
-        holder.join()
+        proc.wait()
 
 
-def test_g2_a_load_of_another_export_does_not_wait_for_the_lock_of_this_one(rig: Rig) -> None:
+def test_g2_a_load_of_another_table_does_not_wait_for_the_lock_of_this_one(tmp_path: Path) -> None:
     """G2 (a): the lock is the export's (and the table's, for a load with `--table`), not the state directory's."""
-    started = rig.tmp / "started"
-    rig.scenario(flags=NEW_FLAGS, **{"load:users:users": {"sleep": 60, "started": str(started)}})
-    holder = threading.Thread(target=rig.run, args=(rig.operator(RivetLoadOperator, export="users", table="users"),))
-    holder.start()
+    started = tmp_path / "started"
+    play = {"flags": NEW_FLAGS, "load:users:users": {"sleep": 60, "started": str(started)}}
+    proc, rig = task_process(tmp_path, play, "RivetLoadOperator", export="users", table="users")
     pid = int(wait_for(started))
     try:
         other, _ = rig.run(rig.operator(RivetLoadOperator, export="users", table="other", lock_wait=1))
@@ -171,34 +201,7 @@ def test_g2_a_load_of_another_export_does_not_wait_for_the_lock_of_this_one(rig:
         assert type(same) is AirflowException and "RIVET_AIRFLOW_EXPORT_BUSY" in str(same)
     finally:
         os.kill(pid, signal.SIGKILL)
-        holder.join()
-
-
-TASK_PROCESS = r"""
-import sys, tempfile
-from pathlib import Path
-sys.path.insert(0, sys.argv[2])
-tmp = Path(sys.argv[1])
-(tmp / "tmp").mkdir(exist_ok=True)
-tempfile.tempdir = str(tmp / "tmp")
-from conftest import NEW_FLAGS, FakeTI, Rig
-from airflow_provider_rivet.operators import RivetApplyOperator
-rig = Rig(tmp)
-rig.scenario(flags=NEW_FLAGS, apply=__import__("json").loads(sys.argv[3]))
-op = rig.operator(RivetApplyOperator, export="orders")
-op.execute({"ti": FakeTI(max_tries=2), "run_id": FakeTI().run_id})
-"""
-
-
-def task_process(tmp: Path, play: dict) -> tuple[subprocess.Popen, Rig]:
-    """A task process running an apply in a child Python, so the test can SIGKILL it as an OOM kill would."""
-    work = tmp / "task"
-    work.mkdir()
-    script = tmp / "task.py"
-    script.write_text(TASK_PROCESS)
-    tests = str(Path(__file__).resolve().parent)
-    proc = subprocess.Popen([sys.executable, str(script), str(work), tests, json.dumps(play)], cwd=tests)
-    return proc, work
+        proc.wait()
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="PR_SET_PDEATHSIG exists on Linux only (CI is Linux)")
@@ -206,7 +209,7 @@ def test_g2_a_killed_task_process_stops_its_rivet_through_the_parent_death_signa
     """G2 (b): the task process is SIGKILLed (OOM, the runner alone reaped) while rivet runs: rivet was orphaned and ran
     on beside the retry. The parent-death signal sends it SIGTERM."""
     started, terminated = tmp_path / "started", tmp_path / "terminated"
-    proc, _ = task_process(tmp_path, {"sleep": 60, "started": str(started), "term_marker": str(terminated)})
+    proc, _ = task_process(tmp_path, {"apply": {"sleep": 60, "started": str(started), "term_marker": str(terminated)}})
     pid = int(wait_for(started))
     proc.kill()
     proc.wait()
@@ -222,22 +225,14 @@ def test_g2_the_export_lock_passes_to_rivet_and_outlives_the_killed_task_process
     kept running. Passed to rivet, it is held as long as rivet lives (here one that ignores SIGTERM, as an orphan the
     parent-death signal could not stop), and a retry started meanwhile starts no rivet and ends retryable."""
     started = tmp_path / "started"
-    proc, work = task_process(tmp_path, {"sleep": 60, "started": str(started), "ignore_term": True})
+    proc, rig = task_process(tmp_path, {"apply": {"sleep": 60, "started": str(started), "ignore_term": True}})
     pid = int(wait_for(started))
     proc.kill()
     proc.wait()
     try:
-        lock = work / "state" / "airflow" / "locks" / "run" / "orders.lock"
+        lock = rig.state_dir / "airflow" / "locks" / "run" / "orders.lock"
         assert lock.exists(), "no export lock was taken for the apply"
         assert held(lock), "the export lock was freed with the task process while its rivet runs on"
-        rig = Rig.__new__(Rig)
-        rig.tmp, rig.bin, rig.state_dir, rig.config, rig.records = (
-            work,
-            work / "bin",
-            work / "state",
-            work / "cfg" / "pg.yaml",
-            [],
-        )
         retry, _ = rig.run(rig.operator(RivetApplyOperator, export="orders", lock_wait=1), FakeTI(try_number=2, max_tries=2))
         assert type(retry) is AirflowException and "RIVET_AIRFLOW_EXPORT_BUSY" in str(retry), retry
         assert len(applies(rig)) == 1, "the retry started a second rivet beside the orphan"
