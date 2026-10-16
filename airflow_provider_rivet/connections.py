@@ -57,11 +57,12 @@ def _extra(conn: Any, name: str, kind: str) -> Any:
 
 
 def _secret_file(folder: Path, name: str, data: str) -> str:
-    """Write a 0600 UTF-8 file in the task's private folder; its path."""
+    """Write a 0600 UTF-8 file in the task's private folder; its path. Written as bytes: the worker's locale never
+    decides the encoding."""
     path = folder / name
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w", encoding="utf-8") as handle:
-        handle.write(data)
+    with os.fdopen(fd, "wb") as handle:
+        handle.write(data.encode())
     return str(path)
 
 
@@ -87,8 +88,8 @@ def toml_string(text: str, what: str) -> str:
     return '"' + text.translate(_TOML_ESCAPES) + '"'
 
 
-# `quote`'s `safe` for a value that is percent-encoded whole (a module constant: no mutant renames it to an
-# alphanumeric string, which `quote` never encodes anyway).
+# `quote`'s `safe` for a value that is percent-encoded whole (a URL zone, parameter, credential or database name; a
+# module constant, so no mutant renames it to an alphanumeric string, which `quote` never encodes anyway).
 _NOTHING_SAFE = ""
 
 
@@ -183,15 +184,15 @@ def _pem(conn: Any, text: str) -> str:
     if text.lstrip().startswith("-----BEGIN"):
         return text
     try:
-        decoded = base64.b64decode("".join(text.split()), validate=True).decode("utf-8")
+        decoded = base64.b64decode("".join(text.split()), validate=True).decode()
+        if decoded.lstrip().startswith("-----BEGIN"):
+            return decoded
     except (binascii.Error, UnicodeDecodeError):
-        decoded = ""
-    if not decoded.lstrip().startswith("-----BEGIN"):
-        raise PreflightRefusal(
-            UNSUPPORTED,
-            f"Snowflake connection `{conn.conn_id}`: extra `private_key_content` is neither a PEM key nor base64 of one",
-        )
-    return decoded
+        pass
+    raise PreflightRefusal(
+        UNSUPPORTED,
+        f"Snowflake connection `{conn.conn_id}`: extra `private_key_content` is neither a PEM key nor base64 of one",
+    )
 
 
 def _snowflake(conn: Any, folder: Path, config: Mapping[str, Any]) -> dict[str, str]:
@@ -330,7 +331,7 @@ URL_UNSUPPORTED["postgres"] = URL_UNSUPPORTED["postgresql"]
 
 
 def _param(value: Any) -> str:
-    return ("true" if value else "false") if isinstance(value, bool) else quote(str(value), safe="")
+    return ("true" if value else "false") if isinstance(value, bool) else quote(str(value), safe=_NOTHING_SAFE)
 
 
 def connection_url(conn: Any, scheme: str | None = None) -> str:
@@ -351,27 +352,27 @@ def connection_url(conn: Any, scheme: str | None = None) -> str:
             raise PreflightRefusal(
                 UNSUPPORTED, f"connection `{conn_id}` sets extra `{name}` ({what}), which a rivet URL cannot carry"
             )
-    if scheme == "mongodb" and str(extra.get("srv", "")).lower() in ("true", "1", "yes"):
+    if scheme == "mongodb" and str(extra.get("srv")).lower() in ("true", "1", "yes"):  # unset: "none"
         scheme = "mongodb+srv"
     if scheme == "mongodb+srv" and conn.port:
         raise PreflightRefusal(
             UNSUPPORTED, f"connection `{conn_id}` is an SRV (`mongodb+srv`) connection with a port; clear the port"
         )
-    auth = quote(conn.login or "", safe="")
+    auth = quote(conn.login or "", safe=_NOTHING_SAFE)
     if conn.password:
-        auth += ":" + quote(conn.password, safe="")
+        auth += ":" + quote(conn.password, safe=_NOTHING_SAFE)
     auth += "@" if auth else ""
     port = f":{conn.port}" if conn.port else ""
     database = (extra.get("service_name") if scheme == "oracle" else None) or conn.schema or ""
     own = str(extra.get("rivet_params") or "")
-    named = {pair.split("=", 1)[0] for pair in own.split("&") if pair}
+    named = {pair.partition("=")[0] for pair in own.split("&") if pair}
     params = [
         f"{key}={_param(extra[name])}"
         for name, key in URL_EXTRAS.get(scheme, {}).items()
         if extra.get(name) not in (None, "") and key not in named
     ]
     query = "&".join([*params, *([own] if own else [])])
-    return f"{scheme}://{auth}{url_host(conn)}{port}/{quote(str(database), safe='')}{'?' + query if query else ''}"
+    return f"{scheme}://{auth}{url_host(conn)}{port}/{quote(str(database), safe=_NOTHING_SAFE)}{'?' + query if query else ''}"
 
 
 # --- The whole subprocess environment ---
@@ -399,7 +400,7 @@ def build_environment(
     env = worker_environment(spec.passthrough, spec.clouds, worker_env)
     if resolved_connections:
         made, replaced = _cloud(resolved_connections, secrets_dir, spec.config)
-        patterns = [pattern for kind in replaced for pattern in CLOUD_ENV.get(kind, ())]
+        patterns = [pattern for kind in replaced for pattern in CLOUD_ENV[kind]]  # every credential kind has its patterns
         env = {k: v for k, v in env.items() if not any(fnmatch.fnmatchcase(k, p) for p in patterns)}
         env.update(made)
     env.update({str(k): str(v) for k, v in spec.env.items()})

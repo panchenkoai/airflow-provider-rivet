@@ -148,7 +148,7 @@ class Capabilities:
         env = {"PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", "")}
         shown = " ".join(argv)
         try:
-            done = subprocess.run(argv, capture_output=True, text=True, timeout=PROBE_TIMEOUT, env=env, check=False)
+            done = subprocess.run(argv, capture_output=True, text=True, timeout=PROBE_TIMEOUT, env=env)  # the exit is read below
         except subprocess.TimeoutExpired as exc:
             raise ProbeFailed(f"`{shown}` did not answer within {PROBE_TIMEOUT}s") from exc
         except (OSError, ValueError) as exc:

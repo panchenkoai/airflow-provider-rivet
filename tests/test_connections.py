@@ -4,11 +4,8 @@ from __future__ import annotations
 
 import base64
 import json
-import os
 import random
 import stat
-import subprocess
-import sys
 import tomllib
 from pathlib import Path
 from types import SimpleNamespace
@@ -336,30 +333,25 @@ def refusal_of(call: object, *args: object) -> PreflightRefusal:
     return refused.value
 
 
-def test_the_tls_and_endpoint_settings_reach_rivet_exactly(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
-    """The settings that decide whether a credential travels encrypted, and to whom, reach the rivet process byte for
-    byte: Mongo `tls` / `allow_insecure` (mutants `_param_3/_4`: `tls=true` written as `tls=false`), ClickHouse
-    `secure` (`_clickhouse_22..37`: the password over plain `http://`) and the AWS `endpoint_url`
-    (`_aws_56..59`: the Connection's keys sent to real AWS)."""
-    conns = {
-        "mongo": mongo(tls=True, allow_insecure=False),
-        "aws": conn("aws", "aws", login="AKIA1", password="s", extra_dejson={"endpoint_url": "https://minio.internal:9000"}),
-        "ch": conn("ch", "clickhouse", host="ch", port=8443, login="l", password="pw", extra_dejson={"secure": "yes"}),
-    }
-    monkeypatch.setattr("airflow_provider_rivet.operators.BaseHook.get_connection", lambda conn_id: conns[conn_id])
-    names = ["RIVET_MONGO_URL", "AWS_ENDPOINT_URL", "AWS_ACCESS_KEY_ID", "RIVET_CLICKHOUSE_URL", "RIVET_CLICKHOUSE_PASSWORD"]
-    rig.scenario(record_env=names, leak_env=[])
-    op = rig.operator(
-        RivetRunOperator, export="orders", connections=["aws", "ch"], env_from_connections={"RIVET_MONGO_URL": "mongo"}
-    )
-    payload, _ = rig.run(op)
-    assert payload["decision"] == "success"
-    assert rig.calls()[-1]["env"] == {
-        "RIVET_MONGO_URL": "mongodb://u:p@m/d?tls=true&tlsAllowInvalidCertificates=false",
-        "AWS_ENDPOINT_URL": "https://minio.internal:9000",
+def test_the_tls_and_endpoint_settings_reach_rivet_exactly(tmp_path: Path) -> None:
+    """The settings that decide whether a credential travels encrypted, and to whom, reach rivet byte for byte:
+    Mongo `tls` / `allow_insecure` (mutants `_param_3/_4`: `tls=true` written as `tls=false`), ClickHouse `secure`
+    (`_clickhouse_22..37`: the password over plain `http://`) and the AWS `endpoint_url` (`_aws_56..59`: the
+    Connection's keys sent to real AWS). `build_environment` is the whole environment the operator gives the rivet
+    process (`RivetBaseOperator._environment`), so the test compares all of it, the worker's variables included."""
+    aws = conn("aws", "aws", login="AKIA1", password="s", extra_dejson={"endpoint_url": "https://minio.internal:9000"})
+    ch = conn("ch", "clickhouse", host="ch", port=8443, login="l", password="pw", extra_dejson={"secure": "yes"})
+    spec = EnvSpec(urls={"RIVET_MONGO_URL": (mongo(tls=True, allow_insecure=False), None)})
+    worker = {"PATH": "/w", "AWS_SESSION_TOKEN": "worker-token", "AIRFLOW__CORE__FERNET_KEY": "f"}
+    assert build_environment(worker, spec, [aws, ch], tmp_path) == {
+        "PATH": "/w",
         "AWS_ACCESS_KEY_ID": "AKIA1",
+        "AWS_SECRET_ACCESS_KEY": "s",
+        "AWS_ENDPOINT_URL": "https://minio.internal:9000",
         "RIVET_CLICKHOUSE_URL": "https://ch:8443",
+        "RIVET_CLICKHOUSE_USER": "l",
         "RIVET_CLICKHOUSE_PASSWORD": "pw",
+        "RIVET_MONGO_URL": "mongodb://u:p@m/d?tls=true&tlsAllowInvalidCertificates=false",
     }
 
 
@@ -496,7 +488,9 @@ def test_every_snowflake_extra_is_read_under_either_extra_form(tmp_path: Path) -
     `_snowflake_4, 20, 26, 27, 32, 48, 49, 53, 57, 58, 65, 71..83`."""
     plain = {"account": "ab1", "role": "R", "authenticator": "externalbrowser"}
     for i, extra in enumerate((plain, {f"extra__snowflake__{k}": v for k, v in plain.items()})):
-        env = cloud_environment([conn("sf", "snowflake", extra_dejson=extra)], sub(tmp_path, str(i)), {"load": "not a mapping"})
+        folder = sub(tmp_path, str(i))
+        env = cloud_environment([conn("sf", "snowflake", extra_dejson=extra)], folder, {"load": "not a mapping"})
+        assert env == {"SNOWFLAKE_HOME": str(folder / "snowflake")}, "the private SNOWFLAKE_HOME's place is the layout"
         assert sf_toml(env) == {
             "connections": {"sf": {"account": "ab1", "user": "", "role": "R", "authenticator": "externalbrowser"}}
         }
@@ -537,20 +531,12 @@ def test_a_lone_surrogate_is_refused_naming_the_field_never_its_value(tmp_path: 
 
 
 def test_a_key_file_is_utf8_whatever_the_workers_locale(tmp_path: Path) -> None:
-    """`_secret_file` writes UTF-8: a worker in the C locale (no coercion, `LC_ALL=C`) would otherwise write ASCII and
-    fail on a non-ASCII password in `config.toml`. Run in a child Python with the package this test imports (the
-    mutated tree under mutmut, which the child inherits through MUTANT_UNDER_TEST). Mutants `_secret_file_15, 18`."""
-    assert Path(connections._secret_file(tmp_path, "here", "é€\U0001f600")).read_bytes() == "é€\U0001f600".encode()
-    root = str(Path(connections.__file__).resolve().parents[1])
-    env = {**os.environ, "LC_ALL": "C", "PYTHONCOERCECLOCALE": "0", "PYTHONUTF8": "0", "PYTHONPATH": root}
-    # The text is spelled with escapes: under LC_ALL=C the child decodes its own argv as ASCII.
-    code = (
-        "import pathlib, sys; from airflow_provider_rivet.connections import _secret_file; "
-        "_secret_file(pathlib.Path(sys.argv[1]), 'k', '\\u00e9\\u20ac\\U0001f600')"
-    )
-    child = subprocess.run([sys.executable, "-c", code, str(tmp_path)], env=env, capture_output=True, text=True, check=False)
-    assert child.returncode == 0, child.stderr[-2000:]
-    assert (tmp_path / "k").read_bytes() == "é€\U0001f600".encode()
+    """`_secret_file` writes the text's UTF-8 bytes (a worker in the C locale would otherwise write ASCII and fail on
+    a non-ASCII password in `config.toml`), mode 0600. Baseline mutants `_secret_file_15,
+    18, 22` (the encoding argument) no longer exist: the file is written as bytes."""
+    path = connections._secret_file(tmp_path, "k", "é€\U0001f600")
+    assert path == str(tmp_path / "k") and mode(path) == 0o600
+    assert Path(path).read_bytes() == "é€\U0001f600".encode()
 
 
 def test_a_kind_is_read_from_either_extra_form_and_a_refusal_names_both_connections(tmp_path: Path) -> None:
