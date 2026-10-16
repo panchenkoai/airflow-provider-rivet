@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import random
 import stat
+import subprocess
+import sys
 import tomllib
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,7 +17,8 @@ import pytest
 from airflow.exceptions import AirflowFailException
 from conftest import Rig
 
-from airflow_provider_rivet.connections import cloud_environment
+from airflow_provider_rivet import connections
+from airflow_provider_rivet.connections import EnvSpec, build_environment, cloud_environment, toml_string, url_host
 from airflow_provider_rivet.operators import RivetLoadOperator, RivetRunOperator, connection_url
 from airflow_provider_rivet.preflight import PreflightRefusal
 
@@ -299,3 +303,333 @@ def test_d23_connection_url_brackets_only_an_ipv6_literal_and_encodes_its_zone()
     with pytest.raises(PreflightRefusal) as refused:
         connection_url(url_conn(host="db.internal:5432", port=5432))
     assert refused.value.code == "RIVET_AIRFLOW_CONNECTION_UNSUPPORTED"
+
+
+# --- Phase-2 mutation hardening: what rivet receives, byte for byte (the mutant ids are in each test's comment) ---
+
+
+@pytest.mark.parametrize("scheme", ["postgresql", "postgres", "mysql", "sqlserver", "mongodb", "mongodb+srv", "oracle"])
+@pytest.mark.parametrize("host", [None, ""])
+def test_a_database_connection_without_a_host_is_refused_like_clickhouse(scheme: str, host: object) -> None:
+    """Defect `url_host_4`: a database Connection with no host became `postgresql://u:p@/d`, and the driver dialled its
+    default socket or host, while the same mistake on a ClickHouse Connection is refused (D22). Every URL that names a
+    host is built by `url_host`, so the refusal lives there, for every kind."""
+    with pytest.raises(PreflightRefusal) as refused:
+        connection_url(url_conn(host=host), scheme)
+    assert refused.value.code == "RIVET_AIRFLOW_CONNECTION_INCOMPLETE"
+    assert str(refused.value).endswith("connection `c` has no host")
+
+
+def sub(tmp_path: Path, name: str) -> Path:
+    """A fresh private folder per call, as each task gets one."""
+    (path := tmp_path / name).mkdir()
+    return path
+
+
+def mongo(**extra: object) -> SimpleNamespace:
+    return url_conn(conn_type="mongo", host="m", extra_dejson=extra)
+
+
+def refusal_of(call: object, *args: object) -> PreflightRefusal:
+    with pytest.raises(PreflightRefusal) as refused:
+        call(*args)  # type: ignore[operator]
+    return refused.value
+
+
+def test_the_tls_and_endpoint_settings_reach_rivet_exactly(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The settings that decide whether a credential travels encrypted, and to whom, reach the rivet process byte for
+    byte: Mongo `tls` / `allow_insecure` (mutants `_param_3/_4`: `tls=true` written as `tls=false`), ClickHouse
+    `secure` (`_clickhouse_22..37`: the password over plain `http://`) and the AWS `endpoint_url`
+    (`_aws_56..59`: the Connection's keys sent to real AWS)."""
+    conns = {
+        "mongo": mongo(tls=True, allow_insecure=False),
+        "aws": conn("aws", "aws", login="AKIA1", password="s", extra_dejson={"endpoint_url": "https://minio.internal:9000"}),
+        "ch": conn("ch", "clickhouse", host="ch", port=8443, login="l", password="pw", extra_dejson={"secure": "yes"}),
+    }
+    monkeypatch.setattr("airflow_provider_rivet.operators.BaseHook.get_connection", lambda conn_id: conns[conn_id])
+    names = ["RIVET_MONGO_URL", "AWS_ENDPOINT_URL", "AWS_ACCESS_KEY_ID", "RIVET_CLICKHOUSE_URL", "RIVET_CLICKHOUSE_PASSWORD"]
+    rig.scenario(record_env=names, leak_env=[])
+    op = rig.operator(
+        RivetRunOperator, export="orders", connections=["aws", "ch"], env_from_connections={"RIVET_MONGO_URL": "mongo"}
+    )
+    payload, _ = rig.run(op)
+    assert payload["decision"] == "success"
+    assert rig.calls()[-1]["env"] == {
+        "RIVET_MONGO_URL": "mongodb://u:p@m/d?tls=true&tlsAllowInvalidCertificates=false",
+        "AWS_ENDPOINT_URL": "https://minio.internal:9000",
+        "AWS_ACCESS_KEY_ID": "AKIA1",
+        "RIVET_CLICKHOUSE_URL": "https://ch:8443",
+        "RIVET_CLICKHOUSE_PASSWORD": "pw",
+    }
+
+
+def test_mongo_booleans_are_written_as_the_url_words_they_mean() -> None:
+    """`_param`: a boolean extra is `true` / `false`, never Python's `True` or the opposite word; any other value is
+    percent-encoded whole, `/` included. Mutants `_param_1, _3.._8, _12`."""
+    assert connection_url(mongo(tls=True, allow_insecure=False)) == "mongodb://u:p@m/d?tls=true&tlsAllowInvalidCertificates=false"
+    assert connection_url(mongo(tls=False, allow_insecure=True)) == "mongodb://u:p@m/d?tls=false&tlsAllowInvalidCertificates=true"
+    assert connection_url(mongo(ssl=True)) == "mongodb://u:p@m/d?tls=true"
+    assert (
+        connection_url(mongo(appName="etl/a b&c=d", replicaSet=0)) == "mongodb://u:p@m/d?replicaSet=0&appName=etl%2Fa%20b%26c%3Dd"
+    )
+
+
+@pytest.mark.parametrize("secure", ["1", "true", "TRUE", "yes", "Yes", True, 1])
+def test_a_secure_clickhouse_connection_is_an_https_endpoint(tmp_path: Path, secure: object) -> None:
+    """Every spelling of `secure` Airflow's ClickHouse Connections use gives `https://`, under either extra form;
+    without a login rivet's user is `default`. Mutants `_clickhouse_12, _18, _19, _22, _25, _26, _53, _54`."""
+    for i, extra in enumerate(({"secure": secure}, {"extra__clickhouse__secure": secure})):
+        env = cloud_environment([conn("ch", "clickhouse", host="ch", password="pw", extra_dejson=extra)], sub(tmp_path, str(i)))
+        assert env == {
+            "RIVET_CLICKHOUSE_URL": "https://ch",
+            "RIVET_CLICKHOUSE_USER": "default",
+            "RIVET_CLICKHOUSE_PASSWORD": "pw",
+        }
+
+
+@pytest.mark.parametrize("secure", ["0", "false", "no", "", None, False, "XXXX"])
+def test_a_clickhouse_connection_that_is_not_secure_is_plain_http(tmp_path: Path, secure: object) -> None:
+    env = cloud_environment([conn("ch", "clickhouse", host="ch", login="l", extra_dejson={"secure": secure})], tmp_path)
+    assert env == {"RIVET_CLICKHOUSE_URL": "http://ch", "RIVET_CLICKHOUSE_USER": "l"}
+
+
+def test_the_clickhouse_protocol_extra_names_the_scheme(tmp_path: Path) -> None:
+    """`protocol` wins over `secure`, under either extra form. Mutants `_clickhouse_30..39`."""
+    cases = [
+        ({"protocol": "https"}, "https://ch"),
+        ({"extra__clickhouse__protocol": "https"}, "https://ch"),
+        ({"protocol": "http", "secure": True}, "http://ch"),
+    ]
+    for i, (extra, url) in enumerate(cases):
+        env = cloud_environment([conn("ch", "clickhouse", host="ch", extra_dejson=extra)], sub(tmp_path, str(i)))
+        assert env["RIVET_CLICKHOUSE_URL"] == url, extra
+
+
+def test_every_aws_setting_reaches_its_variable_under_either_extra_form(tmp_path: Path) -> None:
+    """The session token, region and endpoint, by their plain names or the `extra__aws__` form: nothing dropped, nothing
+    renamed. Mutants `_aws_48..51, 56..59, 63, 67, 68`."""
+    want = {
+        "AWS_ACCESS_KEY_ID": "AKIA1",
+        "AWS_SECRET_ACCESS_KEY": "s",
+        "AWS_SESSION_TOKEN": "tok",
+        "AWS_REGION": "eu-north-1",
+        "AWS_ENDPOINT_URL": "https://minio.internal:9000",
+    }
+    plain = {"aws_session_token": "tok", "region_name": "eu-north-1", "endpoint_url": "https://minio.internal:9000"}
+    for i, extra in enumerate((plain, {f"extra__aws__{k}": v for k, v in plain.items()})):
+        assert (
+            cloud_environment([conn("aws", "aws", login="AKIA1", password="s", extra_dejson=extra)], sub(tmp_path, str(i)))
+            == want
+        )
+
+
+@pytest.mark.parametrize(
+    ("extra", "message"),
+    [
+        (
+            {"role_arn": "arn:aws:iam::1:role/r"},
+            "AWS connection `aws` sets `role_arn`, which rivet cannot use: rivet assumes no role: store the role's session "
+            "keys in login/password and extra `aws_session_token`, or run the worker as the role with an empty login and "
+            "`cloud_credentials=['aws']`",
+        ),
+        (
+            {"session_kwargs": {"profile_name": "prod"}},
+            "AWS connection `aws` sets `session_kwargs.profile_name`, which rivet cannot use: rivet reads no AWS profile: "
+            "put the keys in the Connection's login and password",
+        ),
+        (
+            {"extra__aws__session_kwargs": {"aws_session_token": "t"}},
+            "AWS connection `aws` sets `session_kwargs.aws_session_token`, which rivet cannot use: rivet reads no session_kwargs",
+        ),
+    ],
+)
+def test_an_aws_refusal_names_the_setting_and_its_remedy(tmp_path: Path, extra: dict, message: str) -> None:
+    """Mutants `_aws_4, _10, _11, _28, _31..40`."""
+    refused = refusal_of(cloud_environment, [conn("aws", "aws", login="AKIA1", extra_dejson=extra)], tmp_path)
+    assert (refused.code, str(refused)) == (
+        "RIVET_AIRFLOW_CONNECTION_UNSUPPORTED",
+        f"[RIVET_AIRFLOW_CONNECTION_UNSUPPORTED] {message}",
+    )
+
+
+def test_gcp_and_azure_settings_reach_rivet_under_either_extra_form(tmp_path: Path) -> None:
+    """A `keyfile_dict` given as a mapping is written as its JSON; the `extra__<kind>__` forms are read; an Azure
+    password is the account key. Mutants `_gcp_5, 11, 12, 26, 27, 44, 50, 51`, `_azure_5..7, 11, 17, 18`."""
+    key = json.loads(KEY)
+    gcp = conn("g", "google_cloud_platform", extra_dejson={"keyfile_dict": key, "extra__google_cloud_platform__project": "p1"})
+    env = cloud_environment([gcp], sub(tmp_path, "a"))
+    assert json.loads(Path(env.pop("GOOGLE_APPLICATION_CREDENTIALS")).read_text()) == key and env == {
+        "GOOGLE_CLOUD_PROJECT": "p1"
+    }
+    old = conn("g", "google_cloud_platform", extra_dejson={"extra__google_cloud_platform__keyfile_dict": KEY})
+    assert Path(cloud_environment([old], sub(tmp_path, "b"))["GOOGLE_APPLICATION_CREDENTIALS"]).read_text() == KEY
+    azure = conn("az", "wasb", login="acct", password="acct-key", extra_dejson={"extra__wasb__sas_token": "sv=1"})
+    assert cloud_environment([azure], sub(tmp_path, "c")) == {
+        "AZURE_STORAGE_ACCOUNT": "acct",
+        "AZURE_STORAGE_KEY": "acct-key",
+        "AZURE_STORAGE_SAS_TOKEN": "sv=1",
+    }
+
+
+def test_a_snowflake_key_is_accepted_in_every_form_snowflakes_hook_takes(tmp_path: Path) -> None:
+    """PEM with leading blank lines; base64 wrapped over lines (`base64` wraps at 76) of PEM that itself starts with a
+    blank line. Base64 holding a character outside its alphabet is refused, by a message that never shows the value.
+    Mutants `_pem_2, 8, 10, 12, 13, 20, 24`."""
+    cases = {"pem": "\n  " + pem_key(), "wrapped": base64.encodebytes(("\n" + pem_key() * 3).encode()).decode()}
+    for name, text in cases.items():
+        sf = conn("sf", "snowflake", login="L", extra_dejson={"account": "a", "private_key_content": text})
+        written = Path(cloud_environment([sf], sub(tmp_path, name))["RIVET_SNOWFLAKE_KEY"]).read_text()
+        assert written == ("\n  " + pem_key() if name == "pem" else "\n" + pem_key() * 3)
+    bad = base64.b64encode(pem_key().encode()).decode()
+    bad = bad[:8] + "!" + bad[8:]
+    sf = conn("sf", "snowflake", login="L", extra_dejson={"account": "a", "private_key_content": bad})
+    refused = refusal_of(cloud_environment, [sf], sub(tmp_path, "bad"))
+    assert str(refused) == (
+        "[RIVET_AIRFLOW_CONNECTION_UNSUPPORTED] Snowflake connection `sf`: extra `private_key_content` is neither a PEM "
+        "key nor base64 of one"
+    )
+
+
+def test_every_snowflake_extra_is_read_under_either_extra_form(tmp_path: Path) -> None:
+    """`account`, the connection keys, `authenticator`, `private_key_content` and `private_key_file`, plain or
+    `extra__snowflake__`; a `load:` that is no mapping names nothing; no login is an empty user. Mutants
+    `_snowflake_4, 20, 26, 27, 32, 48, 49, 53, 57, 58, 65, 71..83`."""
+    plain = {"account": "ab1", "role": "R", "authenticator": "externalbrowser"}
+    for i, extra in enumerate((plain, {f"extra__snowflake__{k}": v for k, v in plain.items()})):
+        env = cloud_environment([conn("sf", "snowflake", extra_dejson=extra)], sub(tmp_path, str(i)), {"load": "not a mapping"})
+        assert sf_toml(env) == {
+            "connections": {"sf": {"account": "ab1", "user": "", "role": "R", "authenticator": "externalbrowser"}}
+        }
+    for i, extra in enumerate(({"private_key_file": "/keys/k.p8"}, {"extra__snowflake__private_key_file": "/keys/k.p8"})):
+        sf = conn("sf", "snowflake", login="L", password="pass", extra_dejson={"account": "ab1", **extra})
+        env = cloud_environment([sf], sub(tmp_path, f"f{i}"))
+        assert sf_toml(env)["connections"]["sf"] == {
+            "account": "ab1",
+            "user": "L",
+            "authenticator": "SNOWFLAKE_JWT",
+            "private_key_file": "/keys/k.p8",
+        }
+        assert (env["RIVET_SNOWFLAKE_KEY"], env["PRIVATE_KEY_PASSPHRASE"]) == ("/keys/k.p8", "pass")
+    sf = conn("sf", "snowflake", login="L", extra_dejson={"account": "ab1", "extra__snowflake__private_key_content": pem_key()})
+    assert Path(cloud_environment([sf], sub(tmp_path, "c"))["RIVET_SNOWFLAKE_KEY"]).read_text() == pem_key()
+    refused = refusal_of(cloud_environment, [conn("sf2", "snowflake", login="x")], sub(tmp_path, "x"))
+    assert (refused.code, str(refused)) == (
+        "RIVET_AIRFLOW_CONNECTION_INCOMPLETE",
+        "[RIVET_AIRFLOW_CONNECTION_INCOMPLETE] Snowflake connection `sf2` has no `account` extra",
+    )
+
+
+def test_a_lone_surrogate_is_refused_naming_the_field_never_its_value(tmp_path: Path) -> None:
+    """Mutants `toml_string_2..5`, `_snowflake_111, 115, 122`."""
+    refused = refusal_of(toml_string, "a\ud800b", "the field")
+    assert (refused.code, str(refused)) == (
+        "RIVET_AIRFLOW_CONNECTION_UNSUPPORTED",
+        "[RIVET_AIRFLOW_CONNECTION_UNSUPPORTED] the field holds a lone surrogate, which a TOML file cannot carry",
+    )
+    sf = conn("sf", "snowflake", login="L", extra_dejson={"account": "a", "role": "r\udc00"})
+    assert str(refusal_of(cloud_environment, [sf], sub(tmp_path, "a"))).endswith(
+        "] Snowflake connection `sf`: field `role` holds a lone surrogate, which a TOML file cannot carry"
+    )
+    sf = conn("sf", "snowflake", login="L", extra_dejson={"account": "a"})
+    assert str(refusal_of(cloud_environment, [sf], sub(tmp_path, "b"), {"load": {"connection": "n\ud800"}})).endswith(
+        "] Snowflake connection `sf`: the connection name holds a lone surrogate, which a TOML file cannot carry"
+    )
+
+
+def test_a_key_file_is_utf8_whatever_the_workers_locale(tmp_path: Path) -> None:
+    """`_secret_file` writes UTF-8: a worker in the C locale (no coercion, `LC_ALL=C`) would otherwise write ASCII and
+    fail on a non-ASCII password in `config.toml`. Run in a child Python with the package this test imports (the
+    mutated tree under mutmut, which the child inherits through MUTANT_UNDER_TEST). Mutants `_secret_file_15, 18`."""
+    assert Path(connections._secret_file(tmp_path, "here", "é€\U0001f600")).read_bytes() == "é€\U0001f600".encode()
+    root = str(Path(connections.__file__).resolve().parents[1])
+    env = {**os.environ, "LC_ALL": "C", "PYTHONCOERCECLOCALE": "0", "PYTHONUTF8": "0", "PYTHONPATH": root}
+    code = "import sys; from airflow_provider_rivet.connections import _secret_file; _secret_file(__import__('pathlib').Path(sys.argv[1]), 'k', 'é€\\U0001f600')"
+    subprocess.run([sys.executable, "-c", code, str(tmp_path)], env=env, check=True, capture_output=True)
+    assert (tmp_path / "k").read_bytes() == "é€\U0001f600".encode()
+
+
+def test_a_kind_is_read_from_either_extra_form_and_a_refusal_names_both_connections(tmp_path: Path) -> None:
+    """Mutants `kind_of_5, 11, 12, 16`, `_cloud_8, 13`, `_extra_7, 15`."""
+    tagged = SimpleNamespace(conn_id="h", conn_type="http", host="ch", port=None, login=None, password=None)
+    tagged.extra_dejson = {"extra__rivet__rivet_kind": "clickhouse"}
+    assert cloud_environment([tagged], tmp_path)["RIVET_CLICKHOUSE_URL"] == "http://ch"
+    blank_plain = conn("ch", "clickhouse", host="ch", extra_dejson={"secure": "", "extra__clickhouse__secure": "1"})
+    assert cloud_environment([blank_plain], tmp_path)["RIVET_CLICKHOUSE_URL"] == "https://ch", (
+        "an empty plain extra hides the old form"
+    )
+    bare = SimpleNamespace(conn_id="h", conn_type="http")  # no extra_dejson at all
+    refused = refusal_of(cloud_environment, [bare], tmp_path)
+    assert str(refused) == (
+        "[RIVET_AIRFLOW_CONNECTION_KIND] connection `h` has conn_type `http`, which names no storage or warehouse rivet "
+        "reads; set its extra `rivet_kind` to one of ['aws', 'azure', 'clickhouse', 'gcp', 'snowflake']"
+    )
+    refused = refusal_of(cloud_environment, [conn("a", "aws", login="1"), conn("b", "aws", login="2")], tmp_path)
+    assert (
+        str(refused)
+        == "[RIVET_AIRFLOW_CONNECTION_KIND_TWICE] connections `a` and `b` are both aws: one task reads one aws credential"
+    )
+
+
+def test_url_host_refusals_name_the_connection_and_zones_are_encoded_whole() -> None:
+    """Mutants `url_host_6, 26..39, 44, 49`: the refusal text (with `?` for an object without a conn_id); a zone is
+    percent-encoded whole (`/` too); an unbracketed zone that starts with `25` is a zone, not an escape; a host with
+    one bracket is kept as written, never read as another address."""
+    text = "has host `db.internal:5432`, which holds a `:` but is no IPv6 address, and a port as well; put the port in the port field only"
+    refused = refusal_of(url_host, url_conn(host="db.internal:5432", port=5432))
+    assert str(refused) == f"[RIVET_AIRFLOW_CONNECTION_UNSUPPORTED] connection `c` {text}"
+    anonymous = SimpleNamespace(host="db.internal:5432", port=5432)
+    assert str(refusal_of(url_host, anonymous)) == f"[RIVET_AIRFLOW_CONNECTION_UNSUPPORTED] connection `?` {text}"
+    assert str(refusal_of(url_host, SimpleNamespace(host=None, port=None))).endswith("connection `?` has no host")
+    assert url_host(url_conn(host="fe80::1%a/b")) == "[fe80::1%25a%2Fb]"
+    assert url_host(url_conn(host="fe80::1%25")) == "[fe80::1%2525]", "interface 25"
+    assert url_host(url_conn(host="[fe80::1%2525]")) == "[fe80::1%2525]"
+    assert url_host(url_conn(host="fe80::1]")) == "fe80::1]"
+
+
+def test_connection_url_messages_and_the_extras_it_reads() -> None:
+    """Mutants `connection_url_7, 10..19, 23..25, 32, 43, 46, 62..64, 73, 80, 107, 114, 127, 131, 132, 142, 146, 153`."""
+    anonymous = SimpleNamespace(conn_type="generic", login="u", password="p", host="h", port=None, schema="d")
+    assert str(refusal_of(connection_url, anonymous)) == (
+        "[RIVET_AIRFLOW_CONNECTION_SCHEME] connection `?` has conn_type `generic`, which names no rivet URL scheme; pass "
+        "the scheme as (conn_id, scheme) or set the connection extra `rivet_scheme` to one of ('postgresql', 'postgres', "
+        "'mysql', 'sqlserver', 'mongodb', 'mongodb+srv', 'oracle')"
+    )
+    assert connection_url(url_conn(conn_type="generic", extra_dejson={"rivet_scheme": "mysql"})) == "mysql://u:p@h/d"
+    assert str(refusal_of(connection_url, url_conn(extra_dejson={"iam": True}))) == (
+        "[RIVET_AIRFLOW_CONNECTION_UNSUPPORTED] connection `c` sets extra `iam` (IAM token authentication), which a rivet URL cannot carry"
+    )
+    assert str(refusal_of(connection_url, url_conn(conn_type="mongo", port=1, extra_dejson={"srv": "yes"}))) == (
+        "[RIVET_AIRFLOW_CONNECTION_UNSUPPORTED] connection `c` is an SRV (`mongodb+srv`) connection with a port; clear the port"
+    )
+    for srv in ("1", "yes", "YES", True):
+        assert connection_url(mongo(srv=srv)) == "mongodb+srv://u:p@m/d", srv
+    assert connection_url(url_conn(extra_dejson={"srv": True})) == "postgresql://u:p@h/d", "srv is Mongo's alone"
+    assert connection_url(url_conn(extra_dejson={"service_name": "S"})) == "postgresql://u:p@h/d", "service_name is Oracle's"
+    assert connection_url(url_conn(login="a/b", password="c/d", schema="e/f")) == "postgresql://a%2Fb:c%2Fd@h/e%2Ff"
+    assert connection_url(url_conn(schema=None)) == "postgresql://u:p@h/"
+    assert connection_url(url_conn(extra_dejson={"sslmode": "", "connect_timeout": None})) == "postgresql://u:p@h/d"
+    two = {"sslmode": "require", "application_name": "a", "connect_timeout": 5}
+    assert (
+        connection_url(url_conn(extra_dejson=two)) == "postgresql://u:p@h/d?sslmode=require&application_name=a&connect_timeout=5"
+    )
+    own = {**two, "rivet_params": "application_name=x=y&connect_timeout=9"}
+    assert (
+        connection_url(url_conn(extra_dejson=own))
+        == "postgresql://u:p@h/d?sslmode=require&application_name=x=y&connect_timeout=9"
+    )
+
+
+def test_build_environment_reads_the_worker_environment_it_is_given(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """`build_environment(worker_env, ...)` reads the mapping it is handed, not `os.environ`, both for what it passes
+    and for the PostgreSQL-state guard, whose refusal names both remedies. Mutants `build_environment_4, 7, 37, 39, 46, 47`."""
+    monkeypatch.delenv("PASS_ME", raising=False)
+    worker = {"PATH": "/w", "PASS_ME": "x"}
+    assert build_environment(worker, EnvSpec(passthrough=["PASS_ME"]), [], tmp_path)["PASS_ME"] == "x"
+    refused = refusal_of(build_environment, {"RIVET_STATE_URL": "postgresql://s/state"}, EnvSpec(), [], tmp_path)
+    assert str(refused) == (
+        "[RIVET_AIRFLOW_STATE_ENV_NOT_PASSED] the worker's environment sets RIVET_STATE_URL to a PostgreSQL state and "
+        "this task would not pass it to rivet, which would then run on an empty SQLite state and treat every export as "
+        'a first run. Either inherit the worker\'s value with env_passthrough=["RIVET_STATE_URL"], or give the task its '
+        'own with env_from_connections={"RIVET_STATE_URL": "<conn_id>"} (or `env`); unset it on the worker if it is not '
+        "meant for this pipeline"
+    )
