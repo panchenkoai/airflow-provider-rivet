@@ -41,6 +41,7 @@ CLOUD_ENV = {
 STDERR_TAIL = 1 << 20
 STOP_GRACE = 30.0  # seconds a stopped rivet process gets between SIGTERM and SIGKILL
 QUERY_OWNERS = ".rivet_airflow_query_files.json"
+STALE_AFTER = 24 * 3600  # seconds after which an expired plan artifact or an untouched crashed ledger is pruned
 PLAN_ERRORS = (ValueError, KeyError, IndexError, TypeError, AttributeError)
 _SAFE = re.compile(r"[^A-Za-z0-9_.-]+")
 _PLAIN = re.compile(r"[a-z0-9_][a-z0-9_.-]{0,79}")
@@ -83,8 +84,19 @@ def undeclared_state_variables(env: Mapping[str, str], environ: Mapping[str, str
 
 
 def plan_layout(plan: Any) -> list[dict[str, Any]]:
-    """Waves of a `rivet plan --format json` document, lowest first; raises one of PLAN_ERRORS when it is not one."""
-    campaign = plan[0]["prioritization"]["campaign"]
+    """Waves of a `rivet plan --format json` document, lowest first; raises one of PLAN_ERRORS when it is not one.
+
+    Several planned exports print as an array whose objects carry the campaign; one planned export prints as its
+    bare object with no campaign, and its one wave is its own `export_recommendation` (D10).
+    """
+    if isinstance(plan, dict):
+        rec = plan["prioritization"]["export_recommendation"]
+        name = plan["export_name"]
+        if not isinstance(name, str) or rec.get("export_name", name) != name:
+            raise ValueError("the plan's recommendation names another export")
+        campaign = {"waves": [{"wave": int(rec["recommended_wave"]), "exports": [name]}], "ordered_exports": [rec]}
+    else:
+        campaign = plan[0]["prioritization"]["campaign"]
     cost = {e["export_name"]: e.get("cost_class") for e in campaign.get("ordered_exports", [])}
     waves = sorted(campaign["waves"], key=lambda w: w["wave"])
     layout = [
@@ -117,6 +129,7 @@ class Request:
     stream_stderr: bool = False
     log_keep: int | None = 10
     label: Sequence[Any] = ("dag", "run", "task", 1)
+    series: int | None = None
     upstream_markers: Sequence[str] = ()
 
 
@@ -210,6 +223,8 @@ class _Session:
         """Drop the scratch directory of a diskless worker and the log files past the retention."""
         if self.tmp is not None:
             shutil.rmtree(self.tmp, ignore_errors=True)
+        else:
+            _prune_stale(self.work)
         if self.req.log_keep is not None:
             _prune_logs(self.logs, max(1, self.req.log_keep))
 
@@ -427,6 +442,34 @@ def _temp_base() -> Path:
         if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) != 0o700:
             return Path(tempfile.mkdtemp(prefix="rivet-airflow-"))
     return path
+
+
+def _tighten(path: Path) -> None:
+    """Mode 0600 on a file rivet wrote through its umask (D38); a missing file is left to the step that reads it."""
+    try:
+        os.chmod(path, 0o600)
+    except FileNotFoundError:
+        pass
+
+
+def _prune_stale(work: Path, now: float | None = None) -> None:
+    """Remove expired plan artifacts and crashed ledgers untouched for STALE_AFTER, and the run folders left empty (D33)."""
+    cutoff = (time.time() if now is None else now) - STALE_AFTER
+    for kind in ("plans", "crashed"):
+        try:
+            files = [p for p in (work / kind).rglob("*") if p.is_file() and p.stat().st_mtime < cutoff]
+        except OSError:
+            continue
+        for path in files:
+            if _unexpired(path) if kind == "plans" else not isinstance(_read_json(path), list):
+                continue  # a replayable plan, or a ledger that is not one: left until a person deletes it
+            path.unlink(missing_ok=True)
+        if kind == "plans":
+            for folder in (work / kind).iterdir() if (work / kind).is_dir() else ():
+                try:
+                    folder.rmdir()
+                except OSError:
+                    pass
 
 
 def _prune_logs(folder: Path, keep: int) -> None:
@@ -705,7 +748,11 @@ def _apply(s: _Session) -> Outcome:
     """`rivet plan -e X -o artifact` when no unexpired artifact exists, then `rivet apply artifact`."""
     export = s.req.export or ""
     cfg = s.config_for(None)
-    artifact = _private_dir(s.work, "plans", s.run) / f"{path_name(export, s.req.label[2], _plan_inputs(s, export))}.json"
+    # One sealed plan per try series (Airflow's `max_tries`, which a clear moves): a retry replays it, a clear after a
+    # success plans again instead of replaying a snapshot the successful apply already moved the cursor past (D04).
+    series = () if s.req.series is None else (f"s{int(s.req.series)}",)
+    name = path_name(export, s.req.label[2], *series, _plan_inputs(s, export))
+    artifact = _private_dir(s.work, "plans", s.run) / f"{name}.json"
     _refuse_foreign_artifact(artifact, export, cfg)
     if not _unexpired(artifact):
         plan_argv = [s.pf.binary, "plan", "--config", cfg, "--export", export, "--format", "json"]
@@ -715,6 +762,7 @@ def _apply(s: _Session) -> Outcome:
         if error is not None:
             return s.outcome(planned, [UnitResult(export, status="failed", error=error)], error)
         _refuse_foreign_artifact(artifact, export, cfg)
+        _tighten(artifact)
     has_summary = s.pf.caps.has_flag("apply", "--summary-output")
     summary = s.work / f"{s.name}.summary.json"
     argv = [s.pf.binary, "apply", str(artifact)]
@@ -743,6 +791,9 @@ def _unit_from_metrics(s: _Session, cfg: str, export: str) -> UnitResult:
     unit = UnitResult(export, status="success")
     row = rows[0] if isinstance(rows, list) and rows and isinstance(rows[0], dict) else {}
     if step.exit_status == 0 and row.get("export_name") == export:
+        if "status" in row:  # a `skip_empty` run that delivered nothing is `skipped` (D31)
+            unit.status = s.status(row["status"])
+            unit.skip_reason = s.malformed(row.get("skip_reason"), str)
         unit.run_id = s.malformed(row.get("run_id"), str)
         unit.rows, unit.files = s.malformed(row.get("total_rows"), int), s.malformed(row.get("files_produced"), int)
     return unit

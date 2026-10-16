@@ -67,6 +67,15 @@ Changed before the first release, after review (see the README sections named):
   a callback in `default_args` fires once per failed task.
 - `connection_url`: a password without a login, IPv6 hosts, Oracle `service_name`, an encoded
   database name. The version has one source, `airflow_provider_rivet/__init__.py`.
+- A clear of a finished `RivetApplyOperator` plans again instead of replaying a sealed plan whose
+  cursor the successful apply already moved (rivet refused it `RIVET_PLAN_ARTIFACT_STALE` on
+  every clear for 24 h): the artifact is named by the try series (`max_tries`). (D04)
+- `RivetPlanOperator` and `build_batch_dag` read a plan of one export, which rivet prints as a
+  bare object with no campaign; it was a `KeyError` and an `internal` failure. (D10)
+- The sealed plan artifact is mode `0600` whatever rivet's umask, as the README said. (D38)
+- Expired plan artifacts and crashed ledgers untouched for 24 h are pruned. (D33)
+- An apply whose counts come from `rivet metrics --json` reports the row's status: a
+  `skip_empty` export that delivered nothing is `skipped` with its `skip_reason`. (D31)
 
 The environment built from Connections, after the 2026-10 bug hunt (`connections.build_environment`
 is now the one place rivet's environment is assembled; README "Storage and warehouse connections"):
