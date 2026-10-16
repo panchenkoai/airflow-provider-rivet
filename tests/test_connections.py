@@ -543,8 +543,13 @@ def test_a_key_file_is_utf8_whatever_the_workers_locale(tmp_path: Path) -> None:
     assert Path(connections._secret_file(tmp_path, "here", "é€\U0001f600")).read_bytes() == "é€\U0001f600".encode()
     root = str(Path(connections.__file__).resolve().parents[1])
     env = {**os.environ, "LC_ALL": "C", "PYTHONCOERCECLOCALE": "0", "PYTHONUTF8": "0", "PYTHONPATH": root}
-    code = "import sys; from airflow_provider_rivet.connections import _secret_file; _secret_file(__import__('pathlib').Path(sys.argv[1]), 'k', 'é€\\U0001f600')"
-    subprocess.run([sys.executable, "-c", code, str(tmp_path)], env=env, check=True, capture_output=True)
+    # The text is spelled with escapes: under LC_ALL=C the child decodes its own argv as ASCII.
+    code = (
+        "import pathlib, sys; from airflow_provider_rivet.connections import _secret_file; "
+        "_secret_file(pathlib.Path(sys.argv[1]), 'k', '\\u00e9\\u20ac\\U0001f600')"
+    )
+    child = subprocess.run([sys.executable, "-c", code, str(tmp_path)], env=env, capture_output=True, text=True, check=False)
+    assert child.returncode == 0, child.stderr[-2000:]
     assert (tmp_path / "k").read_bytes() == "é€\U0001f600".encode()
 
 
