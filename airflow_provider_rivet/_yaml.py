@@ -53,9 +53,7 @@ def _int(loader: yaml.SafeLoader, node: yaml.ScalarNode) -> Any:
     text = loader.construct_scalar(node)
     if _LEADING_ZERO.match(text) or not _INT.match(text):
         return text
-    sign, body = (-1, text[1:]) if text.startswith("-") else (1, text.lstrip("+"))
-    base = {"0x": 16, "0o": 8, "0b": 2}.get(body[:2], 10)
-    value = ScalarInt(sign * int(body[2:] if base != 10 else body, base))
+    value = ScalarInt(int(text, 0))  # base 0: a sign, then 0x / 0o / 0b or decimal, exactly the `_INT` forms
     value.text = text
     return value
 
@@ -65,7 +63,7 @@ def _float(loader: yaml.SafeLoader, node: yaml.ScalarNode) -> Any:
     text = loader.construct_scalar(node)
     if _LEADING_ZERO.match(text):
         return text
-    word = text.lstrip("+-").lower()
+    word = text.lower().removeprefix("+").removeprefix("-")
     if word in (".inf", ".nan"):
         number = float(("-" if text.startswith("-") else "") + word[1:])
     else:
@@ -103,7 +101,7 @@ def substitute(text: str, value_of: Callable[[str], str | None]) -> tuple[str, l
     out, i = [], 0
     while (start := text.find("${", i)) >= 0:
         end = text.find("}", start)
-        if end < 0:
+        if end == -1:
             break
         name = text[start + 2 : end]
         value = "" if not name else value_of(name)
@@ -133,14 +131,14 @@ def params_of(args: Sequence[str]) -> dict[str, str]:
     args = list(args)
     for i, arg in enumerate(args):
         if arg in ("-p", "--param"):
-            item = args[i + 1] if i + 1 < len(args) else ""
+            item = args[i + 1] if i + 1 < len(args) else None  # a trailing `-p` has no value
         elif arg.startswith("--param="):
             item = arg[len("--param=") :]
-        elif arg.startswith("-p") and not arg.startswith("--"):
+        elif arg.startswith("-p"):
             item = arg[2:].removeprefix("=")
         else:
             continue
-        if "=" in item:
+        if item and "=" in item:
             key, value = item.split("=", 1)
             params[key] = value
     return params
@@ -166,7 +164,7 @@ def _same_length_mask(text: str) -> str:
     out, i = [], 0
     while (start := text.find("${", i)) >= 0:
         end = text.find("}", start)
-        if end < 0:
+        if end == -1:
             break
         out += [text[i:start], "$", MASK[0], text[start + 2 : end], MASK[1]]
         i = end + 1
@@ -174,8 +172,26 @@ def _same_length_mask(text: str) -> str:
     return "".join(out)
 
 
+def _compose(text: str) -> yaml.Node | None:
+    """`yaml.compose` with the config loader."""
+    loader = ConfigLoader(text)
+    try:
+        return loader.get_single_node()
+    finally:
+        loader.dispose()
+
+
+def _tokens(text: str) -> list[yaml.Token]:
+    """`yaml.scan` with the config loader, as a list."""
+    loader = ConfigLoader(text)
+    try:
+        return list(iter(loader.get_token, None))
+    finally:
+        loader.dispose()
+
+
 def _exports_node(text: str) -> yaml.SequenceNode | None:
-    root = yaml.compose(_same_length_mask(text), Loader=ConfigLoader)
+    root = _compose(_same_length_mask(text))
     if not isinstance(root, yaml.MappingNode):
         raise NarrowRefused("the config is not one YAML mapping")
     found = [value for key, value in root.value if isinstance(key, yaml.ScalarNode) and key.value == "exports"]
@@ -188,55 +204,23 @@ def _exports_node(text: str) -> yaml.SequenceNode | None:
     return found[0]
 
 
-def _content_end(node: yaml.Node, low: int, high: int) -> int:
-    """The end of the last text that belongs to an item: the furthest scalar or flow collection written inside it."""
-    best, seen, todo = low, set(), [node]
-    while todo:
-        cur = todo.pop()
-        if id(cur) in seen:
-            continue
-        seen.add(id(cur))
-        start, end = cur.start_mark.index, cur.end_mark.index
-        if not low <= start <= high:
-            continue
-        if isinstance(cur, yaml.ScalarNode) or cur.flow_style:
-            best = max(best, min(end, high))
-        if isinstance(cur, yaml.MappingNode):
-            todo += [part for pair in cur.value for part in pair]
-        elif isinstance(cur, yaml.SequenceNode):
-            todo += list(cur.value)
-    return best
-
-
 def _block_cuts(text: str, seq: yaml.SequenceNode, drop: set[int]) -> list[tuple[int, int, str]]:
-    """Whole lines from each dropped item's `-` to the end of its last content line."""
-    tokens = list(yaml.scan(_same_length_mask(text), Loader=ConfigLoader))
-    dashes = sorted(t.start_mark.index for t in tokens if isinstance(t, yaml.BlockEntryToken))
-    # An alias composes to its anchor's node, whose marks are where the anchor is written (often above `exports:`), so
-    # the node walk of `_content_end` cannot see `*name` as text of the item that writes it: read it from the tokens.
-    aliases = [(t.start_mark.index, t.end_mark.index) for t in tokens if isinstance(t, yaml.AliasToken)]
-    items = seq.value
+    """Whole lines from each dropped item's `-` to the end of the line of its last token.
+
+    In a block sequence every token from an item's start to the next item's `-` (the end of the sequence for the last
+    item) is that item's text: its scalars, flow collections, anchors, tags and aliases (an alias composes to its
+    anchor's node, whose marks are where the anchor is written, so the composed node cannot tell where its text ends).
+    `narrow_text` reads the cut back and refuses anything that is not the chosen document."""
+    tokens = _tokens(_same_length_mask(text))
+    dashes = [t.start_mark.index for t in tokens if isinstance(t, yaml.BlockEntryToken)]
+    own = [max(d for d in dashes if d < item.start_mark.index) for item in seq.value]  # each item's own `-`
+    bounds = [*own[1:], seq.end_mark.index]
     cuts = []
     for i in sorted(drop):
-        start = items[i].start_mark.index
-        dash = max((d for d in dashes if d < start), default=-1)
-        if dash < 0 or (i > 0 and dash < items[i - 1].start_mark.index):
-            raise NarrowRefused(f"cannot find the `-` of export #{i + 1}")
-        nxt = max((d for d in dashes if i + 1 < len(items) and d < items[i + 1].start_mark.index), default=-1)
-        high = nxt if nxt > start else seq.end_mark.index
-        line = text.rfind("\n", 0, dash) + 1
-        if text[line:dash].strip():
-            raise NarrowRefused(f"export #{i + 1} does not start its own line")
-        end = max([_content_end(items[i], start, high), *(e for s, e in aliases if start <= s < high)])
-        if text[end - 1] == "\n":
-            stop = end
-        else:
-            stop = text.find("\n", end)
-            stop = len(text) if stop < 0 else stop + 1
-        tail = text[end:stop].strip()
-        if tail and not tail.startswith("#"):
-            raise NarrowRefused(f"export #{i + 1} shares its last line with other text")
-        cuts.append((line, stop, ""))
+        start, bound = seq.value[i].start_mark.index, bounds[i]
+        end = max(t.end_mark.index for t in tokens if start <= t.start_mark.index < bound)
+        line = text[: own[i]].rfind("\n") + 1
+        cuts.append((line, text.find("\n", end - 1) + 1 or len(text), ""))
     return cuts
 
 
@@ -256,7 +240,7 @@ def narrow_text(text: str, keep: set[int], count: int, check: Callable[[str], No
     if not drop:
         return text
     for item in items:
-        if not seq.start_mark.index <= item.start_mark.index <= seq.end_mark.index:
+        if item.start_mark.index not in range(seq.start_mark.index, seq.end_mark.index):
             raise NarrowRefused("an export is an alias of a node written elsewhere")
     if seq.flow_style:
         kept = [text[item.start_mark.index : item.end_mark.index] for i, item in enumerate(items) if i not in drop]

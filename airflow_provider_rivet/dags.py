@@ -78,7 +78,11 @@ def read_plan_layout(plan_file: str) -> list[dict[str, Any]]:
 def _watch(dag: DAG) -> None:
     """Add the task that fails the run when any other task failed; it carries no failure callback of its own."""
     tasks = list(dag.tasks)
-    tasks >> RivetRunWatcher(task_id=WATCHER_ID, trigger_rule="one_failed", retries=0, on_failure_callback=None, dag=dag)
+    watcher = RivetRunWatcher(task_id=WATCHER_ID, trigger_rule="one_failed", on_failure_callback=None, dag=dag)
+    # Set after construction, so `default_args` cannot give it retries. No mutant here: Airflow reads `retries = None`
+    # as 0, so that mutant could never be told apart.
+    watcher.retries = 0  # pragma: no mutate
+    tasks >> watcher
 
 
 def _dag(dag_id: str, tags: Sequence[str], dag_kwargs: Mapping[str, Any]) -> DAG:
@@ -118,7 +122,7 @@ def build_batch_dag(
         raise ValueError("`exports` is empty: name at least one export, or give `plan_file`")
     if extract not in ("apply", "run"):
         raise ValueError("`extract` is 'apply' or 'run'")
-    waves = read_plan_layout(plan_file) if plan_file else [{"wave": 1, "exports": list(exports or ()), "heavy": []}]
+    waves = read_plan_layout(plan_file) if plan_file else [{"exports": list(exports or ()), "heavy": []}]
     names = [n for w in waves for n in w["exports"]]
     unknown = sorted(set(compact_exports) - set(names))
     if unknown:
@@ -132,25 +136,27 @@ def build_batch_dag(
         plan = RivetPlanOperator(task_id="plan", plan_file=plan_file, **common) if plan_file and refresh_plan else None
         apply_tasks: dict[str, Any] = {}
         with TaskGroup(group_id="apply"):
-            wave_done: Any | None = None
+            # what every extract of a wave waits for: the plan, and the barrier that ends the wave before it
+            plan_gate = [plan] if plan is not None else []
+            wave_gates = plan_gate
             for index, wave in enumerate(waves):
                 # D26: rivet's `cost_gate_batches` order: each heavy export alone, one after another, then the cheap batch
                 heavy = [n for n in wave["exports"] if n in wave["heavy"]]
                 cheap = [n for n in wave["exports"] if n not in wave["heavy"]]
-                order_done: Any | None = None
+                gates = wave_gates
                 for position, name in enumerate(heavy + cheap):
                     task = extract_cls(task_id=task_name(name), export=name, **common)
                     apply_tasks[name] = task
-                    for gate in (plan, wave_done, order_done):
-                        if gate is not None:
-                            gate >> task
+                    gates >> task
                     if name in heavy and position < len(heavy + cheap) - 1:
                         order_done = RivetWaveBarrier(task_id=f"after_{task_name(name)}", trigger_rule=ORDER_ONLY)
                         task >> order_done
+                        gates = [*wave_gates, order_done]
                 if index < len(waves) - 1:
                     wave_done = RivetWaveBarrier(task_id=f"wave_{wave['wave']}_done", trigger_rule=ORDER_ONLY)
                     for name in wave["exports"]:
                         apply_tasks[name] >> wave_done
+                    wave_gates = [*plan_gate, wave_done]
         load_tasks: dict[str, Any] = {}
         if load:
             with TaskGroup(group_id="load"):
@@ -162,7 +168,7 @@ def build_batch_dag(
                 for name in names:
                     if name in compact_exports:
                         load_tasks[name] >> RivetCompactOperator(task_id=task_name(name), export=name, **common)
-        _watch(dag)
+    _watch(dag)
     return dag
 
 
@@ -195,5 +201,5 @@ def build_cdc_dag(
                 with TaskGroup(group_id="compact"):
                     for table in tables:
                         loads[table] >> RivetCompactOperator(task_id=task_name(table), export=export, table=table, **common)
-        _watch(dag)
+    _watch(dag)
     return dag

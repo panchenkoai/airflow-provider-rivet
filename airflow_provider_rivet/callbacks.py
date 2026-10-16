@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from typing import Any
@@ -29,7 +30,7 @@ def _failed_units(payload: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     """The units that carry an error; the process-level error when no unit does."""
     failed = [u for u in payload.get("units") or [] if u.get("error")]
     if not failed and payload.get("error"):
-        failed = [{"export": None, "table": None, "error": payload["error"]}]
+        failed = [{"error": payload["error"]}]  # no export, no table: read as `(process)`
     return failed
 
 
@@ -112,17 +113,14 @@ def _rivet_errors(payload: Mapping[str, Any]) -> list[str]:
         return []
     try:
         with open(path, "rb") as f:
-            f.seek(max(f.seek(0, 2) - STDERR_TAIL, 0))
-            lines = f.read().decode("utf-8", errors="replace").splitlines()
+            f.seek(max(os.path.getsize(path) - STDERR_TAIL, 0))
+            lines = f.read().decode(errors="replace").splitlines()  # bytes decode as UTF-8
     except OSError:
         return []
     found, plain = [], []
     for line in lines:
-        try:
-            obj = json.loads(line)
-        except ValueError:
-            obj = None
-        if isinstance(obj, dict):
+        obj = _json_object(line)
+        if obj:
             text = obj.get("error") if isinstance(obj.get("error"), str) else obj.get("message")
             if isinstance(text, str) and text:
                 code = obj.get("code")
@@ -130,6 +128,15 @@ def _rivet_errors(payload: Mapping[str, Any]) -> list[str]:
         elif line.lstrip().lower().startswith("error:"):
             plain.append(line.strip())
     return found or plain  # the human `Error:` line repeats the object when both are printed
+
+
+def _json_object(line: str) -> dict[str, Any]:
+    """The JSON object a line holds; empty for any other line."""
+    try:
+        obj = json.loads(line)
+    except ValueError:
+        return {}
+    return obj if isinstance(obj, dict) else {}
 
 
 def format_error_text(payload: Mapping[str, Any] | None, *, exception: Any = None, limit: int, log_url: str = "") -> str:
@@ -194,17 +201,12 @@ def slack_failure_callback(
         """Format this task instance's rivet result and send it."""
         ti = context["ti"]
         map_index = getattr(ti, "map_index", -1)
-        try:
-            # this index's own payload: without `map_indexes` a mapped task's pull returns every index's (D11)
-            payload = ti.xcom_pull(task_ids=ti.task_id, key=XCOM_KEY, map_indexes=map_index)
-        except Exception:
-            payload = None
         alert = _Alert(
             dag_id=ti.dag_id,
             task=ti.task_id + (f"[{map_index}]" if isinstance(map_index, int) and map_index >= 0 else ""),
             run_id=str(context.get("run_id") or getattr(ti, "run_id", "")),
-            log_url=getattr(ti, "log_url", "") or "",
-            payload=payload if isinstance(payload, dict) else None,
+            log_url=getattr(ti, "log_url", None) or "",
+            payload=_payload_of(ti, map_index),
             exception=context.get("exception"),
         )
         if channel:
@@ -213,6 +215,16 @@ def slack_failure_callback(
             _post_webhook(alert, conn_id, hook_kwargs)
 
     return notify
+
+
+def _payload_of(ti: Any, map_index: Any) -> dict[str, Any] | None:
+    """This task instance's rivet result, or None when there is none to read."""
+    try:
+        # this index's own payload: without `map_indexes` a mapped task's pull returns every index's (D11)
+        payload = ti.xcom_pull(task_ids=ti.task_id, key=XCOM_KEY, map_indexes=map_index)
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
 
 
 def _post_webhook(alert: _Alert, conn_id: str, hook_kwargs: Mapping[str, Any]) -> None:

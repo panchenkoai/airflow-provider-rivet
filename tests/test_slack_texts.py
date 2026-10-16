@@ -219,7 +219,8 @@ class MappedTI(FakeTI):
         self.dag_id, self.map_index, self.run_id = "dg", map_index, "ti_run"
         self.pulled, self.raises, self.asked = pulled, raises, []
 
-    def xcom_pull(self, task_ids: object = None, key: str = "return_value", map_indexes: object = None) -> object:
+    def xcom_pull(self, task_ids: object = None, key: str | None = None, map_indexes: object = None) -> object:
+        """`key` defaults to None here: the callback names the key it reads, never relying on Airflow's default."""
         self.asked.append((task_ids, key, map_indexes))
         if self.raises:
             raise RuntimeError("no xcom backend")
@@ -318,3 +319,47 @@ def test_the_thread_text_is_capped_at_its_limit_and_the_webhook_text_at_its_own(
     tail = "\n… truncated, full log: the task log"
     assert rec.posts[1]["text"] == "```\n" + "y" * (3500 - len(tail)) + tail + "\n```"
     assert rec.sent[0].endswith("\n```\n" + "y" * (3000 - len(tail)) + tail + "\n```")
+
+
+class BareTI:
+    """A task instance with only what every Airflow version has: no map_index, run_id or log_url attribute."""
+
+    dag_id, task_id = "dg", "t"
+
+    def __init__(self) -> None:
+        self.asked: list = []
+
+    def xcom_pull(self, task_ids: object = None, key: str | None = None, map_indexes: object = None) -> object:
+        self.asked.append((task_ids, key, map_indexes))
+        return None
+
+
+def test_a_task_instance_without_map_index_run_id_or_log_url_is_one_unmapped_task(monkeypatch: pytest.MonkeyPatch) -> None:
+    rec = Recording(monkeypatch)
+    ti = BareTI()
+    slack_failure_callback("w")({"ti": ti})
+    assert ti.asked == [("t", "return_value", -1)]
+    assert rec.sent == [
+        ":x: *dg.t — failed, no rivet result*\nrun ``\n```\nno error text: the task failed without a rivet result or an exception\n```"
+    ]
+
+
+def test_a_cut_thread_text_points_at_the_task_logs_url(monkeypatch: pytest.MonkeyPatch) -> None:
+    rec = Recording(monkeypatch)
+    ti = MappedTI(pulled=None)
+    ti.log_url = "http://af/log"
+    slack_failure_callback("bot", channel="C")({"ti": ti, "run_id": "r", "exception": ValueError("y" * 5000)})
+    tail = "\n… truncated, full log: http://af/log"
+    assert rec.posts[1]["text"] == "```\n" + "y" * (3500 - len(tail)) + tail + "\n```"
+
+
+def test_the_tail_read_starts_at_its_first_byte(tmp_path: Path) -> None:
+    """A small file is read from byte 0, a large one from exactly 64 KiB before its end: a line starting there is whole."""
+    small = tmp_path / "small.log"
+    small.write_text("Error: first byte\n")
+    assert format_error_text({"stderr_path": str(small)}, limit=3500) == "Error: first byte"
+    edge = "Error: at the edge\n"
+    big = tmp_path / "big.log"
+    big.write_text("x" * 10 + "\n" + edge + "w" * (65536 - len(edge) - 1) + "\n")
+    assert big.stat().st_size == 11 + 65536
+    assert format_error_text({"stderr_path": str(big)}, limit=3500) == "Error: at the edge"

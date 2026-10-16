@@ -512,3 +512,19 @@ def test_an_export_ending_in_an_alias_of_a_top_level_anchor_is_cut_not_refused(k
     items = ["  - name" + item for item in body.split("  - name")[1:]]
     with watchdog():
         assert _yaml.narrow_text(ALIASED_LAST, {kept}, 3, check) == head + "exports:\n" + items[kept]
+
+
+@pytest.mark.parametrize(
+    ("text", "keep", "out"),
+    [
+        ("exports:\n  - a\n  - name: b\n", {1}, "exports:\n  - name: b\n"),
+        ("exports:\n  - name: a\n  - b\n", {0}, "exports:\n  - name: a\n"),
+        ("exports:\n  - name: a\n    t: |\n      one line\n  - name: b\n", {1}, "exports:\n  - name: b\n"),
+        ("exports:\n  - name: a\n    t: >-\n      folded\n  - name: b\n", {1}, "exports:\n  - name: b\n"),
+        ("exports:\n  - {name: a}\n  - [b]\n  - name: c\n", {2}, "exports:\n  - name: c\n"),
+    ],
+)
+def test_an_item_of_one_token_or_ending_in_a_block_scalar_is_cut_whole(text: str, keep: set[int], out: str) -> None:
+    """The item's text is every token from its start to the next `-`: a lone scalar is one token, and a literal block
+    scalar's token ends after its newline, so the cut stops there and never takes the next item's line."""
+    assert narrow(text, keep, text.count("\n  - ")) == out

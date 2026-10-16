@@ -26,7 +26,7 @@ class Lines:
     def __init__(
         self, monkeypatch: pytest.MonkeyPatch, command: str = "run", export: str | None = "orders", table: str | None = None
     ) -> None:
-        ticks = itertools.count()
+        ticks = itertools.count(100)  # the task starts at 100 s: a duration is a difference, never a sum
         monkeypatch.setattr(tasklog, "clock", lambda: float(next(ticks)))
         self.written: list[tuple[int, str]] = []
         self.log = tasklog.TaskLog(command, export, table, lambda level, text: self.written.append((level, text)))
@@ -344,3 +344,43 @@ def test_finish_writes_the_rendered_block(monkeypatch: pytest.MonkeyPatch) -> No
     lines = Lines(monkeypatch)
     lines.log.finish({"decision": "retry", "error": {"class": "retryable"}}, 2, 3, False)
     assert lines.written == [(logging.WARNING, "rivet run orders → FAILED, retryable, Airflow retries it (try 2 of 4)")]
+
+
+def test_a_busy_headline_names_the_lock_and_how_long_it_waited(monkeypatch: pytest.MonkeyPatch) -> None:
+    lines = Lines(monkeypatch).records({"event": "rivet.lock.wait", "lock_wait": 30, "unit": "export `orders`"})
+    assert lines.render({"busy": "RIVET_AIRFLOW_EXPORT_BUSY"}, try_number=1, max_tries=2)[0] == (
+        "WARNING rivet run orders → BUSY [RIVET_AIRFLOW_EXPORT_BUSY]: the lock of export `orders` stayed held for 30 s; "
+        "rivet was not started, Airflow retries it (try 1 of 3)"
+    )
+
+
+def test_a_success_holds_no_unit_line_for_one_unit_and_no_stderr_line(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Only a failed task names its stderr file and its one failed unit; a success with one unit says it in the headline."""
+    payload = {"decision": "success", "units": [{"status": "failed", "export": "e"}], "stderr_path": "/s/x.log"}
+    shown = Lines(monkeypatch).render(payload)
+    assert [line for line in shown if "stderr" in line or "export   " in line] == []
+
+
+def test_a_failed_unit_line_carries_its_code(monkeypatch: pytest.MonkeyPatch) -> None:
+    payload = {
+        "decision": "fail",
+        "units": [{"status": "failed", "export": "e", "error": {"code": "RIVET_X", "class": "refusal"}}],
+    }
+    assert Lines(monkeypatch).render(payload)[1:] == ["INFO   export   e: failed [RIVET_X] refusal"]
+
+
+def test_sqlite_state_alone_is_the_sqlite_note(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert Lines(monkeypatch).render({"decision": "success", "degraded": ["state_url_sqlite"]})[1:] == [
+        "INFO   note     SQLite state is single-host — see " + GUIDE
+    ]
+
+
+def test_finish_passes_a_stop_through(monkeypatch: pytest.MonkeyPatch) -> None:
+    lines = Lines(monkeypatch)
+    lines.log.finish({"decision": "retry_crashed", "signal": 15, "crashed_retry": True}, 1, 2, True)
+    assert lines.written == [(logging.WARNING, "rivet run orders → STOPPED by Airflow: rivet ended by signal 15")]
+
+
+def test_the_headline_time_is_the_tasks_own_duration(monkeypatch: pytest.MonkeyPatch) -> None:
+    lines = Lines(monkeypatch).records(*step("run"))  # two clock readings after the start
+    assert lines.render({"decision": "success"})[0] == "INFO rivet run orders → OK in 3.0 s"

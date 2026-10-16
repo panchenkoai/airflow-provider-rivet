@@ -113,3 +113,30 @@ def test_a_sanitised_task_id_ends_with_eight_hex_digits_of_the_names_hash() -> N
 def test_the_watcher_is_never_retried() -> None:
     dag = build_batch_dag("b", config="c", exports=["a"], default_args={"retries": 5})
     assert dag.get_task("watcher").retries == 0
+
+
+def test_every_rivet_task_reads_the_builders_config_and_state_directory(plan_file: str) -> None:
+    batch = build_batch_dag("b", config="/c/pg.yaml", state_dir="/state", plan_file=plan_file, compact_exports=["a"])
+    cdc = build_cdc_dag("c", config="/c/cdc.yaml", state_dir="/cdc-state", export="e", tables=["t"])
+    for dag, config, state_dir in ((batch, "/c/pg.yaml", "/state"), (cdc, "/c/cdc.yaml", "/cdc-state")):
+        tasks = [t for t in dag.tasks if hasattr(t, "state_dir")]
+        assert tasks and {(t.config, t.state_dir) for t in tasks} == {(config, state_dir)}
+
+
+def test_the_watcher_belongs_to_its_dag_and_watches_every_other_task() -> None:
+    dag = build_cdc_dag("c", config="c", export="e", tables=["t"])
+    watcher = dag.get_task("watcher")
+    assert watcher.dag is dag and set(watcher.upstream_task_ids) == set(dag.task_ids) - {"watcher"}
+
+
+def test_the_watcher_takes_the_dags_default_args_except_retries_and_the_failure_callback() -> None:
+    """It runs where the author's other tasks run (owner, queue, pool from `default_args`); it is never retried and
+    never alerts on its own."""
+    args = {"owner": "data-team", "queue": "rivet", "retries": 5, "on_failure_callback": print}
+    for dag in (
+        build_batch_dag("b", config="c", exports=["a"], default_args=args),
+        build_cdc_dag("c", config="c", export="e", tables=["t"], default_args=args),
+    ):
+        watcher = dag.get_task("watcher")
+        assert (watcher.owner, watcher.queue, watcher.retries) == ("data-team", "rivet", 0)
+        assert not watcher.on_failure_callback
