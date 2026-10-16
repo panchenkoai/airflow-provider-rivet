@@ -168,3 +168,13 @@ is now the one place rivet's environment is assembled; README "Storage and wareh
   on a leftover; the Snowflake sweep drops only the gate's own schema shape, quoted; the run tag
   names the compose project and image; the `Live gate` workflow takes the `-glibc2.28` asset or
   the ghcr.io image, which start on Debian 12.
+- README "Connections and secrets: recommended setup": keyless GCP (Workload Identity, a Connection
+  with only `project`), Google Secret Manager as the secrets backend for keys and passwords, a
+  metastore with a Fernet key, and `AIRFLOW_CONN_*` variables last; the IAM grants, and what the
+  operator does with a key file.
+- Live gate: every stack runs with random passwords and a Fernet key of its own (the source and
+  state password `rivet` and the metastore's `airflow` made Airflow mask those words in every task
+  log, `/home/***/`), graded by `hygiene/*` cells. `--connections gsm` serves the Connections from
+  Google Secret Manager through a reader limited to the gate's secrets, `--gcp-auth adc` runs
+  rivet keyless as the containers' identity; each has cells proving where the Connection came
+  from, and the cleanup and sweep delete the secrets.

@@ -19,17 +19,30 @@ from typing import Any
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
 PACKAGE_FILES = ("airflow_provider_rivet", "pyproject.toml", "README.md", "LICENSE", "CHANGELOG.md")
-STATE_CONN = {
-    "conn_type": "postgres",
-    "host": "gate-state",
-    "port": 5432,
-    "login": "rivet",
-    "password": "rivet",
-    "schema": "rivet_state",
-    "extra": {"rivet_params": "sslmode=require"},
-}
-SOURCE_DSN = "host=127.0.0.1 port={port} dbname=rivet user=rivet password=rivet"
-CH_PASSWORD = "gate-loader-pw"
+SOURCE_DSN = "host=127.0.0.1 port={port} dbname=rivet user=rivet password={password}"
+#: Where a mounted credential sits in the containers: the path Google's default chain (and rivet's) reads under HOME.
+ADC_IN_CONTAINER = "/home/airflow/.config/gcloud/application_default_credentials.json"
+
+
+@dataclass(frozen=True)
+class StandSecrets:
+    """The passwords and keys of one stack, made for it: 32 random hex digits, so no log word holds one."""
+
+    source: str
+    state: str
+    clickhouse: str
+    metastore: str
+    admin: str
+    jwt: str
+    fernet: str
+
+    @classmethod
+    def generate(cls) -> StandSecrets:
+        return cls(*(secrets.token_hex(16) for _ in range(6)), fernet=base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())
+
+    def passwords(self) -> dict[str, str]:
+        """Every value Airflow may mask in a log line, by role."""
+        return {k: v for k, v in vars(self).items() if k != "fernet"}
 
 
 def write_env_file(path: Path, values: dict[str, str]) -> None:
@@ -48,6 +61,7 @@ class Flavor:
     ui_service: str
     health: str
     services: tuple[str, ...]
+    result_backend: str
 
 
 FLAVORS = {
@@ -57,6 +71,7 @@ FLAVORS = {
         "airflow-webserver",
         "/health",
         ("airflow-webserver", "airflow-scheduler", "airflow-worker", "airflow-triggerer", "airflow-init", "airflow-cli"),
+        "db+postgresql",
     ),
     "3.3.2": Flavor(
         "3.3.2",
@@ -72,6 +87,7 @@ FLAVORS = {
             "airflow-init",
             "airflow-cli",
         ),
+        "db+postgresql+psycopg2",
     ),
 }
 
@@ -80,28 +96,34 @@ x-rivet: &rivet
   image: {image}
   environment:
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
-    AIRFLOW_CONN_RIVET_GATE_SOURCE: postgresql://rivet:rivet@gate-source:5432/rivet
-    AIRFLOW_CONN_RIVET_GATE_STATE: '{state_conn}'
+    AIRFLOW__CORE__FERNET_KEY: '{fernet}'
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:{metastore}@postgres/airflow
+    AIRFLOW__CELERY__RESULT_BACKEND: {result_backend}://airflow:{metastore}@postgres/airflow
+    AIRFLOW__API_AUTH__JWT_SECRET: '{jwt}'
     GATE_WAREHOUSES: '{warehouses}'
-  env_file: [gate-connections.env]
+{backend}  env_file: [gate-connections.env]
   volumes:
     - {rivet_dir}:/opt/rivet
-services:
+{adc}services:
 {services}
+  postgres:
+    environment: {{ POSTGRES_PASSWORD: {metastore} }}
+    # The official 50 s of health checks lose to a first initdb on a docker host busy with other stacks.
+    healthcheck: {{ retries: 60, start_period: 60s }}
   gate-source:
     image: postgres:16
-    environment: {{ POSTGRES_USER: rivet, POSTGRES_PASSWORD: rivet, POSTGRES_DB: rivet }}
+    environment: {{ POSTGRES_USER: rivet, POSTGRES_PASSWORD: {source}, POSTGRES_DB: rivet }}
     command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=10"]
     ports: ["127.0.0.1::5432"]
     healthcheck: {{ test: ["CMD", "pg_isready", "-U", "rivet"], interval: 5s, retries: 20 }}
   gate-state:
     image: postgres:16
-    environment: {{ POSTGRES_USER: rivet, POSTGRES_PASSWORD: rivet, POSTGRES_DB: rivet_state }}
+    environment: {{ POSTGRES_USER: rivet, POSTGRES_PASSWORD: {state}, POSTGRES_DB: rivet_state }}
     command: ["bash", "-c", "install -d -o postgres -g postgres -m 700 /ssl && openssl req -new -x509 -days 2 -nodes -subj /CN=gate-state -out /ssl/server.crt -keyout /ssl/server.key && chown postgres:postgres /ssl/server.crt /ssl/server.key && chmod 600 /ssl/server.key && exec docker-entrypoint.sh postgres -c ssl=on -c ssl_cert_file=/ssl/server.crt -c ssl_key_file=/ssl/server.key"]
     healthcheck: {{ test: ["CMD", "pg_isready", "-U", "rivet"], interval: 5s, retries: 20 }}
   gate-clickhouse:
     image: clickhouse/clickhouse-server:24.8
-    environment: {{ CLICKHOUSE_USER: loader, CLICKHOUSE_PASSWORD: {ch_password}, CLICKHOUSE_DB: gate, CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1" }}
+    environment: {{ CLICKHOUSE_USER: loader, CLICKHOUSE_PASSWORD: {clickhouse}, CLICKHOUSE_DB: gate, CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1" }}
     ulimits: {{ nofile: {{ soft: 262144, hard: 262144 }} }}
     ports: ["127.0.0.1::8123"]
 """
@@ -126,8 +148,10 @@ class Stand:
         rivet_bin: Path,
         work: Path,
         warehouses: tuple[str, ...] = (),
-        connections: dict[str, str] | None = None,
+        connections: dict[str, dict[str, Any]] | None = None,
         tag: str | None = None,
+        secrets_backend: dict[str, str] | None = None,
+        adc: Path | None = None,
     ) -> None:
         self.flavor = FLAVORS[version]
         # The run tag keeps two gate runs of one Airflow version apart: each `down -v` and image build is its own.
@@ -141,13 +165,52 @@ class Stand:
         self.source_dsn = ""
         self.clickhouse_port = 0
         self.warehouses = warehouses
-        self.connections = connections or {}
+        self.secrets = StandSecrets.generate()
+        self.extra_connections = connections or {}
+        # `[secrets]` settings (AIRFLOW__SECRETS__*) when the Connections come from a secrets backend, not from
+        # AIRFLOW_CONN_* variables; the credential file the containers read as their own identity (read-only).
+        self.secrets_backend = secrets_backend
+        self.adc = adc
         self._token: str | None = None
+
+    def connections(self) -> dict[str, dict[str, Any]]:
+        """Every Connection the gate DAGs read, by conn_id, in Airflow's JSON form."""
+        return {
+            "rivet_gate_source": {
+                "conn_type": "postgres",
+                "host": "gate-source",
+                "port": 5432,
+                "login": "rivet",
+                "password": self.secrets.source,
+                "schema": "rivet",
+            },
+            "rivet_gate_state": {
+                "conn_type": "postgres",
+                "host": "gate-state",
+                "port": 5432,
+                "login": "rivet",
+                "password": self.secrets.state,
+                "schema": "rivet_state",
+                "extra": {"rivet_params": "sslmode=require"},
+            },
+            **self.extra_connections,
+        }
+
+    def connection_variables(self) -> dict[str, str]:
+        """The AIRFLOW_CONN_* variables of the stack: none when a secrets backend holds the Connections."""
+        if self.secrets_backend is not None:
+            return {}
+        return {f"AIRFLOW_CONN_{conn_id.upper()}": json.dumps(conn) for conn_id, conn in self.connections().items()}
 
     def compose(self, *args: str, **kw: Any) -> subprocess.CompletedProcess:
         """`docker compose` on this stack's project."""
         files = ["-f", str(self.dir / "docker-compose.yaml"), "-f", str(self.dir / "docker-compose.gate.yaml")]
-        env = {**os.environ, "AIRFLOW_UID": str(os.getuid()), "AIRFLOW_PROJ_DIR": str(self.dir)}
+        env = {
+            **os.environ,
+            "AIRFLOW_UID": str(os.getuid()),
+            "AIRFLOW_PROJ_DIR": str(self.dir),
+            "_AIRFLOW_WWW_USER_PASSWORD": self.secrets.admin,
+        }
         return sh(["docker", "compose", "-p", self.project, *files, *args], env=env, **kw)
 
     def build(self) -> None:
@@ -200,17 +263,23 @@ class Stand:
             f"  {s}:\n    <<: *rivet" + ('\n    ports: !override ["127.0.0.1::8080"]' if s == self.flavor.ui_service else "")
             for s in self.flavor.services
         )
-        (self.dir / "docker-compose.gate.yaml").write_text(
-            OVERLAY.format(
-                image=self.image,
-                state_conn=json.dumps(STATE_CONN),
-                rivet_dir=self.rivet_dir,
-                services=services,
-                warehouses=",".join(self.warehouses),
-                ch_password=CH_PASSWORD,
-            )
+        (self.dir / "docker-compose.gate.yaml").write_text(self.overlay(services))
+        write_env_file(self.dir / "gate-connections.env", self.connection_variables())
+
+    def overlay(self, services: str) -> str:
+        """The gate's compose overlay: the image, this stack's own passwords and keys, where Connections come from."""
+        backend = "".join(f"    {k}: '{v}'\n" for k, v in (self.secrets_backend or {}).items())
+        adc = f"    - {self.adc}:{ADC_IN_CONTAINER}:ro\n" if self.adc else ""
+        return OVERLAY.format(
+            image=self.image,
+            rivet_dir=self.rivet_dir,
+            services=services,
+            warehouses=",".join(self.warehouses),
+            backend=backend,
+            adc=adc,
+            result_backend=self.flavor.result_backend,
+            **vars(self.secrets),
         )
-        write_env_file(self.dir / "gate-connections.env", self.connections)
 
     def down(self) -> None:
         """Remove the project's containers, volumes and image (a leftover of an earlier attempt of this run too)."""
@@ -225,7 +294,7 @@ class Stand:
         # No `--wait`: an Airflow 2 webserver on a loaded host can miss the official healthcheck and come up later.
         self.compose("up", "-d", timeout=1800)
         self.ui_port = self.host_port(self.flavor.ui_service, 8080)
-        self.source_dsn = SOURCE_DSN.format(port=self.host_port("gate-source", 5432))
+        self.source_dsn = SOURCE_DSN.format(port=self.host_port("gate-source", 5432), password=self.secrets.source)
         self.clickhouse_port = self.host_port("gate-clickhouse", 8123)
         deadline = time.monotonic() + 900
         while True:
@@ -264,12 +333,12 @@ class Stand:
     def _auth(self) -> str:
         """Basic auth on Airflow 2, a JWT from /auth/token on Airflow 3."""
         if self.flavor.version.startswith("2."):
-            return "Basic " + base64.b64encode(b"airflow:airflow").decode()
+            return "Basic " + base64.b64encode(f"airflow:{self.secrets.admin}".encode()).decode()
         if self._token is None:
             req = urllib.request.Request(
                 f"http://127.0.0.1:{self.ui_port}/auth/token",
                 method="POST",
-                data=json.dumps({"username": "airflow", "password": "airflow"}).encode(),
+                data=json.dumps({"username": "airflow", "password": self.secrets.admin}).encode(),
                 headers={"Content-Type": "application/json"},
             )
             with urllib.request.urlopen(req, timeout=30) as r:
