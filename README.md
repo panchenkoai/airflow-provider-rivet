@@ -568,13 +568,17 @@ never compacts`) and exits 0; `rivet compact` has no `--summary-output` yet (`lo
 task ends green as `compacted`, having done nothing. For these warehouses build the CDC DAG with
 `compact=False` and leave such exports out of `compact_exports`.
 
-## Slack
+## Slack alerts
 
-Mutual exclusion: under Airflow, rivet's own notifications are off and alerting is Airflow's.
-The operators pass `--no-notify` to a binary that has it. Until then **do not configure
-`notifications:` in a rivet config run under Airflow**: every failure would be sent twice. The
-operator warns (a WARNING `note` line; record `rivet.warning`, `notifications_block`) when it sees
-the block.
+**Setup guide: [docs/slack.md](docs/slack.md)** (the Slack app and its token, storing it,
+wiring, what arrives, a DAG that fails on purpose to test it, troubleshooting).
+
+A failed rivet task posts one title to a Slack channel, `dag_id.task_id — <error type>` (the
+rivet code and `final` or `retryable`, else the exception's class), with the run id and a
+task-log link; its error text (rivet's error line for the failed step, else the exception's
+message, through Airflow's secrets masker) is a code block in the thread. A bot token
+(`slack` Connection, scope `chat:write`, `channel=` the channel id) threads; an incoming webhook
+(`slackwebhook` Connection, no `channel`) posts title and error text as one message.
 
 ```python
 from airflow_provider_rivet.callbacks import slack_failure_callback
@@ -584,19 +588,21 @@ dag = build_batch_dag(
     config=...,
     state_dir=...,
     exports=[...],
-    default_args={"retries": 2, "on_failure_callback": slack_failure_callback("slack_webhook")},
+    default_args={"retries": 2, "on_failure_callback": slack_failure_callback("slack_rivet", channel="C0123ABCDEF")},
 )
 ```
 
 The `watcher` task carries no failure callback: the builders set its `on_failure_callback` to
 none, so a failed run sends one message per failed task and nothing for the watcher (which has no
-rivet result to show).
+rivet result to show). Unlike XCom and the task log ("Secrets"), the thread carries rivet's error
+text, which can hold source values. `format_title`, `format_error_text` and `format_failure` are
+the formatters on their own, to send through another channel.
 
-It needs `apache-airflow-providers-slack` (the `slack` extra) and a Slack incoming-webhook
-connection. The message shows task, run, and per failed unit the export, `[code]`, class,
-whether it is retryable, the registry action, the stderr file path and a link to the task log;
-never rivet's error text. `format_failure(payload, ...)` is the pure formatter if you send
-through another channel.
+Mutual exclusion: under Airflow, rivet's own notifications are off and alerting is Airflow's.
+The operators pass `--no-notify` to a binary that has it. Until then **do not configure
+`notifications:` in a rivet config run under Airflow**: every failure would be sent twice. The
+operator warns (a WARNING `note` line; record `rivet.warning`, `notifications_block`) when it sees
+the block.
 
 ## Overlap
 
@@ -644,7 +650,8 @@ a non-checkpointed run, so on 0.31.0 a pod's zombie try and its retry can both r
   the whole export; the first does the work, the others find the ledger up to date.
 - `rivet apply` prints no result today, so a successful apply task reads its counts from
   `rivet metrics`; a failed one has no counts.
-- A failure callback runs where Airflow runs callbacks; on Airflow 3 that was not exercised.
+- A failure callback runs where Airflow runs task callbacks, in the task's process on the worker;
+  exercised live on Airflow 2.10.5 and 3.3.2 by hand (docs/slack.md), not by the live gate.
 
 ## Development
 
