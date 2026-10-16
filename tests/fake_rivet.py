@@ -238,7 +238,8 @@ def main():
             print(json.dumps(play["rows"]))
         else:
             held = json.loads((HERE / "metrics.json").read_text()) if (HERE / "metrics.json").exists() else []
-            held = [r for r in reversed(held) if export in ("", r["export_name"])]
+            # opt-in `newer`: rows another process (another config, a run outside Airflow) recorded after this one's
+            held = [*play.get("newer", []), *(r for r in reversed(held) if export in ("", r["export_name"]))]
             print(json.dumps(held[: int(value_of(argv, "--last") or len(held))]))
         return play.get("exit", 0)
     metric = None
@@ -286,7 +287,8 @@ def main():
     if sub == "apply" and not play.get("exit"):
         cursors(spec, {export: str(int(cursors(spec).get(export) or 0) + 1)})
     if metric is not None:
-        record_metric({**metric, "status": "failed" if play.get("exit") else "success"})
+        # opt-in `metric`: what the terminal row records beside the status (a `skip_empty` run's `skipped`, its reason)
+        record_metric({**metric, "status": "failed" if play.get("exit") else "success", **play.get("metric", {})})
     return play.get("exit", 0)
 
 

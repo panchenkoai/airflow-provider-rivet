@@ -906,3 +906,33 @@ def test_an_operator_payload_carries_the_command_and_the_binarys_version(rig: Ri
     rig.scenario(flags=NEW_FLAGS, run={"summary": FULL})
     payload, _ = rig.run(rig.operator(RivetRunOperator, export="orders"), FakeTI())
     assert (payload["command"], payload["rivet_version"]) == ("run", "0.31.0")
+
+
+# --- the counts of an apply on a binary without `apply --summary-output` are its own run's (defect, `outcome` 2) ------
+
+
+@pytest.mark.parametrize(
+    "newer",
+    [
+        {"export_name": "orders", "run_id": "orders_29991231T000000.000_1", "status": "running", "total_rows": 0},
+        {"export_name": "orders", "run_id": "orders_29991231T000000.000_1", "status": "success", "total_rows": 99,
+         "files_produced": 9},
+        {"export_name": "orders", "run_id": "orders_19700101T000000.000_1", "status": "failed", "total_rows": 0},
+    ],
+    ids=["running", "success", "failed"],
+)  # fmt: skip
+def test_an_apply_reads_its_own_runs_counts_not_the_newest_row_of_its_export(rig: Rig, newer: dict) -> None:
+    """Today's binary has no `apply --summary-output`, so the apply's counts come from `rivet metrics`. The newest row
+    of the export may be another process's run (another config of the export name on a shared PostgreSQL state, a run
+    outside Airflow): it was taken as the apply's, so a `running` / `failed` one made a failed unit with no error in
+    a task that succeeded, and a `success` one reported another run's id and counts. The apply's run is the one rivet's
+    run id names with this apply's pid (as `_applied_by_earlier_try` proves an earlier try's)."""
+    rig.scenario(apply={"summary": FULL}, metrics={"newer": [newer]})
+    out, _ = attempt(rig, "apply", export="orders")
+    own = [r for r in json.loads((rig.bin / "metrics.json").read_text()) if r["status"] == "success"]
+    assert len(own) == 1
+    assert out.decision == "success"
+    assert [(u.export, u.status, u.run_id, u.rows, u.files, u.error) for u in out.units] == [
+        ("orders", "success", own[0]["run_id"], 7, 2, None)
+    ]
+    assert "result_malformed" not in out.degraded

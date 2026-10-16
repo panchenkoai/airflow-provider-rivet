@@ -1002,15 +1002,22 @@ def _apply(s: _Session) -> Outcome:
     else:
         s.degraded.add("apply_summary")
     argv += [*s.req.extra_args, *s.globals_for("apply")]
-    started = {"export": export, "artifact": _digest(artifact), "started_at": datetime.now(UTC).isoformat(), "pid": None}
-    _write_atomic(record, json.dumps(started).encode())
-    step = s.step("apply", argv, on_start=lambda pid: _write_atomic(record, json.dumps({**started, "pid": pid}).encode()))
+    now = datetime.now(UTC)
+    started = {"export": export, "artifact": _digest(artifact), "started_at": now.isoformat()}
+    record.unlink(missing_ok=True)  # an earlier try's record never stands for this try's apply
+    pids: list[int] = []
+
+    def on_start(pid: int) -> None:
+        pids.append(pid)
+        _write_atomic(record, json.dumps({**started, "pid": pid}).encode())
+
+    step = s.step("apply", argv, on_start=on_start)
     error = s.classify(step)
     doc = s.result_file(summary, step) if has_summary else None
     summary.unlink(missing_ok=True)
     units = _run_units(s, step, doc, error)
     if error is None and not has_summary:
-        units = [_unit_from_metrics(s, cfg, export)]
+        units = [_unit_from_metrics(s, cfg, export, pids[-1], now)]
     return s.outcome(step, units, error)
 
 
@@ -1037,12 +1044,11 @@ def _digest(path: Path) -> str | None:
 def _applied_by_earlier_try(s: _Session, cfg: str, export: str, artifact: Path, record: Path) -> tuple[_Step, UnitResult] | None:
     """The successful run of the apply an earlier try of this series started, when rivet's state holds one (G1, G1b).
 
-    Before `rivet apply` the task records, beside the sealed plan, the plan's digest, when it started the process and
-    its pid. A try that died after that apply ended (the task process killed, a zombie) left the record and no result
-    Airflow saw. The record counts only for the same plan bytes, and a run is that apply's only when rivet's own run id
-    names it: `<export>_<UTC start, ms>_<pid of the process>`, with the recorded pid and a start no earlier than the
-    record's. Anything else, a plan replaced or gone, a record without a pid, a run `running`, `interrupted` or failed,
-    or no readable state, is `None`: the plan is applied as before."""
+    Once `rivet apply` has started, the task records beside the sealed plan the plan's digest, when it started the
+    process and its pid. A try that died after that apply ended (the task process killed, a zombie) left the record and
+    no result Airflow saw. The record counts only for the same plan bytes, and a run is that apply's only when
+    `_apply_run` finds it. Anything else, a plan replaced or gone, a record without a pid, a run `running`,
+    `interrupted` or failed, or no readable state, is `None`: the plan is applied as before."""
     doc = _read_json(record)
     if not isinstance(doc, dict) or doc.get("export") != export or type(doc.get("pid")) is not int:
         return None
@@ -1054,31 +1060,42 @@ def _applied_by_earlier_try(s: _Session, cfg: str, export: str, artifact: Path, 
         return None
     if started.tzinfo is None:
         return None
-    floor = started.replace(microsecond=started.microsecond // 1000 * 1000)
     step, rows = _metrics_rows(s, cfg, export, APPLIED_LOOKBACK)
+    row = _apply_run(rows, export, doc["pid"], started)
+    if row is None:
+        return None
+    unit = UnitResult(export, status=row["status"], run_id=row["run_id"])
+    unit.rows, unit.files = s.malformed(row.get("total_rows"), int), s.malformed(row.get("files_produced"), int)
+    return step, unit
+
+
+def _apply_run(rows: list[dict[str, Any]], export: str, pid: int, started: datetime) -> dict[str, Any] | None:
+    """The first of `rivet metrics` rows (newest first) that is the run of the apply process `pid`, started at `started`.
+
+    rivet's own run id names it: `<export>_<UTC start, ms>_<pid of the process>`, with that pid and a start no earlier
+    than `started`'s millisecond; and only a run that ended `success` or `skipped` counts. A newer row of the same
+    export is another process's run (another config of the export name on a shared state, a run outside Airflow)."""
+    floor = started.replace(microsecond=started.microsecond // 1000 * 1000)
     shape = re.compile(re.escape(export) + r"_(\d{8}T\d{6}\.\d{3})_(\d+)")
     for row in rows:
         match = shape.fullmatch(str(row.get("run_id")))
         if row.get("export_name") != export or row.get("status") not in ("success", "skipped") or match is None:
             continue
-        if int(match[2]) != doc["pid"] or datetime.strptime(match[1], "%Y%m%dT%H%M%S.%f").replace(tzinfo=UTC) < floor:
+        if int(match[2]) != pid or datetime.strptime(match[1], "%Y%m%dT%H%M%S.%f").replace(tzinfo=UTC) < floor:
             continue
-        unit = UnitResult(export, status=row["status"], run_id=row["run_id"])
-        unit.rows, unit.files = s.malformed(row.get("total_rows"), int), s.malformed(row.get("files_produced"), int)
-        return step, unit
+        return row
     return None
 
 
-def _unit_from_metrics(s: _Session, cfg: str, export: str) -> UnitResult:
-    """Counts of the export's latest run from `rivet metrics --json`; best effort."""
-    step, rows = _metrics_rows(s, cfg, export, 1)
-    unit = UnitResult(export, status="success")
-    row = rows[0] if rows else {}
-    if row.get("export_name") == export:
-        if "status" in row:  # a `skip_empty` run that delivered nothing is `skipped` (D31)
-            unit.status = s.status(row["status"])
-            unit.skip_reason = s.malformed(row.get("skip_reason"), str)
-        unit.run_id = s.malformed(row.get("run_id"), str)
+def _unit_from_metrics(s: _Session, cfg: str, export: str, pid: int, started: datetime) -> UnitResult:
+    """The apply's unit from its own run in `rivet metrics --json` (`_apply_run`): status, counts and run id; with no
+    such row, a success without counts (the process exited 0)."""
+    _, rows = _metrics_rows(s, cfg, export, APPLIED_LOOKBACK)
+    unit = UnitResult(export)
+    row = _apply_run(rows, export, pid, started)
+    if row is not None:  # a `skip_empty` run that delivered nothing is `skipped` (D31)
+        unit.status, unit.run_id = row["status"], row["run_id"]
+        unit.skip_reason = s.malformed(row.get("skip_reason"), str)
         unit.rows, unit.files = s.malformed(row.get("total_rows"), int), s.malformed(row.get("files_produced"), int)
     return unit
 
