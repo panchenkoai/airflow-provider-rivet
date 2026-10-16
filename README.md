@@ -704,20 +704,27 @@ timeouts in one function is a finding about its loop or wait.
 mutmut does not mutate a decorated function (`Outcome.decision`, `_prctl`, `_export_lock`): their behaviour is
 held by tests alone.
 
-CI (`.github/workflows/mutation.yml`, on Linux, through `dev/mutants_gate.py`):
+When mutants run (`.github/workflows/mutation.yml`, on Linux, through `dev/mutants_gate.py mode`):
 
-- **pull request**: every mutant of every function the diff from the base branch touches must be killed; one that
-  survives, times out or has no test fails the job, which prints it with its diff. A new function ships with the
-  tests that kill its mutants.
-- **push to main, nightly, on demand**: every mutant; the job prints `survivors N <= ratchet M` and fails when N
-  exceeds the number in `.mutmut-ratchet`.
-- Both run as ten parallel shards (the mutants whose number ends in 0 ... 9): a survivor of a function every test
-  passes through (`_Session.step`) runs the whole suite, so one runner would need most of a day.
-- **release**: `release.yml` runs the same full job on the tagged commit itself before it builds, so no version is
-  published from a commit whose mutants were not counted.
+| change | what runs | fails when |
+|---|---|---|
+| a pull request changes `airflow_provider_rivet/` code | the mutants of every function it touches | any of them is not killed |
+| a pull request changes a test file | also the mutants of every function the changed tests call (mutmut's own stats, tests → functions) | one of them that the last full run killed is alive (not in `.mutmut-survivors`): a deleted or weakened assertion goes red on the pull request, not after the merge |
+| a pull request deletes a test, or changes the shared harness: `tests/fake_rivet.py`, `tests/conftest.py`, `dev/mutmut_isolation.py`, `dev/mutants_gate.py`, `.github/workflows/mutation.yml`, `.mutmut-ratchet`, `.mutmut-survivors`, `RIVET_CONTRACT_REF`, `uv.lock`, pyproject's `[tool.mutmut]` / dependency tables | the full run | more mutants survive than `.mutmut-ratchet` |
+| a release (`release.yml` runs it on the tagged commit before it builds) | the full run | as above: nothing is published from a commit whose mutants were not counted |
+| on demand (workflow_dispatch) | the full run | as above |
 
-Moving the ratchet: lowering `.mutmut-ratchet` (after tests kill survivors) is an ordinary PR; raising it needs a
-dated comment line in that file saying which mutants are accepted and why.
+There is no full run on push to main and no nightly run. Every run is split into ten parallel shards (the mutants
+whose number ends in 0 … 9). Each shard prints `shard N: M of TOTAL mutants`, its progress as `shard N: done/M` and
+`shard N: tested T, killed K, not killed S`. The ratchet job prints the per-shard table and fails unless the shards
+graded every mutant exactly once (`sum(tested) == total`) and `survivors N <= ratchet M`. A survivor of a function
+every test passes through (`_Session.step`) runs the whole suite, so one runner would need most of a day.
+
+Moving the ratchet: it changes only through a full run, and a pull request that edits `.mutmut-ratchet` gets one.
+`.mutmut-survivors` lists the survivors of that run by name (the ratchet job uploads it as `mutmut-survivors`); the
+two are committed together.
+Lowering it (after tests kill survivors) is an ordinary PR; raising it needs a dated comment line in that file saying
+which mutants are accepted and why.
 
 ## Live gate
 
