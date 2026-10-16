@@ -293,6 +293,21 @@ def test_d35_sweep_drops_only_the_gate_schema_shape_and_quotes_it(monkeypatch) -
     assert removed == ["snowflake:AFGATE_10010000BEEF_332"]
 
 
+@pytest.mark.parametrize(("error", "reported"), [("PERMISSION_DENIED", True), ("SERVICE_DISABLED", False)])
+def test_a_secret_listing_that_fails_is_reported_unless_the_api_is_off(monkeypatch, error: str, reported: bool) -> None:
+    """A failed `gcloud secrets list` (expired login, network) read as "Secret Manager not enabled": the sweep skipped
+    the gate's secrets and returned as if clean."""
+
+    def listing(cloud):
+        raise RuntimeError(f"gcloud secrets list exited 1: {error}")
+
+    monkeypatch.setattr(warehouse, "_snow", lambda *a, **k: [])
+    monkeypatch.setattr(warehouse, "_bq", lambda *a, **k: "[]")
+    monkeypatch.setattr(warehouse, "sh", lambda *a, **k: subprocess.CompletedProcess(a, 0, "", ""))
+    monkeypatch.setattr(warehouse, "_secrets", listing)
+    assert any(r.startswith("gsm:listing failed") for r in warehouse.sweep(CLOUD)) is reported
+
+
 def test_d35_every_schema_the_gate_makes_has_the_swept_shape() -> None:
     assert warehouse.SCHEMA_SHAPE.fullmatch(CLOUD.schema("3.3.2")) and warehouse.SCHEMA_SHAPE.fullmatch(CLOUD.schema("2.10.5"))
 

@@ -40,16 +40,18 @@ class StandSecrets:
     def generate(cls) -> StandSecrets:
         return cls(*(secrets.token_hex(16) for _ in range(6)), fernet=base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())
 
-    def passwords(self) -> dict[str, str]:
-        """Every value Airflow may mask in a log line, by role."""
-        return {k: v for k, v in vars(self).items() if k != "fernet"}
+
+def write_private(path: Path, text: str) -> None:
+    """A 0600 file: the stand's env file and compose overlay hold its passwords and keys."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    os.fchmod(fd, 0o600)  # a file left wider by an earlier run is tightened too
+    with os.fdopen(fd, "w") as handle:
+        handle.write(text)
 
 
 def write_env_file(path: Path, values: dict[str, str]) -> None:
     """A 0600 env file docker compose reads (empty when the warehouse leg is off)."""
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as handle:
-        handle.writelines(f"{k}={v}\n" for k, v in values.items())
+    write_private(path, "".join(f"{k}={v}\n" for k, v in values.items()))
 
 
 @dataclass(frozen=True)
@@ -148,7 +150,6 @@ class Stand:
         rivet_bin: Path,
         work: Path,
         warehouses: tuple[str, ...] = (),
-        connections: dict[str, dict[str, Any]] | None = None,
         tag: str | None = None,
         secrets_backend: dict[str, str] | None = None,
         adc: Path | None = None,
@@ -166,7 +167,7 @@ class Stand:
         self.clickhouse_port = 0
         self.warehouses = warehouses
         self.secrets = StandSecrets.generate()
-        self.extra_connections = connections or {}
+        self.extra_connections: dict[str, dict[str, Any]] = {}
         # `[secrets]` settings (AIRFLOW__SECRETS__*) when the Connections come from a secrets backend, not from
         # AIRFLOW_CONN_* variables; the credential file the containers read as their own identity (read-only).
         self.secrets_backend = secrets_backend
@@ -263,7 +264,7 @@ class Stand:
             f"  {s}:\n    <<: *rivet" + ('\n    ports: !override ["127.0.0.1::8080"]' if s == self.flavor.ui_service else "")
             for s in self.flavor.services
         )
-        (self.dir / "docker-compose.gate.yaml").write_text(self.overlay(services))
+        write_private(self.dir / "docker-compose.gate.yaml", self.overlay(services))
         write_env_file(self.dir / "gate-connections.env", self.connection_variables())
 
     def overlay(self, services: str) -> str:

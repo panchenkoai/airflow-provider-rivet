@@ -346,8 +346,10 @@ def sweep(cloud: Cloud) -> list[str]:
         removed.append(f"gcs:{len(old)} object(s)")
     try:
         stale = [r["id"] for r in _secrets(cloud) if _age_hours(r["created"]) > SWEEP_AGE_HOURS]
-    except RuntimeError:
-        stale = []  # Secret Manager not enabled in the project: nothing of the gate's can be there
+    except RuntimeError as exc:
+        stale = []
+        if "SERVICE_DISABLED" not in str(exc) and "has not been used" not in str(exc):
+            removed.append(f"gsm:listing failed, nothing swept: {exc}")  # a disabled API holds nothing of the gate's
     for name in stale:
         sh(["gcloud", "secrets", "delete", name, f"--project={cloud.project}", "--quiet"], check=False)
         removed.append(f"gsm:{name}")

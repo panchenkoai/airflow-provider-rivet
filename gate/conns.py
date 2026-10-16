@@ -28,7 +28,7 @@ EMPTY_FERNET = "empty cryptography key"
 def from_secret_manager(
     conn_id: str,
     published: Mapping[str, Any],
-    container_envs: Mapping[str, Sequence[str]],
+    container_envs: Mapping[str, Sequence[str] | None],
     metastore_rows: int,
     listed: Sequence[str],
     secret: str,
@@ -37,9 +37,12 @@ def from_secret_manager(
     """Problems with the claim that `conn_id` reached Airflow from Secret Manager and from nowhere else."""
     problems = []
     var = f"AIRFLOW_CONN_{conn_id.upper()}="
-    carriers = sorted(name for name, env in container_envs.items() if any(e.startswith(var) for e in env))
+    carriers = sorted(name for name, env in container_envs.items() if env and any(e.startswith(var) for e in env))
+    down = sorted(name for name, env in container_envs.items() if env is None)
     if not container_envs:
         problems.append("no Airflow container inspected")
+    if down:
+        problems.append(f"no running container of {down}: its environment was not checked")
     if carriers:
         problems.append(f"{var[:-1]} is set in {carriers}")
     if metastore_rows:
@@ -98,16 +101,19 @@ def parse_connection(stdout: str) -> dict[str, Any] | None:
 # --- Reads of a running stack ----------------------------------------------------------------------------------------
 
 
-def container_envs(stand: Any) -> dict[str, list[str]]:
-    """`Config.Env` of every container of the stack's Airflow services, by service."""
-    out = {}
+def container_envs(stand: Any) -> dict[str, list[str] | None]:
+    """`Config.Env` of every container of the stack's Airflow services, by `service/container`; a service with no
+    running container is `service: None`, so a check of every container cannot pass on one that is down."""
+    out: dict[str, list[str] | None] = {}
     for service in stand.flavor.services:
-        if service == "airflow-init" or service == "airflow-cli":
+        if service in ("airflow-init", "airflow-cli"):
             continue
         ids = stand.compose("ps", "-q", service).stdout.split()
+        if not ids:
+            out[service] = None
         for cid in ids:
             env = sh(["docker", "inspect", "--format", "{{json .Config.Env}}", cid]).stdout
-            out[service] = json.loads(env or "[]")
+            out[f"{service}/{cid[:12]}"] = json.loads(env or "[]")
     return out
 
 

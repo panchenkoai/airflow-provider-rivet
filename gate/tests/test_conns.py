@@ -185,6 +185,7 @@ def test_from_secret_manager_passes_on_a_faithful_stack() -> None:
     [
         {"container_envs": {**CLEAN_ENVS, "airflow-worker": ["AIRFLOW_CONN_GATE_CLICKHOUSE={}"]}},
         {"container_envs": {}},
+        {"container_envs": {**CLEAN_ENVS, "airflow-triggerer": None}},
         {"metastore_rows": 1},
         {"listed": []},
         {"resolved": None},

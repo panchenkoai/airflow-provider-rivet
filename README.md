@@ -528,7 +528,7 @@ Where the Connections of a rivet DAG live decides who else can read them. Safest
    environment's service account. No key file exists anywhere. The GCP Connection holds only
    `project`; a Connection that supplies no credential leaves the worker's identity in place, and
    rivet finds it through Google's default chain (GCS: an ADC file, else the metadata server).
-   rivet's BigQuery loader (main 04c4a712) has no metadata-server path of its own: with no ADC
+   rivet's BigQuery loader has no metadata-server path of its own: with no ADC
    file it runs `gcloud auth application-default print-access-token`, so a Workload Identity
    worker that loads BigQuery needs the `gcloud` CLI on its `PATH`. The live gate proves this
    leg with a credential file mounted read-only where the default chain looks; it has no
@@ -582,14 +582,13 @@ jq -n --rawfile key rsa_key.p8 '{conn_type: "snowflake", login: "RIVET_LOADER",
 # ClickHouse and a source database: the password is read from the terminal, not typed into argv
 read -rs PW
 jq -n --rawfile pw /dev/stdin '{conn_type: "clickhouse", host: "ch.internal", port: 8443, login: "loader",
-  password: $pw, extra: {secure: true}}' <<<"$PW" | gcloud secrets create airflow-connections-ch_rivet --data-file=-
+  password: $pw, extra: {secure: true}}' < <(printf %s "$PW") | gcloud secrets create airflow-connections-ch_rivet --data-file=-
 jq -n --rawfile pw /dev/stdin '{conn_type: "postgres", host: "db.internal", port: 5432, login: "rivet_reader",
-  password: $pw, schema: "app", extra: {sslmode: "verify-full"}}' <<<"$PW" |
+  password: $pw, schema: "app", extra: {sslmode: "verify-full"}}' < <(printf %s "$PW") |
   gcloud secrets create airflow-connections-pg_app --data-file=-
 ```
 
-(`--rawfile` keeps the trailing newline `<<<` adds: strip it with `($pw | rtrimstr("\n"))` if the
-password must not end in one.) The worker's identity reads these secrets only, through an IAM
+(`printf %s` is a shell builtin: the password is in no process's argv, and it gets no trailing newline.) The worker's identity reads these secrets only, through an IAM
 condition on the secret name (it needs the project NUMBER):
 
 ```bash
