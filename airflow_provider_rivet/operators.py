@@ -10,21 +10,38 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from . import _yaml
-from ._compat import AirflowException, AirflowFailException, AirflowSkipException, BaseHook, BaseOperator
+from ._compat import (
+    AirflowException,
+    AirflowFailException,
+    AirflowNotFoundException,
+    AirflowSkipException,
+    BaseHook,
+    BaseOperator,
+)
 from .connections import EnvSpec, build_environment, connection_url  # noqa: F401  (connection_url is re-exported)
 from .invocation import (
     CLOUD_ENV,
     Outcome,
     Request,
-    _stop,
     crashed_retry_allowed,
     invoke,
     path_name,
 )
-from .preflight import PreflightRefusal
+from .preflight import PreflightRefusal, read_config
 
 XCOM_KEY = "return_value"
+
+
+def get_connection(conn_id: str) -> Any:
+    """The Airflow Connection the task names; a refusal when no backend defines it, since a retry cannot create it."""
+    try:
+        return BaseHook.get_connection(conn_id)
+    except AirflowNotFoundException as exc:
+        raise PreflightRefusal(
+            "RIVET_AIRFLOW_CONNECTION_MISSING",
+            f"connection `{conn_id}` is not defined in the metadata database or any secrets backend this worker reads; "
+            "create it, or correct the id the task names",
+        ) from exc
 
 
 class RivetBaseOperator(BaseOperator):
@@ -105,18 +122,15 @@ class RivetBaseOperator(BaseOperator):
             passthrough=self.env_passthrough,
             clouds=self.cloud_credentials,
             env=self.env or {},
-            urls={name: (BaseHook.get_connection(conn_id), scheme) for name, (conn_id, scheme) in urls.items()},
+            urls={name: (get_connection(conn_id), scheme) for name, (conn_id, scheme) in urls.items()},
             config=self._config_doc() if self.connections else {},
         )
-        return build_environment(os.environ, spec, [BaseHook.get_connection(c) for c in self.connections], secrets)
+        return build_environment(os.environ, spec, [get_connection(c) for c in self.connections], secrets)
 
     def _config_doc(self) -> dict[str, Any]:
-        """The config as written, for the names a Connection is filed under; empty when it cannot be read here."""
-        try:
-            doc = _yaml.load(Path(self.config).read_text())
-        except (OSError, ValueError, _yaml.yaml.YAMLError):
-            return {}
-        return doc if isinstance(doc, dict) else {}
+        """The config as written, for the names a Connection is filed under; read by the preflight's reader, so a config
+        it refuses is refused here too."""
+        return read_config(self.config)
 
     def _emit(self, record: dict[str, Any]) -> None:
         """Write one structured line to the task log."""
@@ -131,9 +145,10 @@ class RivetBaseOperator(BaseOperator):
         self._proc = proc
 
     def on_kill(self) -> None:
-        """Stop rivet when Airflow kills the task."""
+        """Ask rivet to stop when Airflow kills the task: a signal only, since this runs inside the SIGTERM handler;
+        the step that started the process reaps it and kills it after the grace (D02)."""
         if self._proc is not None:
-            _stop(self._proc)
+            self._proc.request_stop()
 
     def _upstream_markers(self, ti: Any) -> list[str]:
         """State-directory markers the direct upstream rivet tasks of this run reported."""

@@ -87,3 +87,20 @@ is now the one place rivet's environment is assembled; README "Storage and wareh
 - A ClickHouse Connection without a host is refused (`RIVET_AIRFLOW_CONNECTION_INCOMPLETE`)
   instead of becoming `http://None`. (D22)
 - README: an Azure config reads `account_name: ${AZURE_STORAGE_ACCOUNT}`. (D32)
+- A Connection id no backend defines (`env_from_connections`, `connections`) is refused,
+  `RIVET_AIRFLOW_CONNECTION_MISSING`, with the refusal in XCom; it was retried with no XCom.
+- A config that is not UTF-8, nests too deep, holds a scalar Python cannot convert, or whose
+  `exports` is not a list of mappings with a string `name`, is refused
+  `RIVET_AIRFLOW_CONFIG_UNREADABLE`; it crashed with a traceback and was retried. The
+  Connection resolution reads the config through the same reader.
+- A rivet binary whose `--version` or `<sub> --help` probe fails or times out, in the preflight
+  or while argv is built, is refused `RIVET_AIRFLOW_BINARY_MISSING` with the refusal in XCom; it
+  raised a raw `RuntimeError` / `TimeoutExpired` and was retried.
+- `on_kill` only sends SIGTERM; the step that started rivet reaps it and kills it after 30 s.
+  It used to wait inside Airflow's SIGTERM handler on the lock the interrupted `wait` held, so
+  the task hung until the supervisor's SIGKILL and its secrets folder was never removed.
+- rivet's stderr is cut into lines at `\n` only: a `--json-errors` line whose message holds
+  U+2028, U+2029 or U+0085 was cut apart, so a retryable failure lost its code and its retry.
+  A stderr line that starts with `{` and is not JSON is recorded as `result_malformed`.
+- A summary file that is missing (`result_missing`) or not a JSON object (`result_malformed`)
+  after an exit-0 process is recorded in `degraded`. ("Works today / needs a newer rivet")
