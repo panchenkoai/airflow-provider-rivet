@@ -1,7 +1,9 @@
 """The mutation gate of CI and the release (README, "Mutation testing"); run inside the project environment.
 
+    python dev/mutants_gate.py mode [BASE]           # full / targeted / none: what a pull request runs (README policy)
     python dev/mutants_gate.py changed [BASE]        # the mutmut name globs of the functions `git diff BASE...HEAD` touches
-    python dev/mutants_gate.py pr [BASE]             # run those mutants; fail on any that is not killed
+    python dev/mutants_gate.py pr [BASE]             # run those mutants and those of every function the changed tests
+                                                     # call; fail on any that is not killed
     python dev/mutants_gate.py full                  # run every mutant; fail when more survive than `.mutmut-ratchet`
     python dev/mutants_gate.py full OUT --shard D    # one of ten shards (mutant numbers ending in D); survivors to OUT
     python dev/mutants_gate.py ratchet DIR           # the ten shard files under DIR, judged against the ratchet
@@ -32,13 +34,19 @@ MUTMUT = [sys.executable, "-m", "mutmut"]
 HUNK = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,(\d+))? @@")
 
 
-def changed_lines(base: str) -> dict[str, set[int]]:
-    """Lines of HEAD's package files that the diff from the merge base adds or changes; a pure deletion marks the line
-    after it, so a function whose line was only removed is still touched."""
-    diff = subprocess.run(
-        ["git", "diff", "--unified=0", "--no-color", f"{base}...HEAD", "--", f"{PACKAGE}/*.py"],
-        cwd=ROOT, check=True, capture_output=True, text=True,
-    ).stdout  # fmt: skip
+def git(*args: str) -> str:
+    return subprocess.run(["git", *args], cwd=ROOT, check=True, capture_output=True, text=True).stdout
+
+
+def changed_files(base: str) -> list[str]:
+    """Every path the diff from the merge base adds, changes or deletes."""
+    return [p for p in git("diff", "--name-only", "--no-renames", f"{base}...HEAD").splitlines() if p]
+
+
+def changed_lines(base: str, spec: str = f"{PACKAGE}/*.py") -> dict[str, set[int]]:
+    """Lines of HEAD's files under `spec` that the diff from the merge base adds or changes; a pure deletion marks the
+    line after it, so a function whose line was only removed is still touched."""
+    diff = git("diff", "--unified=0", "--no-color", "--no-renames", f"{base}...HEAD", "--", spec)
     lines: dict[str, set[int]] = {}
     path = None
     for line in diff.splitlines():
@@ -70,6 +78,113 @@ def mangled_functions(path: str) -> list[tuple[str, int, int]]:
     return found
 
 
+# What a full run is owed to (README, "Mutation testing"): a change to the harness every mutant's verdict depends on.
+HARNESS = (
+    "tests/fake_rivet.py",
+    "tests/conftest.py",
+    "dev/mutmut_isolation.py",
+    "dev/mutants_gate.py",
+    ".github/workflows/mutation.yml",
+    "uv.lock",
+    ".mutmut-ratchet",
+    "RIVET_CONTRACT_REF",
+)
+# pyproject.toml sections whose change is a harness change: mutmut's settings and the dependencies.
+PYPROJECT_HARNESS = ("tool.mutmut", "project", "project.optional-dependencies", "dependency-groups", "tool.uv")
+
+
+def pyproject_sections(base: str) -> set[str]:
+    """The TOML tables of pyproject.toml whose lines the diff adds or removes (either side)."""
+    diff = git("diff", "--unified=0", "--no-color", f"{base}...HEAD", "--", "pyproject.toml")
+    if not diff:
+        return set()
+    merge_base = git("merge-base", base, "HEAD").strip()
+    sides = {
+        "old": git("show", f"{merge_base}:pyproject.toml").splitlines(),
+        "new": (ROOT / "pyproject.toml").read_text().splitlines(),
+    }
+
+    def table(side: str, line: int) -> str:
+        for text in reversed(sides[side][: max(line, 1)]):
+            if m := re.match(r"^\s*\[+([^\]]+)\]+", text):
+                return m[1].strip()
+        return ""
+
+    found = set()
+    for m in re.finditer(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@", diff, re.M):
+        old, old_n, new, new_n = int(m[1]), int(m[2] or 1), int(m[3]), int(m[4] or 1)
+        found |= {table("old", line) for line in range(old, old + old_n)} if old_n else set()
+        found |= {table("new", line) for line in range(new, new + new_n)} if new_n else set()
+    return found
+
+
+def test_functions(text: str) -> dict[str, tuple[int, int]]:
+    """pytest's node name (`test_x`, `TestK::test_x`) of every test function, with its lines."""
+    found = {}
+    for node in ast.parse(text).body:
+        if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and node.name.startswith("test"):
+            first = min([node.lineno, *(d.lineno for d in node.decorator_list)])
+            found[node.name] = (first, node.end_lineno or node.lineno)
+        elif isinstance(node, ast.ClassDef) and node.name.startswith("Test"):
+            for item in node.body:
+                if isinstance(item, ast.FunctionDef | ast.AsyncFunctionDef) and item.name.startswith("test"):
+                    found[f"{node.name}::{item.name}"] = (item.lineno, item.end_lineno or item.lineno)
+    return found
+
+
+def changed_tests(base: str) -> tuple[list[str], list[str]]:
+    """(node-id prefixes of the tests the diff changes, the tests it deletes). A change outside any test function of a
+    test file (a helper, a constant, an import) names the whole file."""
+    merge_base = git("merge-base", base, "HEAD").strip()
+    prefixes, deleted = [], []
+    for path, lines in sorted(changed_lines(base, "tests/").items()):
+        if not path.endswith(".py") or path in HARNESS or not Path(path).name.startswith("test_"):
+            continue
+        now = test_functions((ROOT / path).read_text())
+        try:
+            before = test_functions(git("show", f"{merge_base}:{path}"))
+        except subprocess.CalledProcessError:
+            before = {}
+        deleted += [f"{path}::{name}" for name in sorted(set(before) - set(now))]
+        inside = set()
+        for name, (first, last) in now.items():
+            if lines & set(range(first, last + 1)):
+                prefixes.append(f"{path}::{name}")
+                inside |= lines & set(range(first, last + 1))
+        if lines - inside:
+            prefixes.append(f"{path}::")
+    for path in changed_files(base):
+        if path.startswith("tests/") and Path(path).name.startswith("test_") and not (ROOT / path).exists():
+            deleted.append(f"{path}::")
+    return sorted(set(prefixes)), deleted
+
+
+def mode(base: str) -> tuple[str, list[str]]:
+    """`full`, `targeted` or `none` for a pull request, and why (README, "Mutation testing")."""
+    files = changed_files(base)
+    why = [f"{f} is mutation harness" for f in files if f in HARNESS]
+    why += [f"pyproject.toml [{t}] changed" for t in sorted(pyproject_sections(base) & set(PYPROJECT_HARNESS))]
+    _, deleted = changed_tests(base)
+    why += [f"{d} was deleted: what only it covered is found by a full run" for d in deleted]
+    if why:
+        return "full", why
+    touched = [f for f in files if f.endswith(".py") and (f.startswith(f"{PACKAGE}/") or f.startswith("tests/"))]
+    return ("targeted", [f"{f} changed" for f in touched]) if touched else ("none", ["no package or test code changed"])
+
+
+STATS_ONLY = f"{PACKAGE}.__mutation_gate_stats_only__"
+
+
+def covered_globs(prefixes: list[str]) -> list[str]:
+    """The mutant globs of every function one of the named tests calls, by mutmut's own stats (tests -> functions)."""
+    stats = json.loads((ROOT / "mutants" / "mutmut-stats.json").read_text())["tests_by_mangled_function_name"]
+
+    def named(test: str) -> bool:
+        return any(test == p or test.startswith(p + "[") or (p.endswith("::") and test.startswith(p)) for p in prefixes)
+
+    return sorted(f"{function}__mutmut_*" for function, tests in stats.items() if any(named(t) for t in tests))
+
+
 def changed_globs(base: str) -> list[str]:
     """`<module>.<mangled function>__mutmut_*` for every function the diff touches."""
     globs = []
@@ -83,8 +198,29 @@ def changed_globs(base: str) -> list[str]:
     return globs
 
 
-def run_mutmut(args: list[str]) -> subprocess.CompletedProcess:
-    """`mutmut run ...` with the project's own settings (`[tool.mutmut]`, `dev/` for the isolation plugin)."""
+PROGRESS = re.compile(r"(\d+)/(\d+)(?=\s)")
+
+
+def statuses() -> dict[str, str]:
+    """Every mutant mutmut generated, with its status (`not checked` until a run grades it), from mutants/*.meta."""
+    from mutmut.stats import status_by_exit_code
+
+    found = {}
+    for meta in sorted((ROOT / "mutants" / PACKAGE).rglob("*.meta")):
+        for name, code in json.loads(meta.read_text())["exit_code_by_key"].items():
+            found[name] = status_by_exit_code[code]
+    return found
+
+
+def matching(names, globs: list[str]) -> list[str]:
+    return [n for n in names if any(fnmatch.fnmatchcase(n, g) for g in globs)]
+
+
+def run_mutmut(args: list[str], label: str = "", globs: list[str] | None = None) -> subprocess.CompletedProcess:
+    """`mutmut run ...` with the project's own settings (`[tool.mutmut]`, `dev/` for the isolation plugin).
+
+    With `globs`, once mutmut has generated its mutants this prints how many of all of them the run covers, and
+    mutmut's progress `done/total` (total = every mutant of the package) is shown against that number instead."""
     env = {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, [str(ROOT / "dev"), os.environ.get("PYTHONPATH")]))}
     if env.get("RIVET_SRC"):  # mutmut's workers do not run in this directory: a relative checkout path would miss
         env["RIVET_SRC"] = str((ROOT / env["RIVET_SRC"]).resolve())
@@ -92,23 +228,36 @@ def run_mutmut(args: list[str]) -> subprocess.CompletedProcess:
     argv = [*MUTMUT, "run", *(["--max-children", children] if children else []), *args]
     print("+", " ".join(argv), flush=True)
     proc = subprocess.Popen(argv, cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    seen = []
+    seen, pending, count = [], "", None
     for chunk in iter(lambda: proc.stdout.read(4096), ""):  # streamed: a full run is silent for an hour otherwise
-        sys.stdout.write(chunk)
-        sys.stdout.flush()
         seen.append(chunk)
+        pending += chunk
+        *lines, pending = re.split(r"(\r|\n)", pending + "\x00")
+        pending = pending[:-1]
+        out = []
+        for piece in lines:
+            if globs is not None and count is None and "files mutated" in piece:
+                every = statuses()
+                count = len(matching(every, globs))
+                out.append(f"{piece}\nmutation gate: {label}: {count} of {len(every)} mutants\n")
+                continue
+            if count is not None and PROGRESS.search(piece) and "\U0001f389" in piece:
+                piece = f"{label}: " + PROGRESS.sub(lambda m, n=count: f"{m[1]}/{n}", piece, count=1)
+            out.append(piece)
+        sys.stdout.write("".join(out))
+        sys.stdout.flush()
+    sys.stdout.write(pending)
     return subprocess.CompletedProcess(argv, proc.wait(), "".join(seen)[-20000:], "")
 
 
-def not_killed() -> dict[str, str]:
-    """Every mutant of the last run whose status is not `killed`, by name (`mutmut results`)."""
-    out = subprocess.run([*MUTMUT, "results"], cwd=ROOT, check=True, capture_output=True, text=True).stdout
-    found = {}
-    for line in out.splitlines():
-        name, sep, status = line.strip().rpartition(": ")
-        if sep and name.startswith(PACKAGE + "."):
-            found[name] = status
-    return found
+def tally(globs: list[str], label: str) -> tuple[dict[str, str], list[str], int]:
+    """(not-killed mutants by name, the names graded, how many were killed) of the run's mutants; printed."""
+    graded = {n: s for n, s in statuses().items() if any(fnmatch.fnmatchcase(n, g) for g in globs)}
+    tested = sorted(n for n, s in graded.items() if s != "not checked")
+    killed = sum(1 for s in graded.values() if s == "killed")
+    left = {n: s for n, s in graded.items() if s != "killed"}
+    print(f"mutation gate: {label}: tested {len(tested)}, killed {killed}, not killed {len(left)}", flush=True)
+    return left, tested, killed
 
 
 def show(names: list[str]) -> None:
@@ -123,20 +272,35 @@ def sharded(globs: list[str], shard: int | None) -> list[str]:
 
 
 def gate_pr(base: str, shard: int | None) -> int:
-    """Run the mutants of the touched functions; every one must be killed."""
-    globs = sharded(changed_globs(base), shard)
+    """Run the mutants of the functions the diff touches and of every function the tests it changes call; every one
+    must be killed (a deleted or weakened assertion turns red here, not after the merge)."""
+    globs = changed_globs(base)
+    tests, _ = changed_tests(base)
+    if tests:
+        print("mutation gate: tests changed:\n  " + "\n  ".join(tests), flush=True)
+        # mutmut's stats (which test calls which function) are made by any `mutmut run`, before its name filter:
+        # a run filtered to no mutant leaves them in mutants/mutmut-stats.json and stops; the run below reuses them.
+        done = run_mutmut([STATS_ONLY])
+        if "nothing matches" not in done.stdout or not (ROOT / "mutants" / "mutmut-stats.json").exists():
+            print(f"mutation gate: the stats run of mutmut failed (exit {done.returncode})")
+            return 1
+        covered = covered_globs(tests)
+        print(f"mutation gate: the changed tests call {len(covered)} function(s) of {PACKAGE}/", flush=True)
+        globs = sorted(set(globs) | set(covered))
+    globs = sharded(globs, shard)
     if not globs:
-        print(f"mutation gate: the diff from {base} touches no function of {PACKAGE}/; nothing to mutate")
+        print(f"mutation gate: the diff from {base} touches no function of {PACKAGE}/ and no test that calls one")
         return 0
-    print("mutation gate: functions touched:\n  " + "\n  ".join(globs), flush=True)
-    done = run_mutmut(globs)
+    print("mutation gate: functions to mutate:\n  " + "\n  ".join(globs), flush=True)
+    label = "touched functions" if shard is None else f"shard {shard}"
+    done = run_mutmut(globs, label, globs)
     if done.returncode != 0:
         if "nothing matches" in done.stdout:
             print("mutation gate: the touched functions have no mutants in this shard")
             return 0
         print(f"mutation gate: mutmut run exited {done.returncode}")
         return 1
-    left = {n: s for n, s in not_killed().items() if any(fnmatch.fnmatchcase(n, g) for g in globs)}
+    left, _, _ = tally(globs, label)
     if left:
         print(f"mutation gate: {len(left)} mutant(s) of the touched functions not killed:")
         for name, status in sorted(left.items()):
@@ -173,32 +337,65 @@ def judge(left: dict[str, str]) -> int:
 
 
 def gate_full(shard: int | None, out: Path | None) -> int:
-    """Run every mutant (of one shard); judge against the ratchet, or write the shard's survivors to `out`."""
+    """Run every mutant (of one shard); judge against the ratchet, or write the shard's account to `out`."""
     globs = sharded([f"{PACKAGE}.*__mutmut_*"], shard)
-    done = run_mutmut(globs if shard is not None else [])
+    label = "all mutants" if shard is None else f"shard {shard}"
+    done = run_mutmut(globs if shard is not None else [], label, globs)
     if done.returncode != 0:
         print(f"mutation gate: mutmut run exited {done.returncode}")
         return 1
-    left = {n: s for n, s in not_killed().items() if any(fnmatch.fnmatchcase(n, g) for g in globs)}
+    left, tested, killed = tally(globs, label)
     if shard is None:
         return judge(left)
     assert out is not None
-    out.write_text(json.dumps({"shard": shard, "not_killed": left}, indent=1, sort_keys=True))
-    print(f"mutation gate: shard {shard}: {len(left)} not killed, written to {out}")
+    every = statuses()
+    doc = {
+        "shard": shard,
+        "total_mutants": len(every),
+        "mutants": len(matching(every, globs)),
+        "tested": tested,
+        "killed": killed,
+        "not_killed": left,
+    }
+    out.write_text(json.dumps(doc, indent=1, sort_keys=True))
+    print(f"mutation gate: shard {shard}: account written to {out}")
     return 0
 
 
 def gate_ratchet(folder: Path) -> int:
-    """Sum the ten shards' survivor files and judge the total."""
-    left: dict[str, str] = {}
-    shards = set()
+    """Check that the ten shards together graded every mutant exactly once, then judge their total."""
+    docs = {}
     for path in sorted(folder.rglob("*.json")):
         doc = json.loads(path.read_text())
-        shards.add(doc["shard"])
-        left.update(doc["not_killed"])
-    if shards != set(range(10)):
-        print(f"mutation gate: shards {sorted(set(range(10)) - shards)} reported nothing; the run is incomplete")
+        docs[doc["shard"]] = doc
+    if set(docs) != set(range(10)):
+        print(f"mutation gate: shards {sorted(set(range(10)) - set(docs))} reported nothing; the run is incomplete")
         return 1
+    print("| shard | mutants | tested | killed | not killed |\n|---|---|---|---|---|")
+    for i, doc in sorted(docs.items()):
+        print(f"| {i} | {doc['mutants']} | {len(doc['tested'])} | {doc['killed']} | {len(doc['not_killed'])} |")
+    totals = {doc["total_mutants"] for doc in docs.values()}
+    tested = [name for doc in docs.values() for name in doc["tested"]]
+    total = next(iter(totals))
+    print(
+        f"| all | {sum(d['mutants'] for d in docs.values())} | {len(tested)} | "
+        f"{sum(d['killed'] for d in docs.values())} | {sum(len(d['not_killed']) for d in docs.values())} |"
+    )
+    problems = []
+    if len(totals) != 1:
+        problems.append(f"the shards saw different totals {sorted(totals)}: they ran different code")
+    if len(set(tested)) != len(tested):
+        problems.append(f"{len(tested) - len(set(tested))} mutants were graded by more than one shard")
+    if len(set(tested)) != total:
+        problems.append(f"sum(tested) {len(set(tested))} != total mutants {total}: some mutants were graded by no shard")
+    for problem in problems:
+        print(f"mutation gate: {problem}")
+    if problems:
+        return 1
+    print(f"mutation gate: sum(tested) == total mutants == {total}")
+    left: dict[str, str] = {}
+    for doc in docs.values():
+        left.update(doc["not_killed"])
     return judge(left)
 
 
@@ -210,6 +407,11 @@ def main(argv: list[str]) -> int:
         assert 0 <= shard <= 9, "a shard is the last digit of the mutant number, 0-9"
         argv = argv[:i] + argv[i + 2 :]
     mode = argv[0] if argv else ""
+    if mode == "mode":
+        verdict, why = globals()["mode"](argv[1] if len(argv) > 1 else "origin/main")
+        print("\n".join(f"mutation gate: {w}" for w in why), file=sys.stderr)
+        print(verdict)
+        return 0
     if mode == "changed":
         print("\n".join(changed_globs(argv[1] if len(argv) > 1 else "origin/main")))
         return 0
