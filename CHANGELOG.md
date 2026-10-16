@@ -150,6 +150,10 @@ is now the one place rivet's environment is assembled; README "Storage and wareh
   instead of becoming `http://None`. (D22)
 - On a binary without `apply --summary-output`, an apply's counts come from its own run (rivet's run id with this
   apply's pid), not the export's newest `rivet metrics` row, which may be another process's run.
+- A rivet child whose task process died before the parent-death signal took effect stops itself with SIGKILL;
+  its SIGTERM ran the inherited Airflow 3 handler, which returns, and the child went on to run rivet as an orphan.
+- A database Connection without a host is refused (`RIVET_AIRFLOW_CONNECTION_INCOMPLETE`) like a ClickHouse one;
+  it became `postgresql://u:p@/d` and the driver dialled its default socket or host. One check, in `url_host`.
 - README: an Azure config reads `account_name: ${AZURE_STORAGE_ACCOUNT}`. (D32)
 - A Connection id no backend defines (`env_from_connections`, `connections`) is refused,
   `RIVET_AIRFLOW_CONNECTION_MISSING`, with the refusal in XCom; it was retried with no XCom.

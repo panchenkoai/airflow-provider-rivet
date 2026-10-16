@@ -704,7 +704,7 @@ When mutants run (`.github/workflows/mutation.yml`, on Linux, through `dev/mutan
 
 | change | what runs | fails when |
 |---|---|---|
-| a pull request changes `airflow_provider_rivet/` code | the mutants of every function it touches | any of them is not killed |
+| a pull request changes `airflow_provider_rivet/` code | the mutants of every function it touches | one that mutates a line the pull request changed is not killed (the other survivors of those functions are listed, not failed) |
 | a pull request changes only tests, docs or the harness | nothing | — |
 | a release (`release.yml` runs it on the tagged commit before it builds) | the full run | as above: nothing is published from a commit whose mutants were not counted |
 | on demand (workflow_dispatch) | the full run | as above |
