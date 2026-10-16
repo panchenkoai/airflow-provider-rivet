@@ -238,14 +238,17 @@ def read_source(rivet_src: Path, ref: str) -> str:
     """`src/cli/args.rs` at one ref of the rivet checkout; a ref the checkout lacks (CI clones the pinned commit only)
     is fetched first."""
 
+    # a git hook (pre-push runs the suite) exports GIT_DIR and friends for THIS repository: they would win over `-C`
+    env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+
     def show() -> subprocess.CompletedProcess:
         argv = ["git", "-C", str(rivet_src), "show", f"{ref}:{ARGS_RS}"]
-        return subprocess.run(argv, capture_output=True, text=True, check=False)
+        return subprocess.run(argv, capture_output=True, text=True, check=False, env=env)
 
     done = show()
     if done.returncode != 0:
         spec = f"refs/tags/{ref}:refs/tags/{ref}" if ref.startswith("v") else ref
-        subprocess.run(["git", "-C", str(rivet_src), "fetch", "-q", "--depth", "1", "origin", spec], check=False)
+        subprocess.run(["git", "-C", str(rivet_src), "fetch", "-q", "--depth", "1", "origin", spec], check=False, env=env)
         done = show()
     if done.returncode != 0:
         raise RuntimeError(f"cannot read {ARGS_RS} at {ref} in {rivet_src}: {done.stderr.strip()}")
