@@ -319,6 +319,7 @@ class DagRig(Rig):
         path = self.home / "dags" / f"{dag_id}.py"
         path.write_text(source)
         before = {name: os.environ.get(name) for name in env}
+        modules = dict(sys.modules)
         os.environ.update(env)
         try:
             spec = importlib.util.spec_from_file_location(dag_id, path)
@@ -334,6 +335,12 @@ class DagRig(Rig):
             return str(getattr(run.state, "value", run.state)), states
         finally:
             path.unlink()
+            # a DAG file may plant a stub module (a fake Slack hook): the session's later tests get the real one back
+            for name, module in list(sys.modules.items()):
+                if name in modules and modules[name] is not module:
+                    sys.modules[name] = modules[name]
+                elif name not in modules and getattr(module, "__spec__", None) is None:
+                    del sys.modules[name]
             for name, value in before.items():
                 os.environ.pop(name, None) if value is None else os.environ.__setitem__(name, value)
 

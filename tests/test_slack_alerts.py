@@ -295,8 +295,6 @@ def test_each_example_dag_fails_on_its_first_try_and_sends_one_alert_through_the
     monkeypatch.setenv("RIVET_BIN", str(dag_rig.bin / "rivet"))
     monkeypatch.setenv("RIVET_SLACK_CONN_ID", "slack_test")
     monkeypatch.delenv("RIVET_SLACK_CHANNEL", raising=False)
-    # the runner plants its stub in sys.modules: put back whatever was there (the real hook) when the test ends
-    monkeypatch.setitem(sys.modules, WEBHOOK_MODULE, sys.modules.get(WEBHOOK_MODULE))
     sent = dag_rig.tmp / "slack.txt"
     source = EXAMPLE_RUNNER.format(sent=str(sent), example=str(EXAMPLE), name=name)
     state, tasks = dag_rig.run_source(name, source)
