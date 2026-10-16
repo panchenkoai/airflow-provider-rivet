@@ -18,6 +18,7 @@ from ._compat import (
     BaseHook,
     BaseOperator,
 )
+from ._yaml import params_of
 from .connections import EnvSpec, build_environment, connection_url  # noqa: F401  (connection_url is re-exported)
 from .invocation import (
     CLOUD_ENV,
@@ -26,6 +27,7 @@ from .invocation import (
     crashed_retry_allowed,
     invoke,
     path_name,
+    worker_environment,
 )
 from .preflight import PreflightRefusal, read_config
 
@@ -128,9 +130,11 @@ class RivetBaseOperator(BaseOperator):
         return build_environment(os.environ, spec, [get_connection(c) for c in self.connections], secrets)
 
     def _config_doc(self) -> dict[str, Any]:
-        """The config as written, for the names a Connection is filed under; read by the preflight's reader, so a config
-        it refuses is refused here too."""
-        return read_config(self.config)
+        """The config as rivet builds it, for the names a Connection is filed under; read by the preflight's reader, so a
+        config it refuses is refused here too, and a `${...}` in `load.password_env` / `load.connection` resolves from
+        `-p` and the task's environment (the worker's allow-listed variables and `env`) as rivet resolves it (D06)."""
+        env = {**worker_environment(self.env_passthrough, self.cloud_credentials, os.environ), **(self.env or {})}
+        return read_config(self.config, {str(k): str(v) for k, v in env.items()}, params_of(self.extra_args or ()))
 
     def _emit(self, record: dict[str, Any]) -> None:
         """Write one structured line to the task log."""

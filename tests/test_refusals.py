@@ -56,7 +56,7 @@ BAD_CONFIGS = {
     "exports_a_mapping": b"exports:\n  orders:\n    mode: full\n",
     "export_entry_not_a_mapping": b"exports:\n  - orders\n",
     "name_a_list": b"exports:\n  - name: [orders]\n    mode: full\n",
-    "name_a_number": b"exports:\n  - name: 5\n    mode: full\n",
+    "name_a_mapping": b"exports:\n  - name: {orders: 1}\n    mode: full\n",
 }
 
 

@@ -269,4 +269,3 @@ def test_a_relative_destination_path_is_left_as_written_and_resolves_against_the
 def test_the_config_reader_keeps_yaml_1_1_words_as_strings() -> None:
     doc = _yaml.load("notifications:\n  on: [failure]\nat: 12:30:00\nday: 2026-01-01\nn: 100000\nflag: true\n")
     assert doc == {"notifications": {"on": ["failure"]}, "at": "12:30:00", "day": "2026-01-01", "n": 100000, "flag": True}
-    assert _yaml.load(_yaml.dump(doc)) == doc

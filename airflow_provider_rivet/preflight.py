@@ -5,7 +5,7 @@ from __future__ import annotations
 import os
 import shutil
 import uuid
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -39,11 +39,17 @@ class Preflight:
     config: dict[str, Any]
     marker: str | None = None
     warnings: list[tuple[str, str]] = field(default_factory=list)
+    config_text: str = ""
+    value_of: Callable[[str], str | None] = field(default=lambda _name: None, repr=False)
 
     def export_modes(self) -> dict[str, str]:
-        """Mode by export name, as the config declares it."""
+        """Mode by export name, as rivet reads the config (after `${...}`, names as their written text)."""
         exports = self.config.get("exports") or []
-        return {e["name"]: str(e.get("mode", "full")) for e in exports if isinstance(e, dict) and "name" in e}
+        return {
+            str(_yaml.text_of(e["name"])): str(_yaml.text_of(e.get("mode", "full")))
+            for e in exports
+            if isinstance(e, dict) and "name" in e
+        }
 
 
 def state_kind(env: Mapping[str, str]) -> str:
@@ -71,14 +77,20 @@ def binary_unanswering(exc: ProbeFailed) -> PreflightRefusal:
     return PreflightRefusal("RIVET_AIRFLOW_BINARY_MISSING", f"the rivet binary does not answer its probes: {exc}")
 
 
-def read_config(config_path: str) -> dict[str, Any]:
-    """Parse the config as YAML, the one reader of the file; a refusal when it cannot be read or has the wrong shape.
+def read_config_source(
+    config_path: str, env: Mapping[str, str] | None = None, params: Mapping[str, str] | None = None
+) -> tuple[dict[str, Any], str, Callable[[str], str | None]]:
+    """The one reader of the config: the document as rivet builds it (D06: `${name}` from `-p` params, then `env`,
+    spliced into the text first; D07: serde_yaml_ng's scalars), the raw text and the resolver.
 
-    Text that is not UTF-8, nesting past Python's recursion limit and a scalar Python cannot convert are refusals like a
-    missing file: retrying cannot change any of them. `exports` must be a list of mappings with a string `name`.
+    A refusal like a missing file for text that is not UTF-8, nesting past Python's recursion limit, a scalar Python
+    cannot convert, or a wrong shape: `exports` must be a list of mappings whose `name` is a scalar (read as its text,
+    D07: `name: 2024` is the export `2024`, as rivet reads a plain scalar into its string field).
     """
+    value_of = _yaml.resolver(env or {}, params or {})
     try:
-        doc = _yaml.load(Path(config_path).read_text(encoding="utf-8"))
+        text = Path(config_path).read_bytes().decode("utf-8")
+        doc, _ = _yaml.resolve_and_load(text, value_of)
     except (OSError, ValueError, RecursionError, _yaml.yaml.YAMLError) as exc:
         raise PreflightRefusal(
             "RIVET_AIRFLOW_CONFIG_UNREADABLE", f"cannot read config {config_path}: {type(exc).__name__}"
@@ -91,11 +103,27 @@ def read_config(config_path: str) -> dict[str, Any]:
     for i, entry in enumerate(exports or []):
         if not isinstance(entry, dict):
             raise PreflightRefusal("RIVET_AIRFLOW_CONFIG_UNREADABLE", f"config {config_path}: `exports[{i}]` is not a mapping")
-        if "name" in entry and not isinstance(entry["name"], str):
+        if "name" in entry and (entry["name"] is None or isinstance(entry["name"], list | dict)):
             raise PreflightRefusal(
-                "RIVET_AIRFLOW_CONFIG_UNREADABLE", f"config {config_path}: `exports[{i}].name` is not a string"
+                "RIVET_AIRFLOW_CONFIG_UNREADABLE", f"config {config_path}: `exports[{i}].name` is not a scalar"
             )
-    return doc
+    return doc, text, value_of
+
+
+def read_config(
+    config_path: str, env: Mapping[str, str] | None = None, params: Mapping[str, str] | None = None
+) -> dict[str, Any]:
+    """The config document as rivet builds it (`read_config_source`)."""
+    return read_config_source(config_path, env, params)[0]
+
+
+def refuse_unresolved(config_path: str, what: str, value: str) -> None:
+    """D06: a placeholder neither `-p` nor the task env resolves; rivet refuses the config, and a guard cannot read it."""
+    raise PreflightRefusal(
+        "RIVET_AIRFLOW_CONFIG_UNRESOLVED",
+        f"{what} `{value}` of config {config_path} holds a `${{...}}` that neither a `-p` param nor the task's env "
+        f"sets; rivet refuses an unresolved placeholder: pass the variable through `env`, `env_passthrough` or `-p`",
+    )
 
 
 def ensure_marker(state_dir: Path) -> str:
@@ -148,7 +176,11 @@ def check_nothing_left_beside_config(
     for entry in config.get("exports") or []:
         cdc = entry.get("cdc") if isinstance(entry, dict) else None
         ref = cdc.get("checkpoint") if isinstance(cdc, dict) else None
-        if not ref or os.path.isabs(str(ref)) or export not in (None, entry.get("name")):
+        if not ref or export not in (None, _yaml.text_of(entry.get("name"))):
+            continue
+        if "${" in str(ref):
+            refuse_unresolved(config_path, "cdc.checkpoint", str(ref))
+        if os.path.isabs(str(ref)):
             continue
         if (origin / str(ref)).exists() and not (state_dir / str(ref)).exists():
             raise PreflightRefusal(
@@ -170,6 +202,7 @@ def run_preflight(
     export: str | None = None,
     cdc: bool = False,
     upstream_markers: tuple[str, ...] = (),
+    extra_args: Sequence[str] = (),
 ) -> Preflight:
     """Run every check; raise `PreflightRefusal` or return what the invocation needs."""
     binary = resolve_binary(rivet_bin, env)
@@ -183,15 +216,19 @@ def run_preflight(
             "RIVET_AIRFLOW_BINARY_TOO_OLD",
             f"rivet {caps.version_text} at {binary} is older than {floor}, the minimum this package runs",
         )
-    config = read_config(config_path)
+    config, text, value_of = read_config_source(config_path, env, _yaml.params_of(extra_args))
     where = detect_deployment(env, deployment)
     kind = state_kind(env)
-    result = Preflight(binary, caps, where, kind, None, config)
+    result = Preflight(binary, caps, where, kind, None, config, config_text=text, value_of=value_of)
     modes = result.export_modes()
     if export is not None and modes and export not in modes:
+        for name in modes:
+            if "${" in name:
+                refuse_unresolved(config_path, "export name", name)
         raise PreflightRefusal("RIVET_AIRFLOW_EXPORT_UNKNOWN", f"config {config_path} has no export `{export}`")
     touched = [modes.get(export, "")] if export is not None else list(modes.values())
-    is_cdc = cdc or "cdc" in touched
+    # D06: a mode no variable resolves may be `cdc`; the guards treat it as one (fail closed).
+    is_cdc = cdc or any(mode == "cdc" or "${" in mode for mode in touched)
 
     if where == "pod":
         if kind != "postgres":
