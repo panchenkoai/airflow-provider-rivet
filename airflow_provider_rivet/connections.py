@@ -89,8 +89,11 @@ def toml_string(text: str, what: str) -> str:
 
 def url_host(conn: Any) -> str:
     """The Connection's host as a URL authority: an IPv6 literal bracketed with its zone encoded (`%25`, RFC 6874).
-    A host that holds `:` and is not IPv6 is kept as written (`db:5432`), unless the port field is set too."""
-    host = str(conn.host or "")
+    A host that holds `:` and is not IPv6 is kept as written (`db:5432`), unless the port field is set too. No host is
+    refused: every URL rivet gets from a Connection is built here, and without a host its driver dials a default."""
+    if not conn.host:
+        raise PreflightRefusal(INCOMPLETE, f"{conn.conn_type} connection `{conn.conn_id}` has no host")
+    host = str(conn.host)
     bracketed = host.startswith("[") and host.endswith("]")
     bare = host[1:-1] if bracketed else host
     address, percent, zone = bare.partition("%")
@@ -223,8 +226,6 @@ def _snowflake(conn: Any, folder: Path, config: Mapping[str, Any]) -> dict[str, 
 def _clickhouse(conn: Any, folder: Path, config: Mapping[str, Any]) -> dict[str, str]:
     """The HTTP endpoint, user and password; the config reads `url: ${RIVET_CLICKHOUSE_URL}` and the password from its
     `password_env` (RIVET_CLICKHOUSE_PASSWORD always carries it as well)."""
-    if not conn.host:
-        raise PreflightRefusal(INCOMPLETE, f"ClickHouse connection `{conn.conn_id}` has no host")
     secure = str(_extra(conn, "secure", "clickhouse") or "").lower() in ("1", "true", "yes")
     scheme = str(_extra(conn, "protocol", "clickhouse") or ("https" if secure else "http"))
     port = f":{conn.port}" if conn.port else ""

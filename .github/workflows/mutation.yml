@@ -1,0 +1,134 @@
+name: Mutation
+
+# Mutation testing of airflow_provider_rivet/ with mutmut (README, "Mutation testing"; dev/mutants_gate.py), on Linux
+# so the PR_SET_PDEATHSIG test runs. When mutants run:
+# 1. A pull request that changes airflow_provider_rivet/ code: the mutants of every function it touches; one not killed
+#    that mutates a line the pull request changed fails the job (a survivor elsewhere in the function is listed). Nothing else runs on a pull request: a change to tests or to the harness gets no mutants.
+# 2. A release (release.yml calls this workflow on the tagged commit): the full run, judged against `.mutmut-ratchet`.
+# 3. On demand (workflow_dispatch): the full run. There is no run on push to main and no nightly run.
+# The ratchet changes only through a full run (2 or 3).
+# Ten shards (the mutants whose number ends in 0, 1, ... 9) run in parallel: a surviving mutant of a function every
+# test passes through runs the whole suite, so one runner would need most of a day for the package.
+
+on:
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mutation-${{ github.workflow_ref }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  MUTMUT: mutmut==3.8.0
+  RIVET_SRC: rivet
+
+jobs:
+  plan:
+    name: What this pull request runs
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    outputs:
+      mode: ${{ steps.mode.outputs.mode }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - id: mode
+        run: echo "mode=$(python3 dev/mutants_gate.py mode "origin/${{ github.base_ref }}")" >> "$GITHUB_OUTPUT"
+
+  changed:
+    name: Mutants of the touched functions and the changed tests (shard ${{ matrix.shard }})
+    needs: plan
+    if: needs.plan.outputs.mode == 'targeted'
+    runs-on: ubuntu-latest
+    timeout-minutes: 150
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/checkout@v7
+        with:
+          repository: panchenkoai/rivet
+          path: rivet
+          sparse-checkout: |
+            tests/fixtures/scheduler
+            src/config
+      - name: Pin rivet to RIVET_CONTRACT_REF
+        run: git -C rivet fetch --depth 1 origin "$(cat RIVET_CONTRACT_REF)" && git -C rivet checkout --quiet FETCH_HEAD
+      - uses: taiki-e/install-action@v2.87.22
+        with:
+          tool: uv
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/uv
+            .venv
+          key: mutation-${{ runner.os }}-${{ hashFiles('uv.lock', '.python-version') }}-${{ env.MUTMUT }}
+      - run: uv sync --locked
+      - name: Every mutant of the touched functions and of the functions the changed tests call is killed
+        run: uv run --with "$MUTMUT" python dev/mutants_gate.py pr "origin/${{ github.base_ref }}" --shard ${{ matrix.shard }}
+
+  full:
+    name: Every mutant (shard ${{ matrix.shard }})
+    needs: plan
+    if: ${{ !cancelled() && github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          repository: panchenkoai/rivet
+          path: rivet
+          sparse-checkout: |
+            tests/fixtures/scheduler
+            src/config
+      - name: Pin rivet to RIVET_CONTRACT_REF
+        run: git -C rivet fetch --depth 1 origin "$(cat RIVET_CONTRACT_REF)" && git -C rivet checkout --quiet FETCH_HEAD
+      - uses: taiki-e/install-action@v2.87.22
+        with:
+          tool: uv
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/uv
+            .venv
+          key: mutation-${{ runner.os }}-${{ hashFiles('uv.lock', '.python-version') }}-${{ env.MUTMUT }}
+      - run: uv sync --locked
+      - name: The shard's mutants
+        run: uv run --with "$MUTMUT" python dev/mutants_gate.py full "not-killed-${{ matrix.shard }}.json" --shard ${{ matrix.shard }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: mutation-shard-${{ matrix.shard }}
+          path: not-killed-${{ matrix.shard }}.json
+
+  ratchet:
+    name: Every mutant, against the ratchet
+    needs: [plan, full]
+    if: ${{ !cancelled() && github.event_name != 'pull_request' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: mutation-shard-*
+          path: shards
+      - name: The shards graded every mutant once, and no more survive than .mutmut-ratchet allows
+        run: python3 dev/mutants_gate.py ratchet shards
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutmut-survivors
+          path: shards/mutmut-survivors.txt

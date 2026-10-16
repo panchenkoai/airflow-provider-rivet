@@ -64,3 +64,18 @@ ignore = ["E501"]  # the formatter owns line length; long string literals stay a
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 filterwarnings = ["ignore::DeprecationWarning"]
+
+[tool.mutmut]
+# Mutation testing (README, "Mutation testing"; run by `make mutants`): only the product package is mutated —
+# not tests/, gate/ or examples/, which are copied so the documentation tests that read them still run.
+source_paths = ["airflow_provider_rivet/"]
+also_copy = ["README.md", "CHANGELOG.md", "LICENSE", "RIVET_CONTRACT_REF", ".github/", "docs/", "examples/", "gate/", "dev/"]
+# Workers fork from a server that only collected the tests: a process that has already RUN the suite (mutmut's
+# default `fork`) hangs on macOS when forked, and Airflow's dags folder is fixed by the first session's AIRFLOW_HOME.
+process_isolation = "forkserver"
+# mutmut's CPU-time limit per mutant is 15x the tests' measured time plus this constant; the measured time leaves out
+# what every worker pays first (a fresh pytest session, Airflow's `resetdb` for the DAG-run tests), so with the
+# default 1 s a slow-but-finite run of a fast function read as `timeout` (all 20 timeouts of format_failure).
+timeout_constant = 60
+# dev/mutmut_isolation.py: a metadata database, a dags folder and a base temp directory per worker process.
+pytest_add_cli_args = ["-p", "no:cacheprovider", "-p", "mutmut_isolation"]

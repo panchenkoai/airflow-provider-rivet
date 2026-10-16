@@ -671,6 +671,56 @@ scenario (and enforces rivet's own `query_file` rule, tied to the Rust source by
 `tests/test_dag_runs.py` runs the builders' DAGs through `dag.test()` against a SQLite metadata
 database created in a throwaway `AIRFLOW_HOME`, with real task instances and trigger rules.
 
+### Mutation testing
+
+[mutmut](https://github.com/boxed/mutmut) 3.8 mutates `airflow_provider_rivet/` only (never `tests/`, `gate/` or
+`examples/`) and runs, for each mutant, the tests that cover the mutated function. Run it in Linux, never on the
+Mac's own Python: mutmut forks a worker per mutant, and macOS aborts a forked child of a multithreaded process that
+loads an Objective-C class (psutil, under Airflow's import), so there a mutant's verdict is the crash, not its tests.
+`dev/mutants.sh` runs it in a Linux container (Docker), as the calling user, which also runs the Linux-only
+`PR_SET_PDEATHSIG` test of `tests/test_retry.py` (in Linux the two case- and Unicode-folding file-system tests of
+`tests/test_operators.py` skip instead):
+
+```bash
+make mutants                                  # dev/mutants.sh mutmut run, then the survivors; resumable (mutants/)
+make mutants-results                          # the survivors, timeouts and other non-killed mutants of the last run
+dev/mutants.sh mutmut show <mutant name>      # the diff of one mutant
+dev/mutants.sh python dev/mutants_gate.py pr  # what the PR job runs: the mutants of the functions your branch touches
+```
+
+`RIVET_SRC` applies as for `pytest`. The configuration is `[tool.mutmut]` in `pyproject.toml`. Workers fork from a
+server that only collected the tests (`process_isolation = "forkserver"`), and `dev/mutmut_isolation.py` gives each
+worker its own Airflow metadata database, dags folder and pytest base temp: on one shared SQLite file the
+`airflow_db` fixture's `resetdb` of one worker would kill another worker's DAG runs and count its mutant as
+detected. It also caps each worker's memory (a mutant can loop while growing a list, and on a CI runner the OOM
+killer then takes the runner), hands the mutated tree to the child Pythons of `tests/test_retry.py` and
+`tests/test_process_io.py` (the task processes those tests kill), and has mutmut select those tests for every
+mutant, since a child's calls are invisible to mutmut's test selection. A timeout is not a detection: a cluster of
+timeouts in one function is a finding about its loop or wait.
+mutmut does not mutate a decorated function (`Outcome.decision`, `_prctl`, `_export_lock`): their behaviour is
+held by tests alone.
+
+When mutants run (`.github/workflows/mutation.yml`, on Linux, through `dev/mutants_gate.py mode`):
+
+| change | what runs | fails when |
+|---|---|---|
+| a pull request changes `airflow_provider_rivet/` code | the mutants of every function it touches | one that mutates a line the pull request changed is not killed (the other survivors of those functions are listed, not failed) |
+| a pull request changes only tests, docs or the harness | nothing | — |
+| a release (`release.yml` runs it on the tagged commit before it builds) | the full run | as above: nothing is published from a commit whose mutants were not counted |
+| on demand (workflow_dispatch) | the full run | as above |
+
+There is no full run on push to main and no nightly run. Every run is split into ten parallel shards (the mutants
+whose number ends in 0 … 9). Each shard prints `shard N: M of TOTAL mutants`, its progress as `shard N: done/M` and
+`shard N: tested T, killed K, not killed S`. The ratchet job prints the per-shard table and fails unless the shards
+graded every mutant exactly once (`sum(tested) == total`) and `survivors N <= ratchet M`. A survivor of a function
+every test passes through (`_Session.step`) runs the whole suite, so one runner would need most of a day.
+
+Moving the ratchet: it changes only through a full run (on demand or at a release).
+`.mutmut-survivors` lists the survivors of that run by name (the ratchet job uploads it as `mutmut-survivors`); the
+two are committed together.
+Lowering it (after tests kill survivors) is an ordinary PR; raising it needs a dated comment line in that file saying
+which mutants are accepted and why.
+
 ## Live gate
 
 `gate/` runs this provider and a rivet Linux binary in real Airflow 2.10.5 and 3.3.2 stacks (the official
