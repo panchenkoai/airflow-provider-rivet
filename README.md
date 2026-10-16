@@ -533,8 +533,8 @@ started outside Airflow** (cron, a shell), nor against a second DAG over the sam
   `--summary-output` counts the stream only; found by the live gate).
 - This package's tests run `load` and `compact` only through the fake binary, which replays
   rivet's output and talks to no warehouse. A live run against BigQuery, Snowflake and ClickHouse
-  exists only as the warehouse leg of the gate (branch `gate/airflow-live-warehouses`), and that
-  leg does not yet read the warehouse back to grade the values.
+  exists only as the warehouse leg of the live gate (`python -m gate --warehouses ...`, see "Live
+  gate"), which reads each warehouse back through a second client and compares it with the source.
 - On Snowflake and ClickHouse a compact task is green as `compacted` while rivet merged nothing
   (see "Storage and warehouse connections").
 - Narrowing a load to one export today means rewriting the config through a YAML reader and
