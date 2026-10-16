@@ -231,7 +231,7 @@ def test_no_password_reaches_the_metadata_database_the_logs_or_an_exception(
         assert secret.decode() not in text, f"{secret!r} reached a log record or the process's stdout / stderr"
         assert scan(batch.state_dir / "logs", secret), "the fake did print it to its stderr file"
     assert scan(batch.home, str(batch.state_dir).encode()), "the scan sees the rendered fields: state_dir is in them"
-    assert "rivet.result" in text, "the scan sees the task's log records"
+    assert "rivet apply a → OK" in text, "the scan sees the task's log lines (the JSON records are at DEBUG)"
 
 
 MAPPED_SLACK_DAG = """\

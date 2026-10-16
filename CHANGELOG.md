@@ -28,6 +28,11 @@ First release, against rivet 0.31.0 and the contract of ADR-0039; Python 3.12+, 
 
 Changed before the first release, after review (see the README sections named):
 
+- The task log is readable: one headline per task with the outcome first (`OK`, `SKIPPED`,
+  `REFUSED`, `FAILED`, `CRASHED`, `STOPPED`, `BUSY`), counts, duration and run id; one line per
+  rivet step; `note` lines for degradations and single-host SQLite. A successful task's lines
+  were raw JSON and red in the Airflow UI (argv held `--json-errors`); argv and the JSON records
+  are now at DEBUG. ("Reading the task log")
 - A retry after the task process died past a successful `rivet apply` no longer applies the plan
   again: a `mode: full` export was extracted twice and an incremental one was refused
   `RIVET_PLAN_ARTIFACT_STALE` (a failed task, its load skipped). The task records the apply it

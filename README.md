@@ -34,8 +34,9 @@ The rivet binary must be on the worker's `PATH`, or pass `rivet_bin="/abs/path/r
 
 ADR-0039 describes several things no released binary emits yet. The package detects what the
 installed binary can do and takes a recorded fallback for the rest: every task's XCom carries
-`degraded: [<key>, ...]` and the same list is in its `rivet.result` log line. Nothing is guessed
-without a key.
+`degraded: [<key>, ...]`; the task log names the missing flags in one `note` line (`this binary
+lacks: ...`) and the other keys in words, and the `rivet.result` record at DEBUG carries the list.
+Nothing is guessed without a key.
 
 **How it detects.** A flag is detected by probing `rivet <subcommand> --help` once per process
 (not by a version table: the features below have no release number yet, and a development or
@@ -218,12 +219,55 @@ dag = build_cdc_dag(
   consumes what rivet's ledger says is unloaded. A load that finds nothing to do is a success
   (never an Airflow skip: a skip would propagate to `compact.T`).
 - The same `watcher` task ends the DAG: a failed `run`, `load.T` or `compact.T` fails the run.
-- On `stop_reason: max_events` the run task succeeds, puts it in XCom and logs
-  `rivet.cdc.max_events`. It does not loop.
+- On `stop_reason: max_events` the run task succeeds, puts it in XCom and logs a `note` line
+  `stopped at max_events (...)` (record `rivet.cdc.max_events`). It does not loop.
 - `load=False` drops the load and compact tasks (the stream's files are the product);
   `compact=False` keeps `load.T` and drops `compact.T`. Use `compact=False` on Snowflake and
   ClickHouse, where there is nothing to compact (see "Storage and warehouse connections").
 - `operator_kwargs` go to every task, as in the batch builder.
+
+## Reading the task log
+
+Each task writes one block when it ends: a headline with the outcome first, one line per rivet
+step, and indented `note` lines. A successful apply on rivet 0.31.0 with SQLite state:
+
+```
+rivet apply users → OK: 30 rows, 1 file in 4.1 s (run users_20261016T092509.120_4242)
+  plan     sealed, strategy incremental in 0.8 s
+  apply    done in 2.9 s
+  metrics  read the run's counts from rivet's state in 0.3 s
+  note     this binary lacks: apply_summary, lock_wait, no_notify (the operator works around them)
+  note     SQLite state is single-host — see https://github.com/panchenkoai/airflow-provider-rivet#local-worker-setup-guide
+```
+
+A failed one (a retry whose sealed plan another run has overtaken):
+
+```
+rivet apply users → REFUSED [RIVET_PLAN_ARTIFACT_STALE], final
+  metrics  no earlier try's apply of this plan in rivet's state in 0.3 s
+  plan     replayed the sealed plan of an earlier try
+  apply    exit 5 in 0.6 s
+  export   users: failed [RIVET_PLAN_ARTIFACT_STALE] refusal
+  stderr   <state_dir>/logs/<dag_id>/<task_id>-<hash>/<run_id>__try2.apply.stderr.log
+  note     this binary lacks: apply_summary, lock_wait, no_notify (the operator works around them)
+  note     SQLite state is single-host — see https://github.com/panchenkoai/airflow-provider-rivet#local-worker-setup-guide
+  note     rivet's failure line has no class or action: the class is read from its exit class
+```
+
+- The headline's outcome is `OK`, `SKIPPED` (nothing to do: rivet's `skip_reason`, or an earlier
+  try already applied the plan), `REFUSED` (class `refusal`, or a preflight refusal before rivet
+  started), `FAILED` (with its class), `CRASHED` (a signal or a 129-255 exit), `STOPPED` (Airflow
+  stopped the task) or `BUSY` (the export's lock stayed held). A final failure says `final` and is
+  an ERROR line; one Airflow retries says `retryable, Airflow retries it (try N of M)` and is a
+  WARNING line. The registry `action` follows when rivet printed one.
+- `note` lines are INFO, except what you must act on: a `notifications:` block rivet will send
+  from, a crash-retry ledger that cannot be used (WARNING).
+- No INFO or WARNING line of a successful task holds `error` or `exception`, the words Airflow
+  colours red by default (`[logging] color_log_error_keywords`), unless an export or table name
+  holds one.
+- rivet's stderr text is never in the block: a failed task prints the file's path. argv and the
+  structured records are at DEBUG (`[logging] logging_level = DEBUG`); XCom carries the outcome,
+  units, error object, degradations and paths.
 
 ## Retries
 
@@ -254,7 +298,7 @@ cleared, so a manual clear gets a fresh budget; changing `retries` in the DAG fi
 of a series does not move it, so it cannot reset the budget.
 
 Every way the ledger can fail grants NO crash retry (`crashed_ledger` in `degraded`, the reason
-in the `rivet.crashed` record under `ledger_problem`): a directory that cannot be created or
+in a WARNING `note` line and in the `rivet.crashed` record under `ledger_problem`): a directory that cannot be created or
 written, and a file that is not the ledger's JSON, which is left as it is until a person deletes
 it. On a worker with no state directory (a pod) there is no file: a crash is retried only within
 the first `crashed_retries` tries of the task instance, so neither a crash after a transient
@@ -276,7 +320,7 @@ process runs, its pid. A retry that finds this record for the same plan bytes as
 `rivet metrics --export X --json` for a run of the export whose status is `success` (or `skipped`)
 and whose run id, `<export>_<UTC start>_<pid>` as rivet makes it, carries the recorded pid and a
 start no earlier than the record's. When there is one, the task starts no `rivet apply`, logs
-`rivet.apply.already_applied` and ends success with that run's `run_id`, `rows` and `files`. A run
+`SKIPPED: an earlier try already applied this plan` (record `rivet.apply.already_applied`) and ends success with that run's `run_id`, `rows` and `files`. A run
 recorded `running`, `interrupted` or failed, another process's run (a `rivet run` of the export, a
 second DAG), a plan that was replaced, or a state `rivet metrics` cannot read: the plan is applied
 again, as before. Residual risk: an unrelated successful run of the same export by a rivet process
@@ -470,13 +514,18 @@ SQLite state in `state_dir`.
 - XCom carries code, class, exit_code, retryable, action, kind, counts, `stop_reason`, the
   degradations and file paths. It never carries the error `message`: redaction covers
   credentials only, and error text can embed source cell values.
-- The task log gets one-line JSON records: `rivet.start` (argv), `rivet.unit` (one per unit),
-  `rivet.result`, `rivet.warning`, `rivet.crashed`, `rivet.cdc.max_events`, `rivet.refused`.
+- The task log gets a readable block in the package's own words (see "Reading the task log"):
+  outcome, codes, class, action, counts, run id, step exit statuses, paths. Names the DAG gives
+  (export, table) are the only text in it the package did not write. The one-line JSON records,
+  `rivet.start` (argv), `rivet.step`, `rivet.unit` (one per unit), `rivet.result`, `rivet.warning`,
+  `rivet.crashed`, `rivet.cdc.max_events`, `rivet.refused`, ..., are written at DEBUG, under the
+  same rules.
 - **rivet's raw stdout and stderr go to files and never to the task log or to the worker
   process's own stderr** (which Airflow 3, and Airflow 2 with `run_as_user`, copy into the task
   log). The files are
   `<base>/<dag_id>/<task_id>-<hash>/<run_id>__try<N>.<step>.stderr.log` (and `.stdout.log`), mode `0600`
-  in `0700` directories; the `rivet.start` record and XCom name the path. `<base>` is
+  in `0700` directories; XCom and a failed task's `stderr` log line name the path (and the
+`rivet.start` record at DEBUG). `<base>` is
   `stderr_dir` when given, else `<state_dir>/logs`, else, on a worker with no state directory,
   `<temp dir>/rivet-airflow-<uid>/logs` (recorded as `stderr_temp`; a pod loses the files with
   its disk, and what a failure was is still in the error object).
@@ -524,7 +573,8 @@ task ends green as `compacted`, having done nothing. For these warehouses build 
 Mutual exclusion: under Airflow, rivet's own notifications are off and alerting is Airflow's.
 The operators pass `--no-notify` to a binary that has it. Until then **do not configure
 `notifications:` in a rivet config run under Airflow**: every failure would be sent twice. The
-operator warns (`rivet.warning`, `notifications_block`) when it sees the block.
+operator warns (a WARNING `note` line; record `rivet.warning`, `notifications_block`) when it sees
+the block.
 
 ```python
 from airflow_provider_rivet.callbacks import slack_failure_callback
@@ -563,7 +613,7 @@ for `run`, `apply` and `cdc_run`; one per table for `load` and `compact` with `-
 per export. The lock's descriptor is passed to every rivet process the task starts, so a rivet that
 outlives its task keeps the lock until it exits. A task that finds the lock held waits up to
 `lock_wait` seconds, then starts no rivet and ends retryable (`RIVET_AIRFLOW_EXPORT_BUSY`; the
-waiting is logged as `rivet.lock.wait`). The task releases the lock by an explicit unlock once its
+waiting is logged when it starts, `waiting up to <lock_wait> s for the lock of ...`, record `rivet.lock.wait`). The task releases the lock by an explicit unlock once its
 rivet has exited. With `load_table_filter` degraded, the per-table tasks of one export share the
 export's lock and wait for one another, now up to `lock_wait` seconds, then retry.
 
