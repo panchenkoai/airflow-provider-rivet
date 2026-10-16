@@ -4,6 +4,7 @@ import json
 import os
 import signal
 import sys
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
@@ -137,11 +138,26 @@ def main():
     target = value_of(argv, "--summary-output")
     if target and play.get("summary") is not None:
         Path(target).write_text(json.dumps(play["summary"]))
+    if target and play.get("summary_raw") is not None:
+        Path(target).write_text(play["summary_raw"])
+    elif target and play.get("summary") is None and not play.get("exit") and not play.get("no_summary"):
+        # rivet writes the summary file on every exit-0 run it was asked for (src/pipeline/aggregate.rs `persist`).
+        Path(target).write_text(json.dumps({"per_table" if sub in ("load", "compact") else "per_export": []}))
     if play.get("line") is not None:
-        print(json.dumps(play["line"]), file=sys.stderr)
+        # serde_json writes non-ASCII raw (U+2028 included), not as `\u` escapes: so does the fake.
+        sys.stderr.flush()
+        sys.stderr.buffer.write((json.dumps(play["line"], ensure_ascii=False) + "\n").encode())
+    if play.get("line_raw") is not None:
+        sys.stderr.flush()
+        sys.stderr.buffer.write((play["line_raw"] + "\n").encode())
     for index in range(play.get("stderr_after", 0)):
         print(f"warning: trailing line {index}", file=sys.stderr)
     sys.stderr.flush()
+    if play.get("sleep"):
+        if play.get("ignore_term"):
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        Path(play["started"]).write_text(str(os.getpid()))
+        time.sleep(play["sleep"])
     if play.get("signal"):
         os.kill(os.getpid(), getattr(signal, play["signal"]))
     return play.get("exit", 0)

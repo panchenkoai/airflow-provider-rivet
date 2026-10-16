@@ -18,7 +18,6 @@ from .invocation import (
     CLOUD_ENV,
     Outcome,
     Request,
-    _stop,
     crashed_retry_allowed,
     invoke,
     path_name,
@@ -164,9 +163,10 @@ class RivetBaseOperator(BaseOperator):
         self._proc = proc
 
     def on_kill(self) -> None:
-        """Stop rivet when Airflow kills the task."""
+        """Ask rivet to stop when Airflow kills the task: a signal only, since this runs inside the SIGTERM handler;
+        the step that started the process reaps it and kills it after the grace (D02)."""
         if self._proc is not None:
-            _stop(self._proc)
+            self._proc.request_stop()
 
     def _upstream_markers(self, ti: Any) -> list[str]:
         """State-directory markers the direct upstream rivet tasks of this run reported."""
