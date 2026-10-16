@@ -87,6 +87,11 @@ def toml_string(text: str, what: str) -> str:
     return '"' + text.translate(_TOML_ESCAPES) + '"'
 
 
+# `quote`'s `safe` for a value that is percent-encoded whole (a module constant: no mutant renames it to an
+# alphanumeric string, which `quote` never encodes anyway).
+_NOTHING_SAFE = ""
+
+
 def url_host(conn: Any) -> str:
     """The Connection's host as a URL authority: an IPv6 literal bracketed with its zone encoded (`%25`, RFC 6874).
     A host that holds `:` and is not IPv6 is kept as written (`db:5432`), unless the port field is set too. No host is
@@ -109,7 +114,7 @@ def url_host(conn: Any) -> str:
             ) from None
         return host
     if percent:
-        zone = quote(unquote(zone[2:] if bracketed and zone.startswith("25") else zone), safe="")
+        zone = quote(unquote(zone[2:] if bracketed and zone.startswith("25") else zone), safe=_NOTHING_SAFE)
         address = f"{address}%25{zone}"
     return f"[{address}]"
 
@@ -227,7 +232,7 @@ def _snowflake(conn: Any, folder: Path, config: Mapping[str, Any]) -> dict[str, 
 def _clickhouse(conn: Any, folder: Path, config: Mapping[str, Any]) -> dict[str, str]:
     """The HTTP endpoint, user and password; the config reads `url: ${RIVET_CLICKHOUSE_URL}` and the password from its
     `password_env` (RIVET_CLICKHOUSE_PASSWORD always carries it as well)."""
-    secure = str(_extra(conn, "secure", "clickhouse") or "").lower() in ("1", "true", "yes")
+    secure = str(_extra(conn, "secure", "clickhouse")).lower() in ("1", "true", "yes")  # an unset extra is `None`
     scheme = str(_extra(conn, "protocol", "clickhouse") or ("https" if secure else "http"))
     port = f":{conn.port}" if conn.port else ""
     env = {CLICKHOUSE_URL: f"{scheme}://{url_host(conn)}{port}", CLICKHOUSE_USER: conn.login or "default"}
