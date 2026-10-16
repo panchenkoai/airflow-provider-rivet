@@ -1,7 +1,7 @@
 name: Live gate
 
 # The live Airflow gate (python -m gate) against a released rivet binary: on demand, and before a provider release.
-# rivet's own release gate runs the same scenario against its candidate build (dev/release_oracle/airflow_provider.py).
+# rivet's own release gate does not run it: rivet has no hook for this scenario.
 
 on:
   workflow_dispatch:

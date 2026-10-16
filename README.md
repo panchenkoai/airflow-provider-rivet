@@ -535,5 +535,17 @@ CDC snapshot + changes replayed by `__seq` == source; exact operation counts), t
 SQLite / psql client, and the Airflow REST API (run and task states, XCom rows == rows in the files).
 `--sabotage drop-delta-file` must turn it red. Each stack is torn down with its volumes before and after.
 
-rivet's release gate runs it on every release candidate (`dev/release_oracle/airflow_provider.py`, pinned by
-`dev/release_oracle/airflow-provider.ref`); the `Live gate` workflow here runs it against a released binary.
+Options: `--rivet-bin` (required), `--airflow` (comma-separated versions, default both), `--work` (working
+directory, default a fresh temporary one), `--verdicts <file>` (one JSON line per graded cell), `--keep`,
+`--sabotage drop-delta-file`.
+
+**Warehouse leg.** `--warehouses bigquery,snowflake,clickhouse` (any subset) also extracts to GCS and runs
+`load` and `compact` into those warehouses from Airflow Connections (`connections=`). It needs a GCP credential
+(`--gcp-keyfile`, default the gcloud application-default credentials), the bucket `--gcs-bucket`, the BigQuery
+`--bq-project` and `--bq-location`, the `bq`, `gcloud` and `snow` CLIs on the host (ClickHouse runs inside the
+stack), and for Snowflake a local `snow` connection (`--sf-connection`) whose login the gate's Connection copies,
+`--sf-warehouse`, `--sf-database` and the storage integration `--sf-integration`. The leg today prints an inventory of the warehouse objects after each cycle
+and records no verdict: a green gate does not yet say that the warehouse holds the source's values.
+
+rivet's own release gate does not run this gate: rivet has no hook for it. The `Live gate` workflow here runs it
+against a released binary, on demand and on an `airflow-v*` tag.
