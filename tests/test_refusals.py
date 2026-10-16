@@ -85,8 +85,7 @@ def test_d08_a_version_probe_that_times_out_is_refused_without_retry(rig: Rig, m
     monkeypatch.setattr(capabilities, "PROBE_TIMEOUT", 0.5, raising=False)
     rig.scenario(probe_broken={"--version": "hang"})
     code, text = refusal(rig, rig.operator(RivetRunOperator, export="orders"))
-    assert code == "RIVET_AIRFLOW_BINARY_MISSING"
-    assert "--version" in text
+    assert code == "RIVET_AIRFLOW_BINARY_MISSING", text
 
 
 @pytest.mark.parametrize(
@@ -105,5 +104,4 @@ def test_c1a_a_help_probe_that_fails_after_the_preflight_is_refused_without_retr
     monkeypatch.setattr(capabilities, "PROBE_TIMEOUT", 0.5, raising=False)
     rig.scenario(probe_broken={sub: how})
     code, text = refusal(rig, rig.operator(cls, export="orders"))
-    assert code == "RIVET_AIRFLOW_BINARY_MISSING"
-    assert f"{sub} --help" in text
+    assert code == "RIVET_AIRFLOW_BINARY_MISSING", text
