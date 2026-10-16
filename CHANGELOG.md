@@ -148,6 +148,8 @@ is now the one place rivet's environment is assembled; README "Storage and wareh
   is bracketed, with its zone encoded as `%25` (D23).
 - A ClickHouse Connection without a host is refused (`RIVET_AIRFLOW_CONNECTION_INCOMPLETE`)
   instead of becoming `http://None`. (D22)
+- On a binary without `apply --summary-output`, an apply's counts come from its own run (rivet's run id with this
+  apply's pid), not the export's newest `rivet metrics` row, which may be another process's run.
 - README: an Azure config reads `account_name: ${AZURE_STORAGE_ACCOUNT}`. (D32)
 - A Connection id no backend defines (`env_from_connections`, `connections`) is refused,
   `RIVET_AIRFLOW_CONNECTION_MISSING`, with the refusal in XCom; it was retried with no XCom.
