@@ -342,6 +342,14 @@ class _Session:
                 running.request_stop()
                 running.wait()
                 raise
+        self.emit(
+            {
+                "event": "rivet.step",
+                "step": name,
+                "exit_status": None if code < 0 else code,
+                "signal": -code if code < 0 else None,
+            }
+        )
         if name != "metrics":
             self.stderr_path = str(stderr_path)
         lines = _lines(_tail(stderr_path))
@@ -937,6 +945,14 @@ def _apply(s: _Session) -> Outcome:
             return s.outcome(planned, [UnitResult(export, status="failed", error=error)], error)
         _refuse_foreign_artifact(artifact, export, cfg)
         _tighten(artifact)
+        sealed = _read_json(artifact)
+        s.emit(
+            {
+                "event": "rivet.plan.sealed",
+                "export": export,
+                "strategy": sealed.get("strategy") if isinstance(sealed, dict) else None,
+            }
+        )
     has_summary = s.pf.caps.has_flag("apply", "--summary-output")
     summary = s.work / f"{s.name}.summary.json"
     argv = [s.pf.binary, "apply", str(artifact)]
