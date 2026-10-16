@@ -539,12 +539,10 @@ started outside Airflow** (cron, a shell), nor against a second DAG over the sam
   `--summary-output` counts the stream only; found by the live gate).
 - This package's tests run `load` and `compact` only through the fake binary, which replays
   rivet's output and talks to no warehouse. A live run against BigQuery, Snowflake and ClickHouse
-  exists only as the warehouse leg of the gate (branch `gate/airflow-live-warehouses`), and that
-  leg does not yet read the warehouse back to grade the values.
+  exists only as the warehouse leg of the live gate (`python -m gate --warehouses ...`, see "Live
+  gate"), which reads each warehouse back through a second client and compares it with the source.
 - On Snowflake and ClickHouse a compact task is green as `compacted` while rivet merged nothing
   (see "Storage and warehouse connections").
-- Narrowing a load to one export today means rewriting the config through a YAML reader and
-  writer: comments are dropped and YAML anchors are expanded in the copy.
 - With `load_table_filter` degraded, the per-table tasks of a multi-table CDC export each load
   the whole export; the first does the work, the others find the ledger up to date.
 - `rivet apply` prints no result today, so a successful apply task reads its counts from
@@ -568,3 +566,47 @@ The tests need no rivet binary and no running Airflow: a fake `rivet` script rep
 scenario (and enforces rivet's own `query_file` rule, tied to the Rust source by a test).
 `tests/test_dag_runs.py` runs the builders' DAGs through `dag.test()` against a SQLite metadata
 database created in a throwaway `AIRFLOW_HOME`, with real task instances and trigger rules.
+
+## Live gate
+
+`gate/` runs this provider and a rivet Linux binary in real Airflow 2.10.5 and 3.3.2 stacks (the official
+compose files, Celery) and grades the result with oracles, never with rivet's own report:
+
+```bash
+uv run --only-group gate python -m gate --rivet-bin /path/to/linux/rivet            # both Airflow versions
+uv run --only-group gate python -m gate --rivet-bin ./rivet --airflow 3.3.2 --keep  # one stack, left up
+uv run --only-group gate python -m pytest -q gate/tests                             # the oracles, RED on every mutant
+```
+
+Per stack: four DAGs (incremental batch and CDC with `initial: snapshot`, each on a shared SQLite state and on
+a TLS PostgreSQL state), three cycles (initial load, a delta of inserts / updates / deletes, an idle run). The
+SQLite CDC run pauses at `cdc_after_open` and the SQLite batch run must finish inside that window, so the two
+writers on one SQLite file overlap on every cycle. Oracles: DuckDB over the Parquet against the source read by
+DuckDB's postgres scanner (delta == source rows past the previous high-water; newest version per key == source;
+CDC snapshot + changes replayed by `__seq` == source; exact operation counts), the stored cursor read by a plain
+SQLite / psql client, and the Airflow REST API (run and task states, XCom rows == rows in the files).
+`--sabotage drop-delta-file` must turn it red. Each stack is torn down with its volumes before and after; the
+compose project and the image carry the run tag (`--tag`, default `%m%d%H%M` + 4 hex), so two runs never share one.
+
+Options: `--rivet-bin` (required), `--airflow` (comma-separated versions, default both), `--work` (working
+directory, default a fresh temporary one), `--verdicts <file>` (one JSON line per graded cell), `--keep`,
+`--sabotage drop-delta-file` or `warehouse-value`, `--tag` (the run tag).
+
+**Warehouse leg.** `--warehouses bigquery,snowflake,clickhouse` (any subset) also extracts to GCS and runs
+`load` and `compact` into those warehouses from Airflow Connections (`connections=`). It needs a GCP credential
+(`--gcp-keyfile`, default the gcloud application-default credentials), the bucket `--gcs-bucket`, the BigQuery
+`--bq-project` and `--bq-location`, the `bq`, `gcloud` and `snow` CLIs on the host (ClickHouse runs inside the
+stack), and for Snowflake a local `snow` connection (`--sf-connection`) whose login the gate's Connection copies,
+`--sf-warehouse`, `--sf-database` and the storage integration `--sf-integration` (a role that cannot create
+schemas needs the run's `AFGATE_<TAG>_<stack>` schema made beforehand: pass `--tag`). Each warehouse is read back by a
+client the loader does not use (google-cloud-bigquery, snowflake-connector-python with the key of the local `snow`
+connection, ClickHouse over HTTP as JSON), every value is brought to one form (integer, integer cents, epoch
+microseconds, text) and compared with the source: the batch current state equals the source with exactly the keys the
+cycle deleted left over (an incremental extract cannot see a delete); the CDC current state without the rows flagged
+`__is_deleted` equals the source; the BigQuery batch buffer `<table>__changes` is gone after `compact`, which only
+that DAG may not skip. `--sabotage warehouse-value` adds a cent to one BigQuery row after the delta load and must turn
+it red. The cleanup lists the dataset, schema and GCS prefix again and fails on anything left; the sweep of runs older
+than a day drops only names of the gate's own shape.
+
+rivet's own release gate does not run this gate: rivet has no hook for it. The `Live gate` workflow here runs it
+against a released binary, on demand and on an `airflow-v*` tag.

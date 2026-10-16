@@ -144,3 +144,10 @@ is now the one place rivet's environment is assembled; README "Storage and wareh
   A stderr line that starts with `{` and is not JSON is recorded as `result_malformed`.
 - A summary file that is missing (`result_missing`) or not a JSON object (`result_malformed`)
   after an exit-0 process is recorded in `degraded`. ("Works today / needs a newer rivet")
+- Live gate (`python -m gate`, not part of the package): the warehouse leg is graded by values a
+  second client reads back (google-cloud-bigquery, snowflake-connector-python, ClickHouse HTTP)
+  against the source, per warehouse, mode and table; it printed an inventory and graded nothing.
+  Only the BigQuery batch compaction may not be skipped; the cloud cleanup lists again and fails
+  on a leftover; the Snowflake sweep drops only the gate's own schema shape, quoted; the run tag
+  names the compose project and image; the `Live gate` workflow takes the `-glibc2.28` asset or
+  the ghcr.io image, which start on Debian 12.
