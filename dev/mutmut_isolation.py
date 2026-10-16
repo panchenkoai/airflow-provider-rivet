@@ -10,7 +10,7 @@ would then be shared across concurrent workers:
 
 A mutant can also turn a loop unbounded in memory (`_yaml.substitute` with `i = None` scans the same `${` forever,
 growing its output list): mutmut's CPU-time limit comes too late, and on a CI runner the kernel's OOM killer then
-takes the runner itself. So each worker's data segment is capped (`MUTANTS_MEM_LIMIT_MB`, default 2048): the mutant
+takes the runner itself. So each worker's data segment is capped (`MUTANTS_MEM_LIMIT_MB`, default 3072: the cap is on the virtual data segment, where glibc reserves an arena per thread): the mutant
 dies with MemoryError, which is a detection, and the run goes on.
 
 So each process gets a base temp of its own, and Airflow's ORM is pointed at `apr-mutmut-<pid>.db` once the session
@@ -32,12 +32,14 @@ from pathlib import Path
 import pytest
 
 _OWNED: list[Path] = []
+_MUTATED_ROOT: list[str] = []
+_BASE_PYTHONPATH = os.environ.get("PYTHONPATH", "")
 
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_configure(config: pytest.Config) -> None:
     """Before the tmp_path factory exists: a base temp directory and a memory cap of this process."""
-    cap = int(os.environ.get("MUTANTS_MEM_LIMIT_MB", "2048")) << 20
+    cap = int(os.environ.get("MUTANTS_MEM_LIMIT_MB", "3072")) << 20
     _, hard = resource.getrlimit(resource.RLIMIT_DATA)
     resource.setrlimit(resource.RLIMIT_DATA, (cap if hard == resource.RLIM_INFINITY else min(cap, hard), hard))
     base = Path(tempfile.gettempdir()) / f"apr-mutmut-{os.getpid()}"
@@ -47,7 +49,14 @@ def pytest_configure(config: pytest.Config) -> None:
 
 
 def pytest_collection_finish(session: pytest.Session) -> None:
-    """Before any fixture runs: this process's own metadata database."""
+    """Before any fixture runs: this process's own metadata database, and the mutated package for child Pythons."""
+    # tests/test_retry.py and tests/test_process_io.py run the operator in a child Python (a task process the test
+    # kills). That child imported the package installed in the environment, the unmutated source, so the guards those
+    # tests exist for (PR_SET_PDEATHSIG, the lock passed to rivet, stop-before-step, on_kill) were never mutation
+    # tested. The child inherits MUTANT_UNDER_TEST; with the mutated tree first on its path it runs the mutant too.
+    import airflow_provider_rivet
+
+    _MUTATED_ROOT.append(str(Path(airflow_provider_rivet.__file__).resolve().parents[1]))
     if not os.environ.get("AIRFLOW_HOME"):
         return  # the suite's conftest sets it before Airflow is imported; nothing to isolate without it
     db = Path(tempfile.gettempdir()) / f"apr-mutmut-{os.getpid()}.db"
@@ -66,6 +75,37 @@ def pytest_collection_finish(session: pytest.Session) -> None:
     settings.SQL_ALCHEMY_CONN = conn
     settings.SQL_ALCHEMY_CONN_ASYNC = settings._get_async_conn_uri_from_sync(sync_uri=conn)
     settings.configure_orm()
+
+
+# The test modules that run the operator in a child Python (above). mutmut picks the tests of a mutant from the
+# functions each test called in its stats run, and a child's calls are not seen there: without this, the stop / kill
+# / lock tests of these modules were never chosen for the mutants of the code they exist for (`_run_with_secrets`'s
+# Stopped and Busy arms, `Running.wait`, `Stopped`). In the stats run, a test of these modules counts as calling
+# every function of the package; that over-selects (a few seconds per surviving mutant), never under-selects.
+CHILD_PYTHON_TESTS = ("test_retry.py::", "test_process_io.py::")
+
+
+def pytest_runtest_setup(item: pytest.Item) -> None:
+    """A child Python of a mutant's test imports the mutated tree; one of the stats run does not: there the trampoline
+    would record its calls through mutmut's config, which it cannot find from the child's working directory."""
+    parts = [*(_MUTATED_ROOT if os.environ.get("MUTANT_UNDER_TEST") != "stats" else []), _BASE_PYTHONPATH]
+    os.environ["PYTHONPATH"] = os.pathsep.join(p for p in parts if p)
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_call(item: pytest.Item):
+    yield
+    if os.environ.get("MUTANT_UNDER_TEST") != "stats" or not any(m in item.nodeid for m in CHILD_PYTHON_TESTS):
+        return
+    import sys
+
+    from mutmut.stats import record_trampoline_hit
+
+    for name, module in list(sys.modules.items()):
+        if name == "airflow_provider_rivet" or name.startswith("airflow_provider_rivet."):
+            for attr in vars(module):
+                if attr.startswith("mutants_") and attr.endswith("__mutmut"):
+                    record_trampoline_hit(f"{name}.{attr[len('mutants_') : -len('__mutmut')]}")
 
 
 def pytest_unconfigure(config: pytest.Config) -> None:
