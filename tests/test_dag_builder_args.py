@@ -11,6 +11,8 @@ from typing import Any
 import pytest
 
 from airflow_provider_rivet.dags import build_batch_dag, build_cdc_dag, read_plan_layout, task_name
+from airflow_provider_rivet.invocation import plan_layout
+from airflow_provider_rivet.operators import CLOUD_ENV, RivetApplyOperator, RivetLoadOperator, RivetRunOperator
 
 
 @pytest.fixture
@@ -140,3 +142,112 @@ def test_the_watcher_takes_the_dags_default_args_except_retries_and_the_failure_
         watcher = dag.get_task("watcher")
         assert (watcher.owner, watcher.queue, watcher.retries) == ("data-team", "rivet", 0)
         assert not watcher.on_failure_callback
+
+
+# ---- what a builder reads and builds with: the plan layout and an operator's arguments ----
+# The builders call these, so the PR mutation gate grades them with this file: invocation.x_plan_layout__mutmut_*
+# and operators.xǁRivetBaseOperatorǁ__init____mutmut_*.
+
+
+def one_export_plan(**rec: Any) -> dict:
+    """`rivet plan --format json` for one planned export: its bare object, no campaign (D10)."""
+    return {"export_name": "a", "prioritization": {"export_recommendation": {"recommended_wave": 2, **rec}}}
+
+
+@pytest.mark.parametrize(
+    ("plan", "layout"),
+    [
+        (one_export_plan(export_name="a", cost_class="low"), [{"wave": 2, "exports": ["a"], "heavy": []}]),
+        (one_export_plan(export_name="a", cost_class="high"), [{"wave": 2, "exports": ["a"], "heavy": ["a"]}]),
+        (
+            [{"prioritization": {"campaign": {"waves": [{"wave": 1, "exports": ["x", "y"]}, {"wave": 0, "exports": []}]}}}],
+            [{"wave": 1, "exports": ["x", "y"], "heavy": ["x", "y"]}],
+        ),
+    ],
+)
+def test_the_plan_layout_of_one_export_or_a_campaign_without_costs(plan: Any, layout: list) -> None:
+    """One export's wave and cost come from its own recommendation; a campaign with no costs makes every export heavy."""
+    assert plan_layout(plan) == layout
+
+
+@pytest.mark.parametrize(
+    ("plan", "message"),
+    [
+        (one_export_plan(export_name="b"), "the plan's recommendation names another export"),
+        ({**one_export_plan(), "export_name": 5}, "the plan's recommendation names another export"),
+        ([{"prioritization": {"campaign": {"waves": [{"wave": 1, "exports": []}]}}}], "the plan has no wave with an export"),
+    ],
+)
+def test_a_plan_that_is_no_layout_says_why(plan: Any, message: str) -> None:
+    with pytest.raises(ValueError) as caught:
+        plan_layout(plan)
+    assert str(caught.value) == message
+
+
+def test_a_recommendation_without_its_export_name_is_no_plan_layout(tmp_path: Path) -> None:
+    """The refusal names the error type: a recommendation that names no export is not read as naming this one."""
+    path = tmp_path / "one.plan.json"
+    path.write_text(json.dumps(one_export_plan(cost_class="low")))
+    with pytest.raises(RuntimeError, match=r"output \(KeyError\);"):
+        read_plan_layout(str(path))
+
+
+def test_an_operators_defaults_are_the_documented_ones() -> None:
+    op = RivetRunOperator(task_id="t", config="c.yaml", export="e")
+    assert (op.rivet_bin, op.deployment, op.lock_wait, op.crashed_retries, op.stream_stderr, op.log_keep) == (
+        "rivet",
+        "auto",
+        600,
+        1,
+        False,
+        10,
+    )
+    assert (op.env, op.env_from_connections, op.extra_args, op.stderr_dir, op.cwd) == (None, None, None, None, None)
+    assert (op.env_passthrough, op.cloud_credentials, op.connections) == ((), (), ())
+
+
+def test_an_operators_arguments_are_kept_as_given() -> None:
+    op = RivetRunOperator(
+        task_id="t",
+        config="c.yaml",
+        export="e",
+        rivet_bin="/opt/rivet",
+        env={"A": "1"},
+        env_from_connections={"B": "c"},
+        env_passthrough=["P"],
+        cloud_credentials=sorted(CLOUD_ENV)[:1],
+        connections=["conn"],
+        deployment="pod",
+        extra_args=["-p", "X=1"],
+        lock_wait=5,
+        crashed_retries=3,
+        stderr_dir="/e",
+        stream_stderr=True,
+        log_keep=None,
+        cwd="/w",
+    )
+    assert (op.rivet_bin, op.env, op.env_from_connections, op.env_passthrough) == ("/opt/rivet", {"A": "1"}, {"B": "c"}, ("P",))
+    assert (op.cloud_credentials, op.connections, op.deployment, op.extra_args) == (
+        tuple(sorted(CLOUD_ENV)[:1]),
+        ("conn",),
+        "pod",
+        ["-p", "X=1"],
+    )
+    assert (op.lock_wait, op.crashed_retries, op.stderr_dir, op.stream_stderr, op.log_keep, op.cwd) == (
+        5,
+        3,
+        "/e",
+        True,
+        None,
+        "/w",
+    )
+
+
+def test_an_operator_refuses_a_missing_export_or_an_unknown_cloud_by_name() -> None:
+    with pytest.raises(ValueError) as caught:
+        RivetApplyOperator(task_id="t", config="c.yaml")
+    assert str(caught.value) == "RivetApplyOperator needs `export`"
+    assert RivetLoadOperator(task_id="t2", config="c.yaml").export is None
+    with pytest.raises(ValueError) as caught:
+        RivetRunOperator(task_id="t", config="c.yaml", cloud_credentials=["nope", "also"])
+    assert str(caught.value) == f"cloud_credentials names {sorted(CLOUD_ENV)}, got ['also', 'nope']"

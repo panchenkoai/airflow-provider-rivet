@@ -54,6 +54,9 @@ class RivetBaseOperator(BaseOperator):
 
     command = ""
     needs_export = False
+    # Airflow asked this task to stop (`on_kill` sets it on the instance). A class default, not an `__init__`
+    # assignment: a mutant `= None` there reads exactly as False, so no test could tell it apart.
+    _stop_requested = False
     template_fields: Sequence[str] = (
         "config",
         "export",
@@ -115,7 +118,6 @@ class RivetBaseOperator(BaseOperator):
         self.log_keep = log_keep
         self.cwd = cwd
         self._proc: Any = None
-        self._stop_requested = False
         self._tasklog: TaskLog | None = None
 
     def _environment(self, secrets: Path) -> dict[str, str]:
