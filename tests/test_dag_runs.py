@@ -236,3 +236,54 @@ def test_no_password_reaches_the_metadata_database_the_logs_or_an_exception(
         assert scan(batch.state_dir / "logs", secret), "the fake did print it to its stderr file"
     assert scan(batch.home, str(batch.state_dir).encode()), "the scan sees the rendered fields: state_dir is in them"
     assert "rivet.result" in text, "the scan sees the task's log records"
+
+
+MAPPED_SLACK_DAG = """\
+import os, sys, types
+from airflow_provider_rivet._compat import DAG
+from airflow_provider_rivet.callbacks import slack_failure_callback
+from airflow_provider_rivet.operators import RivetRunOperator
+
+class Hook:
+    def __init__(self, slack_webhook_conn_id, **kwargs):
+        pass
+    def send(self, text):
+        with open({sent!r}, "a") as out:
+            out.write(text + "\\n---\\n")
+
+module = types.ModuleType("airflow.providers.slack.hooks.slack_webhook")
+module.SlackWebhookHook = Hook
+sys.modules["airflow.providers.slack.hooks.slack_webhook"] = module
+with DAG({dag_id!r}, schedule=None, start_date=__import__("datetime").datetime(2026, 1, 1)) as dag:
+    RivetRunOperator.partial(
+        task_id="run", config={config!r}, state_dir={state_dir!r}, rivet_bin={rivet_bin!r}, deployment="local",
+        env={{"RIVET_PG_URL": os.environ["RIVET_PG_URL"]}}, retries=0, on_failure_callback=slack_failure_callback(),
+    ).expand(export=["a", "b"])
+"""
+
+
+def test_d11_the_slack_alert_of_a_mapped_rivet_task_names_the_code_of_its_own_index(batch: DagRig) -> None:
+    """D11: the callback pulled the XCom without `map_indexes`, got every index's payload as a list, and dropped the code.
+
+    Both indexes fail with their own code, so whichever runs second meets two payloads whatever order `dag.test()` picks.
+    """
+    other = {"exit": 5, "line": {"error": "refused", "exit_class": 5, "code": "RIVET_CONFIG_CURSOR_COLUMN_CASE"}}
+    batch.scenario(**{"run:a": other, "run:b": REFUSED})
+    sent = batch.tmp / "slack.txt"
+    source = MAPPED_SLACK_DAG.format(
+        sent=str(sent),
+        dag_id="mapped_alert",
+        config=str(batch.config),
+        state_dir=str(batch.state_dir),
+        rivet_bin=str(batch.bin / "rivet"),
+    )
+    state, tasks = batch.run_source("mapped_alert", source)
+    assert (tasks["run[0]"], tasks["run[1]"], state) == (FAILED, FAILED, FAILED), tasks
+    texts = sorted(t for t in sent.read_text().split("\n---\n") if t.strip())
+    assert len(texts) == 2, texts
+    for text in texts:
+        assert "no rivet result was published" not in text, text
+        assert text.count("•") == 1, text
+    assert "*a*: `RIVET_CONFIG_CURSOR_COLUMN_CASE`" in "".join(texts) and "*b*: `RIVET_SOURCE_CDC_LOG_GAP`" in "".join(texts), (
+        texts
+    )
