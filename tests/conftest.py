@@ -209,8 +209,8 @@ class DagRig(Rig):
         op = {"rivet_bin": str(self.bin / "rivet"), "deployment": "local"}
         kwargs["operator_kwargs"] = {**op, **kwargs.get("operator_kwargs", {})}
         env = env or {"RIVET_PG_URL": SECRET}
-        path = self.home / "dags" / f"{dag_id}.py"
-        path.write_text(
+        return self.run_source(
+            dag_id,
             "import os\n"
             f"from airflow_provider_rivet.dags import {builder}\n"
             f"kwargs = {kwargs!r}\n"
@@ -219,8 +219,15 @@ class DagRig(Rig):
             f"    with open({str(failures_to)!r}, 'a') as log:\n"
             "        log.write(context['ti'].task_id + '\\n')\n"
             + ("kwargs['default_args']['on_failure_callback'] = record\n" if failures_to else "")
-            + f"dag = {builder}({dag_id!r}, **kwargs)\n"
+            + f"dag = {builder}({dag_id!r}, **kwargs)\n",
+            env,
         )
+
+    def run_source(self, dag_id: str, source: str, env: dict | None = None) -> tuple[str, dict[str, str]]:
+        """Write a DAG file whose module defines `dag`, run it; (run state, state by task id, `[i]` added when mapped)."""
+        env = env or {"RIVET_PG_URL": SECRET}
+        path = self.home / "dags" / f"{dag_id}.py"
+        path.write_text(source)
         before = {name: os.environ.get(name) for name in env}
         os.environ.update(env)
         try:
@@ -228,7 +235,12 @@ class DagRig(Rig):
             module = importlib.util.module_from_spec(spec)
             spec.loader.exec_module(module)
             run = module.dag.test()
-            states = {ti.task_id: str(getattr(ti.state, "value", ti.state)) for ti in run.get_task_instances()}
+            states = {
+                ti.task_id + ("" if ti.map_index in (-1, None) else f"[{ti.map_index}]"): str(
+                    getattr(ti.state, "value", ti.state)
+                )
+                for ti in run.get_task_instances()
+            }
             return str(getattr(run.state, "value", run.state)), states
         finally:
             path.unlink()

@@ -6,11 +6,8 @@ import json
 import logging
 from pathlib import Path
 
-import airflow
 import pytest
 from conftest import NEW_FLAGS, SECRET, DagRig
-
-AIRFLOW_MAJOR = int(airflow.__version__.split(".")[0])
 
 REFUSED = {"exit": 5, "line": {"error": "refused: row 4111-1111", "exit_class": 5, "code": "RIVET_SOURCE_CDC_LOG_GAP"}}
 BATCH_CONFIG = """\
@@ -187,7 +184,6 @@ def test_a_failure_callback_from_default_args_fires_for_the_failed_task_and_not_
 NON_ASCII = ("\u0437\u0430\u043a\u0430\u0437\u044b", "\u043a\u043b\u0438\u0435\u043d\u0442\u044b")
 
 
-@pytest.mark.skipif(AIRFLOW_MAJOR >= 3, reason="Airflow 3 dag.test() cannot run a non-ASCII task id (latin-1 in its API client)")
 def test_two_non_ascii_exports_of_one_dag_are_each_planned_and_extracted(dag_rig: DagRig) -> None:
     exports = "".join(f"  - {{name: {json.dumps(n)}, query: SELECT 1, mode: full}}\n" for n in NON_ASCII)
     dag_rig.config.write_text(f"source:\n  type: postgres\n  url_env: RIVET_PG_URL\nexports:\n{exports}")
@@ -236,3 +232,87 @@ def test_no_password_reaches_the_metadata_database_the_logs_or_an_exception(
         assert scan(batch.state_dir / "logs", secret), "the fake did print it to its stderr file"
     assert scan(batch.home, str(batch.state_dir).encode()), "the scan sees the rendered fields: state_dir is in them"
     assert "rivet.result" in text, "the scan sees the task's log records"
+
+
+MAPPED_SLACK_DAG = """\
+import os, sys, types
+from airflow_provider_rivet._compat import DAG
+from airflow_provider_rivet.callbacks import slack_failure_callback
+from airflow_provider_rivet.operators import RivetRunOperator
+
+class Hook:
+    def __init__(self, slack_webhook_conn_id, **kwargs):
+        pass
+    def send(self, text):
+        with open({sent!r}, "a") as out:
+            out.write(text + "\\n---\\n")
+
+module = types.ModuleType("airflow.providers.slack.hooks.slack_webhook")
+module.SlackWebhookHook = Hook
+sys.modules["airflow.providers.slack.hooks.slack_webhook"] = module
+with DAG({dag_id!r}, schedule=None, start_date=__import__("datetime").datetime(2026, 1, 1)) as dag:
+    RivetRunOperator.partial(
+        task_id="run", config={config!r}, state_dir={state_dir!r}, rivet_bin={rivet_bin!r}, deployment="local",
+        env={{"RIVET_PG_URL": os.environ["RIVET_PG_URL"]}}, retries=0, on_failure_callback=slack_failure_callback(),
+    ).expand(export=["a", "b"])
+"""
+
+
+def test_d11_the_slack_alert_of_a_mapped_rivet_task_names_the_code_of_its_own_index(batch: DagRig) -> None:
+    """D11: the callback pulled the XCom without `map_indexes`, got every index's payload as a list, and dropped the code.
+
+    Both indexes fail with their own code, so whichever runs second meets two payloads whatever order `dag.test()` picks.
+    """
+    other = {"exit": 5, "line": {"error": "refused", "exit_class": 5, "code": "RIVET_CONFIG_CURSOR_COLUMN_CASE"}}
+    batch.scenario(**{"run:a": other, "run:b": REFUSED})
+    sent = batch.tmp / "slack.txt"
+    source = MAPPED_SLACK_DAG.format(
+        sent=str(sent),
+        dag_id="mapped_alert",
+        config=str(batch.config),
+        state_dir=str(batch.state_dir),
+        rivet_bin=str(batch.bin / "rivet"),
+    )
+    state, tasks = batch.run_source("mapped_alert", source)
+    assert (tasks["run[0]"], tasks["run[1]"], state) == (FAILED, FAILED, FAILED), tasks
+    texts = sorted(t for t in sent.read_text().split("\n---\n") if t.strip())
+    assert len(texts) == 2, texts
+    for text in texts:
+        assert "no rivet result was published" not in text, text
+        assert text.count("•") == 1, text
+    assert "*a*: `RIVET_CONFIG_CURSOR_COLUMN_CASE`" in "".join(texts) and "*b*: `RIVET_SOURCE_CDC_LOG_GAP`" in "".join(texts), (
+        texts
+    )
+
+
+def test_d24_a_refused_cdc_drain_blocks_load_and_compact_under_a_default_args_trigger_rule(cdc: DagRig) -> None:
+    """D24: with `trigger_rule="all_done"` in default_args, load and compact ran after a refused drain."""
+    cdc.scenario(run=REFUSED)
+    args = {"retries": 0, "trigger_rule": "all_done"}
+    state, tasks = cdc.run_dag("build_cdc_dag", "cdc_all_done", export="orders_cdc", tables=["orders"], default_args=args)
+    assert [c[0] for c in cdc.ran()] == ["run"], "no load and no compaction follows a refused drain"
+    assert (tasks["run"], tasks["load.orders"], tasks["compact.orders"], state) == (FAILED, BLOCKED, BLOCKED, FAILED), tasks
+
+
+DAY_NAMES = ("daily orders", "orders:v2")
+
+
+def test_d29_exports_whose_names_are_no_task_ids_run_and_load_under_their_real_names(dag_rig: DagRig) -> None:
+    """D29: `daily orders` and `orders:v2` broke the DAG import; now they get sanitised task ids and rivet sees the names."""
+    exports = "".join(f"  - {{name: {json.dumps(n)}, query: SELECT 1, mode: full}}\n" for n in DAY_NAMES)
+    dag_rig.config.write_text(f"source:\n  type: postgres\n  url_env: RIVET_PG_URL\nexports:\n{exports}")
+    state, tasks = dag_rig.run_dag("build_batch_dag", "odd_names", exports=list(DAY_NAMES), extract="run")
+    assert state == OK and tasks.pop("watcher") == SKIPPED and set(tasks.values()) == {OK} and len(tasks) == 4, tasks
+    assert sorted(dag_rig.ran()) == sorted((step, n) for n in DAY_NAMES for step in ("run", "load")), dag_rig.ran()
+
+
+def test_d29_a_cyrillic_export_gets_an_ascii_task_id_and_runs_under_its_real_name(dag_rig: DagRig) -> None:
+    """D29: a non-ASCII export name was its own task id, which Airflow 3's `dag.test()` cannot run; the id is now ASCII."""
+    name = "заказы"
+    dag_rig.config.write_text(
+        f"source:\n  type: postgres\n  url_env: RIVET_PG_URL\nexports:\n  - {{name: {name}, query: SELECT 1, mode: full}}\n"
+    )
+    state, tasks = dag_rig.run_dag("build_batch_dag", "cyrillic_export", exports=[name], extract="run")
+    assert all(t.isascii() for t in tasks), tasks
+    assert state == OK and tasks.pop("watcher") == SKIPPED and set(tasks.values()) == {OK} and len(tasks) == 2, tasks
+    assert sorted(dag_rig.ran()) == [("load", name), ("run", name)], dag_rig.ran()

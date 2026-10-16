@@ -67,6 +67,17 @@ Changed before the first release, after review (see the README sections named):
   a callback in `default_args` fires once per failed task.
 - `connection_url`: a password without a login, IPv6 hosts, Oracle `service_name`, an encoded
   database name. The version has one source, `airflow_provider_rivet/__init__.py`.
+- `slack_failure_callback` on a mapped task reports its own index's code and class; it said "no
+  rivet result was published" because the XCom pull returned every index's payload.
+- DAG builders: every rivet task is `all_success` whatever `default_args` says, and a
+  `trigger_rule` in `operator_kwargs` is refused (with `all_done`, load and compact ran after a
+  refused drain); user `default_args` are merged over the builders' `retries=2`; a bare string
+  for `exports`, `compact_exports` or `tables` is refused; a name that is no ASCII task id
+  (`daily orders`, `orders:v2`, `заказы`) gets a sanitised task id with a hash and keeps its real name;
+  in a wave, each heavy export runs alone and the cheap ones after them, like `rivet apply`.
+  ("DAG builders")
+- On Airflow 3 the exceptions are imported from `airflow.sdk.exceptions`, not the deprecated
+  `airflow.exceptions`.
 - A clear of a finished `RivetApplyOperator` plans again instead of replaying a sealed plan whose
   cursor the successful apply already moved (rivet refused it `RIVET_PLAN_ARTIFACT_STALE` on
   every clear for 24 h): the artifact is named by the try series (`max_tries`). (D04)

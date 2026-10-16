@@ -155,10 +155,18 @@ plan ──> apply: [a] [b] ─> wave_2_done ─> [big] ─> after_big ─> [hug
 - Three TaskGroups, `apply`, `load`, `compact`. They are the picture; **dependencies run per
   table**: `apply.X >> load.X >> compact.X`, all `all_success`. A failed `apply.a` leaves
   `apply.b`, `load.b` and every later wave runnable; it blocks `load.a` and `compact.a`.
-- Waves come from the plan file, as in the recipe: cheap exports of a wave run in parallel,
-  the others one at a time, and wave N+1 starts after wave N. Ordering goes through tasks that
+- Waves come from the plan file, as in the recipe, and each wave is ordered the way `rivet apply`'s
+  cost gate orders it: every heavy export alone, one after another, then the cheap exports of the
+  wave together; wave N+1 starts after wave N. Ordering goes through tasks that
   do nothing, `apply.wave_<n>_done` and `apply.after_<export>`, with `trigger_rule="all_done"`:
   the next export waits for the earlier one to *finish*, not to succeed.
+- Every rivet task is `trigger_rule="all_success"` whatever `default_args` says; a `trigger_rule`
+  in `operator_kwargs` is refused. `default_args` you pass are merged over the builders'
+  (`retries=2`, `retry_delay` 5 minutes), so adding a callback keeps the retries.
+- `exports`, `compact_exports` and `tables` are lists; a bare string is refused. A name that is
+  not an ASCII task id (`daily orders`, `orders:v2`, `заказы`) gets a task id with each character
+  outside `[A-Za-z0-9_.-]` replaced by `_` and an 8-character hash of the name (`apply.daily_orders_<hash>`); rivet still
+  receives the real name.
 - `plan` is a direct upstream of every `apply` task: a failed plan refresh blocks the whole
   run (`upstream_failed`), because a run that could not plan has nothing it should extract.
 - **A run with a failed task is a failed run.** Airflow colours a run by its leaf tasks, and an
