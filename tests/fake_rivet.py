@@ -163,6 +163,15 @@ def canonical(path):
     return out
 
 
+def descriptor(fd):
+    """(st_dev, st_ino) of an open descriptor, or None when it is not open."""
+    try:
+        info = os.fstat(fd)
+    except OSError:
+        return None
+    return info.st_dev, info.st_ino
+
+
 def main():
     """Answer `--version` / `--help`, or replay the scenario for the subcommand."""
     spec = json.loads((HERE / "scenario.json").read_text())
@@ -190,6 +199,9 @@ def main():
     seen = {k: os.environ.get(k) for k in spec.get("record_env", [])}
     call = {"argv": argv, "env": seen, "env_keys": sorted(os.environ), "cwd": os.getcwd(), "sql": sql, "export": export}
     call["config"] = doc if spec.get("record_config") and not unreadable else None
+    if spec.get("record_fds"):
+        # opt-in: the descriptors this process was started with, as [fd, st_dev, st_ino]; fd 0 is its stdin
+        call["fds"] = [[fd, *descriptor(fd)] for fd in range(256) if fd not in (1, 2) and descriptor(fd)]
     with open(HERE / "calls.jsonl", "a") as log:
         log.write(json.dumps(call) + "\n")
     if refusal:
