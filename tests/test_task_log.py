@@ -106,11 +106,12 @@ def test_golden_apply_success_with_counts(rig: Rig, log: Recorder) -> None:
 def test_golden_apply_success_on_a_degraded_binary(rig: Rig, log: Recorder) -> None:
     """The owner's case: rivet 0.31.0 (no apply summary, no --lock-wait, no --no-notify) and SQLite state. The missing
     flags are one note, not a `degraded: [...]` dump that reads like a fault; counts come from `rivet metrics`."""
-    rig.scenario(metrics={"rows": [{"export_name": "users", "run_id": "users_1", "total_rows": 30, "files_produced": 1}]})
+    rig.scenario(apply={"summary": {"per_export": [{"export_name": "users", "rows": 30, "files": 1}]}})
     payload, _ = rig.run(rig.operator(RivetApplyOperator, export="users"))
+    run_id = payload["units"][0]["run_id"]
     assert payload["degraded"] == ["apply_summary", "lock_wait", "no_notify", "state_url_sqlite"]
     assert log.shown() == [
-        "INFO rivet apply users → OK: 30 rows, 1 file in 7.0 s (run users_1)",
+        f"INFO rivet apply users → OK: 30 rows, 1 file in 7.0 s (run {run_id})",
         "INFO   plan     sealed, strategy incremental in 1.0 s",
         "INFO   apply    done in 1.0 s",
         "INFO   metrics  read the run's counts from rivet's state in 1.0 s",
@@ -153,11 +154,11 @@ def test_golden_cdc_max_events_is_a_note(rig: Rig, log: Recorder) -> None:
 
 def test_golden_skipped_nothing_to_do(rig: Rig, log: Recorder) -> None:
     """A `skip_empty` apply that delivered nothing: SKIPPED with rivet's reason, not OK with zero rows."""
-    rows = [{"export_name": "users", "run_id": "users_2", "status": "skipped", "skip_reason": "empty", "total_rows": 0}]
-    rig.scenario(metrics={"rows": rows})
+    rig.scenario(apply={"metric": {"status": "skipped", "skip_reason": "empty"}})
     payload, _ = rig.run(rig.operator(RivetApplyOperator, export="users"))
     assert payload["units"][0]["status"] == "skipped"
-    assert log.shown()[0] == "INFO rivet apply users → SKIPPED: nothing to do (empty) in 7.0 s (run users_2)"
+    run_id = payload["units"][0]["run_id"]
+    assert log.shown()[0] == f"INFO rivet apply users → SKIPPED: nothing to do (empty) in 7.0 s (run {run_id})"
 
 
 def test_golden_compact_skipped_is_an_airflow_skip_with_the_same_headline(rig: Rig, log: Recorder) -> None:

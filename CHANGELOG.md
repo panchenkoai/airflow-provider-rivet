@@ -148,6 +148,8 @@ is now the one place rivet's environment is assembled; README "Storage and wareh
   is bracketed, with its zone encoded as `%25` (D23).
 - A ClickHouse Connection without a host is refused (`RIVET_AIRFLOW_CONNECTION_INCOMPLETE`)
   instead of becoming `http://None`. (D22)
+- On a binary without `apply --summary-output`, an apply's counts come from its own run (rivet's run id with this
+  apply's pid), not the export's newest `rivet metrics` row, which may be another process's run.
 - A load/compact of a config whose export item ends in an alias (`destination: *s3`) narrows the config
   instead of refusing it `RIVET_AIRFLOW_CONFIG_NARROW_UNSAFE` ("shares its last line with other text").
 - A rivet child whose task process died before the parent-death signal took effect stops itself with SIGKILL;
