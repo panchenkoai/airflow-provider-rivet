@@ -160,11 +160,7 @@ class Outcome:
     @property
     def decision(self) -> str:
         """`success`, `retry` (transient budget), `retry_crashed` (its own budget) or `fail`."""
-        if self.error is None:
-            return "success"
-        if self.error.class_ == "crashed":
-            return "retry_crashed"
-        return "retry" if self.error.retryable else "fail"
+        return decision_of(self.error)
 
     def to_xcom(self) -> dict[str, Any]:
         """The XCom payload: units without `message`, never an environment value."""
@@ -181,6 +177,15 @@ class Outcome:
             "state_marker": self.marker,
             "rivet_version": self.rivet_version,
         }
+
+
+def decision_of(error: ErrorObject | None) -> str:
+    """`Outcome.decision`'s body, outside the property so mutation testing reaches it."""
+    if error is None:
+        return "success"
+    if error.class_ == "crashed":
+        return "retry_crashed"
+    return "retry" if error.retryable else "fail"
 
 
 @dataclass
@@ -647,8 +652,13 @@ def _copy_query_files(config: Mapping[str, Any], source: Path, folder: Path, tou
 
 @functools.cache
 def _prctl() -> Any:
-    """libc's `prctl` on Linux, else `None`."""
-    if not sys.platform.startswith("linux"):
+    """libc's `prctl` on Linux, else `None`; looked up once (`_find_prctl`)."""
+    return _find_prctl(sys.platform)
+
+
+def _find_prctl(platform: str) -> Any:
+    """`_prctl`'s body, outside the cache so mutation testing reaches it."""
+    if not platform.startswith("linux"):
         return None
     try:
         return ctypes.CDLL(None, use_errno=True).prctl
@@ -698,35 +708,66 @@ def _export_lock(s: _Session) -> Iterator[None]:
 
     Every rivet step inherits the descriptor (`step`), so a rivet that outlives the task keeps the lock and a retry
     cannot start a second one beside it. The lock is released by an explicit unlock once the steps have ended: a copy
-    of the descriptor in any other process would keep a lock released by close alone held."""
+    of the descriptor in any other process would keep a lock released by close alone held. The bodies are the plain
+    functions below, so mutation testing reaches them."""
+    fd = _take_export_lock(s)
+    try:
+        yield
+    finally:
+        _release_export_lock(s, fd)
+
+
+def _take_export_lock(s: _Session) -> int | None:
+    """Open and lock the export's lock file, polling every LOCK_POLL seconds for up to `lock_wait`; its descriptor, set
+    as `s.lock_fd`, or `None` where nothing is locked (`_lock_path`). Raises `Busy` or `Stopped` with nothing held.
+
+    Each poll that finds the lock held first asks whether the task was stopped; the first one logs the wait."""
     found = _lock_path(s)
     if found is None:
-        yield
-        return
+        return None
     path, unit = found
     fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
     try:
         deadline = time.monotonic() + max(0, s.req.lock_wait)
-        waiting = False
-        while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                if s.stopped is not None and s.stopped():
-                    raise Stopped(s.req.command) from None
-                if not waiting:
-                    waiting = True
-                    s.emit({"event": "rivet.lock.wait", "lock": str(path), "unit": unit, "lock_wait": s.req.lock_wait})
-                if time.monotonic() >= deadline:
-                    raise Busy(path, unit, s.req.lock_wait) from None
+        if not _try_flock(fd):
+            _stop_check(s)
+            s.emit({"event": "rivet.lock.wait", "lock": str(path), "unit": unit, "lock_wait": s.req.lock_wait})
+            while time.monotonic() < deadline:
                 time.sleep(LOCK_POLL)
-        s.lock_fd = fd
-        try:
-            yield
-        finally:
-            s.lock_fd = None
-            fcntl.flock(fd, fcntl.LOCK_UN)
+                if _try_flock(fd):
+                    break
+                _stop_check(s)
+            else:
+                raise Busy(path, unit, s.req.lock_wait)
+    except BaseException:
+        os.close(fd)
+        raise
+    s.lock_fd = fd
+    return fd
+
+
+def _try_flock(fd: int) -> bool:
+    """One non-blocking try of the exclusive lock: True when this descriptor now holds it."""
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        return False
+    return True
+
+
+def _stop_check(s: _Session) -> None:
+    """Raise `Stopped` when Airflow asked the task to stop while it waits for the lock."""
+    if s.stopped is not None and s.stopped():
+        raise Stopped(s.req.command)
+
+
+def _release_export_lock(s: _Session, fd: int | None) -> None:
+    """Unlock explicitly, then close: the descriptor `_take_export_lock` returned; nothing for `None`."""
+    if fd is None:
+        return
+    try:
+        s.lock_fd = None
+        fcntl.flock(fd, fcntl.LOCK_UN)
     finally:
         os.close(fd)
 
