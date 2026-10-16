@@ -148,6 +148,8 @@ is now the one place rivet's environment is assembled; README "Storage and wareh
   is bracketed, with its zone encoded as `%25` (D23).
 - A ClickHouse Connection without a host is refused (`RIVET_AIRFLOW_CONNECTION_INCOMPLETE`)
   instead of becoming `http://None`. (D22)
+- A database Connection without a host is refused (`RIVET_AIRFLOW_CONNECTION_INCOMPLETE`) like a ClickHouse one;
+  it became `postgresql://u:p@/d` and the driver dialled its default socket or host. One check, in `url_host`.
 - README: an Azure config reads `account_name: ${AZURE_STORAGE_ACCOUNT}`. (D32)
 - A Connection id no backend defines (`env_from_connections`, `connections`) is refused,
   `RIVET_AIRFLOW_CONNECTION_MISSING`, with the refusal in XCom; it was retried with no XCom.
