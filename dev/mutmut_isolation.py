@@ -76,6 +76,30 @@ def pytest_collection_finish(session: pytest.Session) -> None:
     settings.configure_orm()
 
 
+# The test modules that run the operator in a child Python (above). mutmut picks the tests of a mutant from the
+# functions each test called in its stats run, and a child's calls are not seen there: without this, the stop / kill
+# / lock tests of these modules were never chosen for the mutants of the code they exist for (`_run_with_secrets`'s
+# Stopped and Busy arms, `Running.wait`, `Stopped`). In the stats run, a test of these modules counts as calling
+# every function of the package; that over-selects (a few seconds per surviving mutant), never under-selects.
+CHILD_PYTHON_TESTS = ("test_retry.py::", "test_process_io.py::")
+
+
+@pytest.hookimpl(hookwrapper=True)
+def pytest_runtest_call(item: pytest.Item):
+    yield
+    if os.environ.get("MUTANT_UNDER_TEST") != "stats" or not any(m in item.nodeid for m in CHILD_PYTHON_TESTS):
+        return
+    import sys
+
+    from mutmut.stats import record_trampoline_hit
+
+    for name, module in list(sys.modules.items()):
+        if name == "airflow_provider_rivet" or name.startswith("airflow_provider_rivet."):
+            for attr in vars(module):
+                if attr.startswith("mutants_") and attr.endswith("__mutmut"):
+                    record_trampoline_hit(f"{name}.{attr[len('mutants_') : -len('__mutmut')]}")
+
+
 def pytest_unconfigure(config: pytest.Config) -> None:
     """A worker leaves nothing behind."""
     for path in _OWNED:
