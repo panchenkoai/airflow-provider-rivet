@@ -54,7 +54,7 @@ so the "rivet >=" column is the first release that carries that section.
 | `error_object` | `class`, `retryable`, `kind`, `action` on the `--json-errors` line | derives `class` and `retryable` from the printed line's integer `exit_class`; `kind` and `action` are null | D1/D2, rivet >= unreleased |
 | `per_unit_error` | `failures[]` and `per_export[].error` | when several units of one process failed, each carries the process-level object | D2/D3, rivet >= unreleased |
 | `stop_reason` | CDC `stop_reason` and `tables[]` | `stop_reason` is null: a `max_events` stop cannot be told from `caught_up` | D4, rivet >= unreleased |
-| `apply_summary` | `--summary-output` on `rivet apply` | reads run id and counts from `rivet metrics --json` after a successful apply | D3, rivet >= unreleased |
+| `apply_summary` | `--summary-output` on `rivet apply` | reads run id, counts, status and `skip_reason` (a `skip_empty` export that delivered nothing is `skipped`) from `rivet metrics --json` after a successful apply | D3, rivet >= unreleased |
 | `load_filter` | `--export` on `rivet load` / `rivet compact` | writes a single-export copy of the config and loads that | D3, rivet >= unreleased |
 | `load_table_filter` | `--table` on `rivet load` / `rivet compact` | the per-table task handles every table of its export; tasks of one export are serialised by a file lock in the state directory | D3, rivet >= unreleased |
 | `load_result` | `--summary-output` on `rivet load` / `rivet compact` | status is `loaded` / `compacted` on exit 0 and `failed` otherwise; `skipped`, `table` and row counts are unknown (null) | D3, rivet >= unreleased |
@@ -92,12 +92,12 @@ builds it, runs the process, reads the outputs and classifies.
 
 | Operator | Runs | Notes |
 |---|---|---|
-| `RivetApplyOperator` | `rivet plan -e X --format json -o <artifact>` then `rivet apply <artifact>` | a retry replays the same sealed artifact while it is unexpired |
+| `RivetApplyOperator` | `rivet plan -e X --format json -o <artifact>` then `rivet apply <artifact>` | a retry replays the same sealed artifact while it is unexpired; a clear plans again |
 | `RivetRunOperator` | `rivet run [-e X] --summary-output <file>` | the fallback when sealed apply is not wanted; also runs a whole config |
 | `RivetCdcRunOperator` | `rivet run -e X --summary-output <file>` for a `mode: cdc` export | one bounded drain; succeeds on `max_events`, reports it, never loops |
 | `RivetLoadOperator` | `rivet load` | per export, per table where the binary can narrow |
 | `RivetCompactOperator` | `rivet compact` | a compaction rivet reports as `skipped` becomes an Airflow skip |
-| `RivetPlanOperator` | `rivet plan --format json` | rewrites the plan layout file atomically, only when the output is a layout `build_batch_dag` can read (waves with exports); the file keeps its mode |
+| `RivetPlanOperator` | `rivet plan --format json` | rewrites the plan layout file atomically, only when the output is a layout `build_batch_dag` can read (waves with exports; one planned export, which rivet prints as a bare object with no campaign, is one wave from its `export_recommendation`); the file keeps its mode |
 
 ```python
 from airflow_provider_rivet.operators import RivetApplyOperator
@@ -298,7 +298,7 @@ SQLite state in `state_dir`.
      `.rivet_airflow_query_files.json`, which records the config directory each one came from.
    - a relative `cdc.checkpoint`, which resolves beside the copied config, that is, here.
    - `airflow/<dag_id>/`: sealed plan artifacts
-     (`plans/<run_id>/<export>__<task_id>__<inputs>-<hash>.json`), the crashed ledger, scratch
+     (`plans/<run_id>/<export>__<task_id>__s<max_tries>__<inputs>-<hash>.json`), the crashed ledger, scratch
      files; `airflow/locks/<export>.lock`.
    - `logs/<dag_id>/<task_id>-<hash>/`: rivet's stdout and stderr, one file per step and try.
    - **How a name becomes a path.** A DAG id, task id, run id or export name that is one lower-case
@@ -311,11 +311,14 @@ SQLite state in `state_dir`.
      therefore never share a directory, a sealed plan, a log file or a ledger, also on a file
      system that ignores case. A task's log folder always carries the hash, also for a plain
      task id, so it is never a folder an older layout wrote to.
-   - **One sealed plan per task, config and export.** The artifact's name is made from the
-     export, the task id (with the map index) and `<inputs>`: a digest of the config's absolute
+   - **One sealed plan per task, try series, config and export.** The artifact's name is made from the
+     export, the task id (with the map index), the try series (`s<max_tries>`; Airflow moves
+     `max_tries` when a task is cleared) and `<inputs>`: a digest of the config's absolute
      path, the config's bytes and the export's `query_file`. Two tasks of one DAG run never
      share a plan, also when they run two configs that both have an export of one name; a
-     retry of the same task replays its own plan; a config or query file edited between two
+     retry of the same task replays its own plan; a clear starts a new series and plans again,
+     so a clear after a successful apply never replays a cursor snapshot that apply already
+     moved past (rivet would refuse it `RIVET_PLAN_ARTIFACT_STALE`); a config or query file edited between two
      tries is planned again under a new name.
    - A retry replays its own plan only while the resolved config path and the config's bytes
      are unchanged. A config reached through a symlink that is re-pointed between two tries
@@ -328,7 +331,8 @@ SQLite state in `state_dir`.
    - The artifact records the export and the config it was planned from (`export_name`,
      `config_path`). `apply` refuses a plan object in which either is missing or is not the
      task's own (`RIVET_AIRFLOW_PLAN_ARTIFACT_FOREIGN`), expired or not, and leaves the file as
-     it is, so the retry is refused for the same reason until a person deletes it. The config
+     it is, so the retry is refused for the same reason until a person deletes it (or, once it has
+     expired and is 24 h old, the pruning below removes it). The config
      is compared as a file, not as text: another case, Unicode form or symlink of the same
      file is the task's own, and a recorded path that no longer exists is not. A file at
      that path that is not a JSON object (empty, cut short) is planned over.
@@ -417,8 +421,11 @@ SQLite state in `state_dir`.
 - **Retention.** When a task ends, the files of its newest `log_keep` tries (default 10, counted
   per task across runs) are kept and the older ones are removed. `log_keep=None` keeps
   everything. Only the task's own folder is looked at; a file of an older layout is never
-  removed (see "Upgrading a state directory"). Sealed plan artifacts and crashed ledgers under `airflow/<dag_id>/` are small and
-  are not pruned.
+  removed (see "Upgrading a state directory"). Under `airflow/<dag_id>/`, a sealed plan artifact
+  that has expired and was last written over 24 h ago is removed (with the `plans/<run_id>/`
+  folder it leaves empty), and so is a crashed ledger untouched for 24 h (a crash of that series
+  more than 24 h after its last one starts a fresh budget). A ledger that is not the ledger's JSON
+  is left for a person to delete.
 - `stream_stderr=True` copies stderr into the task log when each step ends. It is the one way
   raw stderr reaches the task log, and it is for debugging: it puts possibly data-bearing text
   into a store with wider access than the worker.
