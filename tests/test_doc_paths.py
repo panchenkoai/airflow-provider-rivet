@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import fnmatch
+import os
 import re
 import subprocess
 
@@ -21,6 +22,8 @@ def rivet_has(path: str) -> bool:
         ["git", "-C", str(RIVET_SRC), "ls-tree", "--name-only", "HEAD", f"{parent}/"],
         capture_output=True,
         text=True,
+        # A git hook (pre-push runs this suite) exports GIT_DIR and friends, which would point -C at this repo.
+        env={k: v for k, v in os.environ.items() if not k.startswith("GIT_")},
     )
     if out.returncode != 0:
         return any(RIVET_SRC.glob(path))
