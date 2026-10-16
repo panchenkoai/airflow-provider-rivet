@@ -197,8 +197,14 @@ def test_cdc_dag_without_compact_or_load() -> None:
 
 
 def test_the_provider_entry_point_names_the_distribution_and_the_version_has_one_source() -> None:
-    info = get_provider_info()
-    assert info["package-name"] == "airflow-provider-rivet" and info["versions"] == [__version__]
+    # the whole dict: `airflow providers list` and the UI's Providers page show its name and description
+    # (mutants x_get_provider_info__mutmut_7/8/9/12...)
+    assert get_provider_info() == {
+        "package-name": "airflow-provider-rivet",
+        "name": "Rivet",
+        "description": "Run rivet exports, CDC drains, loads and compactions as Airflow tasks.",
+        "versions": [__version__],
+    }
     pyproject = (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text()
     assert 'dynamic = ["version"]' in pyproject and 'path = "airflow_provider_rivet/__init__.py"' in pyproject
     assert not re.search(r"^version\s*=", pyproject, re.M), "the version is written in __init__.py only"
