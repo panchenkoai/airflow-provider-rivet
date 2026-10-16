@@ -1238,9 +1238,29 @@ def test_old_plan_artifacts_and_crashed_ledgers_are_pruned(rig: Rig) -> None:
 def test_an_apply_unit_from_metrics_takes_the_status_rivet_recorded(rig: Rig) -> None:
     """D31: a skip_empty export that delivered nothing is `skipped` in metrics, and the apply unit says so."""
     rig.scenario(apply={"metric": {"status": "skipped", "skip_reason": "source returned 0 rows"}})
-    payload, _ = rig.run(rig.operator(RivetApplyOperator, export="orders"))
+    op = rig.operator(RivetApplyOperator, export="orders")
+    payload, _ = rig.run(op, FakeTI(try_number=1, max_tries=2))
     assert payload["units"][0]["status"] == "skipped"
     assert payload["skip_reason"] == "source returned 0 rows"
+    # G1b: a retry that finds the earlier try's run keeps the status rivet recorded (mutant x__applied_by_earlier_try 57)
+    again, _ = rig.run(op, FakeTI(try_number=2, max_tries=2))
+    assert [c["argv"][0] for c in rig.calls()].count("apply") == 1
+    assert again["units"][0]["status"] == "skipped"
+
+
+def test_an_apply_run_is_the_one_started_in_or_after_the_apply_started_millisecond() -> None:
+    """rivet names its run by the UTC millisecond it started: a run in the same millisecond as `started` is the apply's
+    (mutants x__apply_run 6, 48), one a millisecond earlier is not (mutant 5)."""
+    from datetime import UTC, datetime
+
+    def row(ms: str) -> dict:
+        return {"export_name": "orders", "status": "success", "run_id": f"orders_20261016T100000.{ms}_7"}
+
+    started = datetime(2026, 10, 16, 10, 0, 0, 500900, tzinfo=UTC)
+    assert invocation._apply_run([row("500")], "orders", 7, started) == row("500")
+    exact = started.replace(microsecond=1000)
+    assert invocation._apply_run([row("000")], "orders", 7, exact) is None
+    assert invocation._apply_run([row("001")], "orders", 7, exact) == row("001")
 
 
 RECIPES = """\
