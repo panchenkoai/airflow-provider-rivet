@@ -83,10 +83,12 @@ The list lives in one place in the code, `airflow_provider_rivet/capabilities.py
 
 ## Operators
 
-All of them take `config`, `export`, `state_dir`, `rivet_bin`, `env`, `env_from_connections`,
-`env_passthrough`, `cloud_credentials`, `deployment` (`auto` / `local` / `pod`), `extra_args`,
-`lock_wait` (default 600), `crashed_retries` (default 1), `stderr_dir`, `stream_stderr`, `log_keep`
-(default 10) and `cwd`. Templated: `config`, `export`, `table`, `state_dir`, `plan_file`,
+All of them take `config`, `export`, `table` (one table of the export, for `load` and `compact`),
+`state_dir`, `plan_file` (the layout file `RivetPlanOperator` rewrites), `rivet_bin`, `env`,
+`env_from_connections`, `env_passthrough`, `cloud_credentials`, `connections` (storage and
+warehouse Connections, see "Storage and warehouse connections"), `deployment` (`auto` / `local` /
+`pod`), `extra_args`, `lock_wait` (default 600), `crashed_retries` (default 1), `stderr_dir`,
+`stream_stderr`, `log_keep` (default 10) and `cwd`. Templated: `config`, `export`, `table`, `state_dir`, `plan_file`,
 `extra_args`, `stderr_dir`, `cwd`. **`env` and `env_from_connections` are not templated**, so their
 values are never stored as rendered fields. No operator builds argv: one module, `invocation.py`,
 builds it, runs the process, reads the outputs and classifies.
@@ -97,7 +99,7 @@ builds it, runs the process, reads the outputs and classifies.
 | `RivetRunOperator` | `rivet run [-e X] --summary-output <file>` | the fallback when sealed apply is not wanted; also runs a whole config |
 | `RivetCdcRunOperator` | `rivet run -e X --summary-output <file>` for a `mode: cdc` export | one bounded drain; succeeds on `max_events`, reports it, never loops |
 | `RivetLoadOperator` | `rivet load` | per export, per table where the binary can narrow |
-| `RivetCompactOperator` | `rivet compact` | a compaction rivet reports as `skipped` becomes an Airflow skip |
+| `RivetCompactOperator` | `rivet compact` | with `load_result` degraded (rivet 0.31.0 and main) exit 0 is `compacted`, also when rivet merged nothing; a binary with compact's `--summary-output` reports `skipped`, which becomes an Airflow skip |
 | `RivetPlanOperator` | `rivet plan --format json` | rewrites the plan layout file atomically, only when the output is a layout `build_batch_dag` can read (waves with exports; one planned export, which rivet prints as a bare object with no campaign, is one wave from its `export_recommendation`); the file keeps its mode |
 
 ```python
@@ -183,6 +185,8 @@ plan ──> apply: [a] [b] ─> wave_2_done ─> [big] ─> after_big ─> [hug
 | `compact.X` | | run | failed |
 | nothing | | | success (`watcher` skipped) |
 - `plan_file` is read at parse time (no database access); without one, pass `exports=[...]`.
+- With `plan_file`, a `plan` task rewrites that file from `rivet plan` at the start of every run;
+  `refresh_plan=False` drops the task and keeps the file as it is.
 - `extract="run"` uses `rivet run -e X` instead of plan + apply.
 - **Compact tasks are created only for the exports named in `compact_exports`.** Whether a table
   compacts depends on the load mode, `load.layout` and the warehouse, which only rivet resolves
@@ -216,6 +220,10 @@ dag = build_cdc_dag(
 - The same `watcher` task ends the DAG: a failed `run`, `load.T` or `compact.T` fails the run.
 - On `stop_reason: max_events` the run task succeeds, puts it in XCom and logs
   `rivet.cdc.max_events`. It does not loop.
+- `load=False` drops the load and compact tasks (the stream's files are the product);
+  `compact=False` keeps `load.T` and drops `compact.T`. Use `compact=False` on Snowflake and
+  ClickHouse, where there is nothing to compact (see "Storage and warehouse connections").
+- `operator_kwargs` go to every task, as in the batch builder.
 
 ## Retries
 
@@ -475,7 +483,11 @@ The config keeps what is not a secret (bucket, project, dataset, database, schem
 Connection holds who may write there. The Snowflake loader runs the `snow` CLI, which must be on
 the worker (`pip install snowflake-cli` into its own environment). On BigQuery `rivet compact`
 merges the buffer into the base table; on Snowflake and ClickHouse the current state is a view
-over `<table>__changes`, and the compact task is skipped with the reason rivet gives.
+over `<table>__changes` and there is nothing to merge. rivet 0.31.0 (and main) says so only in a
+stderr line (`compact [<table>]: skipped — this warehouse keeps a change log behind a view and
+never compacts`) and exits 0; `rivet compact` has no `--summary-output` yet (`load_result`), so the
+task ends green as `compacted`, having done nothing. For these warehouses build the CDC DAG with
+`compact=False` and leave such exports out of `compact_exports`.
 
 ## Slack
 
@@ -519,7 +531,12 @@ started outside Airflow** (cron, a shell), nor against a second DAG over the sam
 - On rivet 0.31.0 the `rows` / `files` of a CDC `run` task leave out its `initial: snapshot`: the first
   run of a CDC DAG reports 0 rows while the snapshot files hold the whole table (the binary's
   `--summary-output` counts the stream only; found by the live gate).
-- `load` and `compact` against a warehouse were exercised only through the fake binary.
+- This package's tests run `load` and `compact` only through the fake binary, which replays
+  rivet's output and talks to no warehouse. A live run against BigQuery, Snowflake and ClickHouse
+  exists only as the warehouse leg of the gate (branch `gate/airflow-live-warehouses`), and that
+  leg does not yet read the warehouse back to grade the values.
+- On Snowflake and ClickHouse a compact task is green as `compacted` while rivet merged nothing
+  (see "Storage and warehouse connections").
 - Narrowing a load to one export today means rewriting the config through a YAML reader and
   writer: comments are dropped and YAML anchors are expanded in the copy.
 - With `load_table_filter` degraded, the per-table tasks of a multi-table CDC export each load
