@@ -332,11 +332,11 @@ class _Session:
                 preexec_fn=_parent_death_signal(),
             )
             running = Running(proc)
-            if on_start is not None:
-                on_start(proc.pid)
             if self.on_process:
                 self.on_process(running)
             try:
+                if on_start is not None:
+                    on_start(proc.pid)
                 code = running.wait()
             except BaseException:
                 running.request_stop()
