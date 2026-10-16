@@ -614,6 +614,44 @@ scenario (and enforces rivet's own `query_file` rule, tied to the Rust source by
 `tests/test_dag_runs.py` runs the builders' DAGs through `dag.test()` against a SQLite metadata
 database created in a throwaway `AIRFLOW_HOME`, with real task instances and trigger rules.
 
+### Mutation testing
+
+[mutmut](https://github.com/boxed/mutmut) 3.8 mutates `airflow_provider_rivet/` only (never `tests/`, `gate/` or
+`examples/`) and runs, for each mutant, the tests that cover the mutated function. Run it in Linux, never on the
+Mac's own Python: mutmut forks a worker per mutant, and macOS aborts a forked child of a multithreaded process that
+loads an Objective-C class (psutil, under Airflow's import), so there a mutant's verdict is the crash, not its tests.
+`dev/mutants.sh` runs it in a Linux container (Docker), as the calling user, which also runs the Linux-only
+`PR_SET_PDEATHSIG` test of `tests/test_retry.py` (in Linux the two case- and Unicode-folding file-system tests of
+`tests/test_operators.py` skip instead):
+
+```bash
+make mutants                                  # dev/mutants.sh mutmut run, then the survivors; resumable (mutants/)
+make mutants-results                          # the survivors, timeouts and other non-killed mutants of the last run
+dev/mutants.sh mutmut show <mutant name>      # the diff of one mutant
+dev/mutants.sh python dev/mutants_gate.py pr  # what the PR job runs: the mutants of the functions your branch touches
+```
+
+`RIVET_SRC` applies as for `pytest`. The configuration is `[tool.mutmut]` in `pyproject.toml`. Workers fork from a
+server that only collected the tests (`process_isolation = "forkserver"`), and `dev/mutmut_isolation.py` gives each
+worker its own Airflow metadata database, dags folder and pytest base temp: on one shared SQLite file the
+`airflow_db` fixture's `resetdb` of one worker would kill another worker's DAG runs and count its mutant as
+detected. A timeout is not a detection: a cluster of timeouts in one function is a finding about its loop or wait.
+mutmut does not mutate a decorated function (`Outcome.decision`, `_prctl`, `_export_lock`): their behaviour is
+held by tests alone.
+
+CI (`.github/workflows/mutation.yml`, on Linux, through `dev/mutants_gate.py`):
+
+- **pull request**: every mutant of every function the diff from the base branch touches must be killed; one that
+  survives, times out or has no test fails the job, which prints it with its diff. A new function ships with the
+  tests that kill its mutants.
+- **push to main, nightly, on demand**: every mutant; the job prints `survivors N <= ratchet M` and fails when N
+  exceeds the number in `.mutmut-ratchet`.
+- **release**: `release.yml` runs the same full job on the tagged commit itself before it builds, so no version is
+  published from a commit whose mutants were not counted.
+
+Moving the ratchet: lowering `.mutmut-ratchet` (after tests kill survivors) is an ordinary PR; raising it needs a
+dated comment line in that file saying which mutants are accepted and why.
+
 ## Live gate
 
 `gate/` runs this provider and a rivet Linux binary in real Airflow 2.10.5 and 3.3.2 stacks (the official

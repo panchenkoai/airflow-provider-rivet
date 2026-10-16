@@ -1,0 +1,96 @@
+name: Mutation
+
+# Mutation testing of airflow_provider_rivet/ with mutmut (README, "Mutation testing"; dev/mutants_gate.py), on Linux
+# so the PR_SET_PDEATHSIG test runs.
+# - pull request: the mutants of every function the PR touches; any one not killed fails the job.
+# - push to main, nightly, on demand, and the release (release.yml calls this workflow on the tagged commit): every
+#   mutant; fails when more are not killed than `.mutmut-ratchet` allows.
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  schedule:
+    - cron: "17 2 * * *"
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mutation-${{ github.workflow_ref }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  MUTMUT: mutmut==3.8.0
+  RIVET_SRC: rivet
+
+jobs:
+  changed:
+    name: Mutants of the touched functions
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: actions/checkout@v7
+        with:
+          repository: panchenkoai/rivet
+          path: rivet
+          sparse-checkout: |
+            tests/fixtures/scheduler
+            src/config
+      - name: Pin rivet to RIVET_CONTRACT_REF
+        run: git -C rivet fetch --depth 1 origin "$(cat RIVET_CONTRACT_REF)" && git -C rivet checkout --quiet FETCH_HEAD
+      - uses: taiki-e/install-action@v2.87.22
+        with:
+          tool: uv
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/uv
+            .venv
+          key: mutation-${{ runner.os }}-${{ hashFiles('uv.lock', '.python-version') }}-${{ env.MUTMUT }}
+      - run: uv sync --locked
+      - name: Every mutant of the functions this PR touches is killed
+        run: uv run --with "$MUTMUT" python dev/mutants_gate.py pr "origin/${{ github.base_ref }}"
+
+  full:
+    name: Every mutant, against the ratchet
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/checkout@v7
+        with:
+          repository: panchenkoai/rivet
+          path: rivet
+          sparse-checkout: |
+            tests/fixtures/scheduler
+            src/config
+      - name: Pin rivet to RIVET_CONTRACT_REF
+        run: git -C rivet fetch --depth 1 origin "$(cat RIVET_CONTRACT_REF)" && git -C rivet checkout --quiet FETCH_HEAD
+      - uses: taiki-e/install-action@v2.87.22
+        with:
+          tool: uv
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/uv
+            .venv
+          key: mutation-${{ runner.os }}-${{ hashFiles('uv.lock', '.python-version') }}-${{ env.MUTMUT }}
+      - run: uv sync --locked
+      - name: Not-killed mutants stay within .mutmut-ratchet
+        run: uv run --with "$MUTMUT" python dev/mutants_gate.py full
+      - name: Survivor list
+        if: always()
+        run: uv run --with "$MUTMUT" mutmut results > mutmut-results.txt || true
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutmut-results-${{ github.sha }}
+          path: mutmut-results.txt

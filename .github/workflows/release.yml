@@ -2,6 +2,8 @@ name: Release
 
 # A tag `airflow-v<version>` publishes that version to PyPI through Trusted Publishing (no token stored here).
 # The tag must equal `airflow-v` + airflow_provider_rivet.__version__; the `pypi` environment gates the upload.
+# Nothing is built or published unless the full mutation run passes `.mutmut-ratchet` on this very commit: the
+# `mutation` job runs it here, so tagging a commit main never checked cannot skip it.
 
 on:
   push:
@@ -11,8 +13,13 @@ permissions:
   contents: read
 
 jobs:
+  mutation:
+    name: Mutation gate on the tagged commit
+    uses: ./.github/workflows/mutation.yml
+
   build:
     name: Build and check
+    needs: mutation
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
