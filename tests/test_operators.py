@@ -12,6 +12,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+import yaml
 from airflow.exceptions import AirflowException, AirflowFailException, AirflowSkipException
 from conftest import NEW_FLAGS, SECRET, FakeTI, Rig, fixture
 
@@ -1229,3 +1230,43 @@ def test_an_apply_unit_from_metrics_takes_the_status_rivet_recorded(rig: Rig) ->
     payload, _ = rig.run(rig.operator(RivetApplyOperator, export="orders"))
     assert payload["units"][0]["status"] == "skipped"
     assert payload["skip_reason"] == "source returned 0 rows"
+
+
+RECIPES = """\
+source:
+  type: mysql
+  url_env: RIVET_PG_URL
+exports:
+  - name: orders
+    table: orders
+    mode: chunked
+  - name: users
+    table: users
+    mode: full
+  - name: countries
+    table: countries
+    mode: full
+  - name: stream
+    tables: [orders, users]
+    mode: cdc
+    cdc: { backfill: auto }
+  - name: listed
+    tables: [countries]
+    mode: cdc
+    cdc: { backfill: [countries] }
+  - name: snap
+    tables: [orders]
+    mode: cdc
+    cdc: { initial: snapshot }
+"""
+
+
+@pytest.mark.parametrize(
+    ("export", "kept"),
+    [("stream", ["orders", "users", "stream"]), ("listed", ["countries", "listed"]), ("snap", ["snap"])],
+)
+def test_a_narrowed_copy_keeps_the_recipes_the_streams_backfill_reads(rig: Rig, export: str, kept: list[str]) -> None:
+    rig.config.write_text(RECIPES)
+    rig.run(rig.operator(RivetLoadOperator, export=export, table="orders"))
+    names = [e["name"] for e in yaml.safe_load(rig.copy(export).read_text())["exports"]]
+    assert names == kept, "a stream without its backfill recipes is refused by rivet: RIVET_CONFIG_CDC_SHAPE_INVALID"
