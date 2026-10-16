@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
@@ -13,6 +14,7 @@ from .preflight import PreflightRefusal
 CLICKHOUSE_URL = "RIVET_CLICKHOUSE_URL"
 CLICKHOUSE_USER = "RIVET_CLICKHOUSE_USER"
 CLICKHOUSE_PASSWORD = "RIVET_CLICKHOUSE_PASSWORD"
+ENV_NAME = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 SNOWFLAKE_KEY = "RIVET_SNOWFLAKE_KEY"
 
 
@@ -111,13 +113,18 @@ def _snowflake(conn: Any, folder: Path, config: Mapping[str, Any]) -> dict[str, 
 
 
 def _clickhouse(conn: Any, folder: Path, config: Mapping[str, Any]) -> dict[str, str]:
-    """The HTTP endpoint, user and password; the config reads `url: ${RIVET_CLICKHOUSE_URL}`, `password_env: RIVET_CLICKHOUSE_PASSWORD`."""
+    """The HTTP endpoint, user and password; the config reads `url: ${RIVET_CLICKHOUSE_URL}` and the password from its
+    `password_env` (RIVET_CLICKHOUSE_PASSWORD always carries it as well)."""
     secure = str(_extra(conn, "secure", "clickhouse") or "").lower() in ("1", "true", "yes")
     scheme = str(_extra(conn, "protocol", "clickhouse") or ("https" if secure else "http"))
     port = f":{conn.port}" if conn.port else ""
     env = {CLICKHOUSE_URL: f"{scheme}://{conn.host}{port}", CLICKHOUSE_USER: conn.login or "default"}
     if conn.password:
-        env[CLICKHOUSE_PASSWORD] = conn.password
+        # `rivet init --clickhouse-url` writes `password_env: CLICKHOUSE_PASSWORD`; the variable the config names gets it too.
+        load = config.get("load") if isinstance(config.get("load"), dict) else {}
+        named = load.get("password_env")
+        for name in {CLICKHOUSE_PASSWORD, *([named] if isinstance(named, str) and ENV_NAME.fullmatch(named) else [])}:
+            env[name] = conn.password
     return env
 
 

@@ -105,3 +105,12 @@ def test_a_refused_connection_fails_the_task_before_rivet_and_leaves_no_folder(r
     assert isinstance(exc, AirflowFailException) and not rig.calls()
     assert ti.store[("task", "return_value")]["preflight_refusal"] == "RIVET_AIRFLOW_CONNECTION_KIND"
     assert made and not Path(made[0]).exists()
+
+
+def test_the_clickhouse_password_reaches_the_variable_the_config_names(tmp_path: Path) -> None:
+    ch = conn("ch", "clickhouse", host="ch", login="loader", password="pw")
+    scaffold = {"load": {"target": "clickhouse", "password_env": "CLICKHOUSE_PASSWORD"}}  # what `rivet init` writes
+    env = cloud_environment([ch], tmp_path, scaffold)
+    assert env["CLICKHOUSE_PASSWORD"] == "pw" and env["RIVET_CLICKHOUSE_PASSWORD"] == "pw"
+    odd = cloud_environment([ch], tmp_path / "x", {"load": {"password_env": "PATH; rm -rf /"}})
+    assert "PATH; rm -rf /" not in odd and odd["RIVET_CLICKHOUSE_PASSWORD"] == "pw"

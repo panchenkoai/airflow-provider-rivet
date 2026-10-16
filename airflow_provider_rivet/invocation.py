@@ -222,7 +222,7 @@ class _Session:
         if only_export is None:
             return _write_atomic(folder / copy_name(source), source.read_bytes())
         doc = dict(self.pf.config)
-        doc["exports"] = [e for e in doc.get("exports") or [] if isinstance(e, dict) and e.get("name") == only_export]
+        doc["exports"] = narrowed_exports(doc.get("exports") or [], only_export)
         return _write_atomic(folder / copy_name(source, only_export), _yaml.dump(doc).encode())
 
     def malformed(self, value: Any, kind: type) -> Any:
@@ -425,6 +425,22 @@ def _tail(path: Path) -> str:
         size = handle.seek(0, os.SEEK_END)
         handle.seek(max(0, size - STDERR_TAIL))
         return handle.read().decode(errors="replace")
+
+
+def narrowed_exports(exports: list[Any], only_export: str) -> list[dict[str, Any]]:
+    """The export, and the batch exports its `cdc.backfill` reads its baseline through: rivet refuses a stream whose
+    recipes are missing (`backfill: auto` pairs by `table:`, a list names them)."""
+    exports = [e for e in exports if isinstance(e, dict)]
+    chosen = [e for e in exports if e.get("name") == only_export]
+    backfill = (chosen[0].get("cdc") or {}).get("backfill") if chosen and isinstance(chosen[0].get("cdc"), dict) else None
+    if backfill == "auto":
+        tables = set(chosen[0].get("tables") or [])
+        recipes = {e.get("name") for e in exports if e.get("mode") != "cdc" and e.get("table") in tables}
+    elif isinstance(backfill, list):
+        recipes = set(backfill)
+    else:
+        recipes = set()
+    return [e for e in exports if e.get("name") == only_export or e.get("name") in recipes]
 
 
 def copy_name(source: Path, only_export: str | None = None) -> str:
