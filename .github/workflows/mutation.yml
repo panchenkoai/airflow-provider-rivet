@@ -2,8 +2,8 @@ name: Mutation
 
 # Mutation testing of airflow_provider_rivet/ with mutmut (README, "Mutation testing"; dev/mutants_gate.py), on Linux
 # so the PR_SET_PDEATHSIG test runs. When mutants run:
-# 1. A pull request that changes airflow_provider_rivet/ code: the mutants of every function it touches; any one not
-#    killed fails the job. Nothing else runs on a pull request: a change to tests or to the harness gets no mutants.
+# 1. A pull request that changes airflow_provider_rivet/ code: the mutants of every function it touches; one not killed
+#    that mutates a line the pull request changed fails the job (a survivor elsewhere in the function is listed). Nothing else runs on a pull request: a change to tests or to the harness gets no mutants.
 # 2. A release (release.yml calls this workflow on the tagged commit): the full run, judged against `.mutmut-ratchet`.
 # 3. On demand (workflow_dispatch): the full run. There is no run on push to main and no nightly run.
 # The ratchet changes only through a full run (2 or 3).
