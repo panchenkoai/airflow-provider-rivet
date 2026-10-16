@@ -141,6 +141,17 @@ class Request:
     upstream_markers: Sequence[str] = ()
 
 
+def decide(error: ErrorObject | None) -> str:
+    """The retry decision of a task whose representative error is `error`: `success`, `retry` (transient budget),
+    `retry_crashed` (its own budget) or `fail`. A plain function, so mutation testing reaches it (a property is not
+    mutated)."""
+    if error is None:
+        return "success"
+    if error.class_ == "crashed":
+        return "retry_crashed"
+    return "retry" if error.retryable else "fail"
+
+
 @dataclass
 class Outcome:
     """What a task reports: its units, the representative error and what the binary could not do."""
@@ -159,12 +170,8 @@ class Outcome:
 
     @property
     def decision(self) -> str:
-        """`success`, `retry` (transient budget), `retry_crashed` (its own budget) or `fail`."""
-        if self.error is None:
-            return "success"
-        if self.error.class_ == "crashed":
-            return "retry_crashed"
-        return "retry" if self.error.retryable else "fail"
+        """`success`, `retry` (transient budget), `retry_crashed` (its own budget) or `fail` (`decide`)."""
+        return decide(self.error)
 
     def to_xcom(self) -> dict[str, Any]:
         """The XCom payload: units without `message`, never an environment value."""
