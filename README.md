@@ -398,7 +398,9 @@ SQLite state in `state_dir`.
      names no rivet scheme, such as `generic`, is refused before rivet starts
      (`RIVET_AIRFLOW_CONNECTION_SCHEME`). A password without a login is kept, an IPv6 host is
      bracketed, an Oracle connection's extra `service_name` is used as the path, and the extra
-     `rivet_params` adds a query string.
+     `rivet_params` adds a query string. A `conn_id` no backend defines, here or in
+     `connections=[...]`, is refused before rivet starts (`RIVET_AIRFLOW_CONNECTION_MISSING`),
+     not retried.
   4. `connections=[conn_id, ...]`: storage and warehouse Connections, see below.
 
   argv carries the config path, export names and flags.

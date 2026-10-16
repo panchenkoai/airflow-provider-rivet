@@ -11,8 +11,14 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-from . import _yaml
-from ._compat import AirflowException, AirflowFailException, AirflowSkipException, BaseHook, BaseOperator
+from ._compat import (
+    AirflowException,
+    AirflowFailException,
+    AirflowNotFoundException,
+    AirflowSkipException,
+    BaseHook,
+    BaseOperator,
+)
 from .connections import cloud_environment
 from .invocation import (
     CLOUD_ENV,
@@ -24,7 +30,7 @@ from .invocation import (
     undeclared_state_variables,
     worker_environment,
 )
-from .preflight import PreflightRefusal
+from .preflight import PreflightRefusal, read_config
 
 XCOM_KEY = "return_value"
 _SCHEMES = {"postgres": "postgresql", "mssql": "sqlserver", "mongo": "mongodb"}
@@ -52,6 +58,18 @@ def connection_url(conn: Any, scheme: str | None = None) -> str:
     database = (extra.get("service_name") if scheme == "oracle" else None) or conn.schema or ""
     params = f"?{extra['rivet_params']}" if extra.get("rivet_params") else ""
     return f"{scheme}://{auth}{host}{port}/{quote(str(database), safe='')}{params}"
+
+
+def get_connection(conn_id: str) -> Any:
+    """The Airflow Connection the task names; a refusal when no backend defines it, since a retry cannot create it."""
+    try:
+        return BaseHook.get_connection(conn_id)
+    except AirflowNotFoundException as exc:
+        raise PreflightRefusal(
+            "RIVET_AIRFLOW_CONNECTION_MISSING",
+            f"connection `{conn_id}` is not defined in the metadata database or any secrets backend this worker reads; "
+            "create it, or correct the id the task names",
+        ) from exc
 
 
 class RivetBaseOperator(BaseOperator):
@@ -126,11 +144,11 @@ class RivetBaseOperator(BaseOperator):
         names, and URLs from Connections; key files go to `secrets`, which the task removes when rivet has exited."""
         env = worker_environment(self.env_passthrough, self.cloud_credentials)
         if self.connections:
-            env.update(cloud_environment([BaseHook.get_connection(c) for c in self.connections], secrets, self._config_doc()))
+            env.update(cloud_environment([get_connection(c) for c in self.connections], secrets, self._config_doc()))
         env.update({str(k): str(v) for k, v in (self.env or {}).items()})
         for name, ref in (self.env_from_connections or {}).items():
             conn_id, scheme = (ref, None) if isinstance(ref, str) else (ref[0], ref[1])
-            env[name] = connection_url(BaseHook.get_connection(conn_id), scheme)
+            env[name] = connection_url(get_connection(conn_id), scheme)
         for name in undeclared_state_variables(env, os.environ):
             raise PreflightRefusal(
                 "RIVET_AIRFLOW_STATE_ENV_NOT_PASSED",
@@ -143,12 +161,9 @@ class RivetBaseOperator(BaseOperator):
         return env
 
     def _config_doc(self) -> dict[str, Any]:
-        """The config as written, for the names a Connection is filed under; empty when it cannot be read here."""
-        try:
-            doc = _yaml.load(Path(self.config).read_text())
-        except (OSError, ValueError, _yaml.yaml.YAMLError):
-            return {}
-        return doc if isinstance(doc, dict) else {}
+        """The config as written, for the names a Connection is filed under; read by the preflight's reader, so a config
+        it refuses is refused here too."""
+        return read_config(self.config)
 
     def _emit(self, record: dict[str, Any]) -> None:
         """Write one structured line to the task log."""

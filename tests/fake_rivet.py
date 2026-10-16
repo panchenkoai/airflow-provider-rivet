@@ -94,11 +94,19 @@ def main():
     """Answer `--version` / `--help`, or replay the scenario for the subcommand."""
     spec = json.loads((HERE / "scenario.json").read_text())
     argv = sys.argv[1:]
+    broken = spec.get("probe_broken", {})
     if argv == ["--version"]:
+        if broken.get("--version") == "hang":
+            time.sleep(90)
         print(f"rivet {spec.get('version', '0.31.0')} (fake)")
         return 0
     sub = argv[0]
     if "--help" in argv:
+        if broken.get(sub) == "hang":
+            time.sleep(90)
+        if broken.get(sub) == "exit":
+            print(f"error: unrecognized subcommand '{sub}'", file=sys.stderr)
+            return 2
         flags = BASE_FLAGS.get(sub, []) + spec.get("flags", {}).get(sub, []) + spec.get("flags", {}).get("*", [])
         print("Usage: rivet " + sub + " [OPTIONS]\n\nOptions:\n" + "\n".join(f"      {f} <X>" for f in flags))
         return 0

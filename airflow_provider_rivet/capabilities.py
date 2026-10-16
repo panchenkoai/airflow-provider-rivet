@@ -8,6 +8,7 @@ import subprocess
 from dataclasses import dataclass
 
 MIN_RIVET_VERSION = (0, 31, 0)
+PROBE_TIMEOUT = 60
 _VERSION_RE = re.compile(r"rivet\s+(\d+)\.(\d+)\.(\d+)")
 
 
@@ -124,6 +125,10 @@ UNDETECTABLE = (
 )
 
 
+class ProbeFailed(RuntimeError):
+    """A probe of the binary got no usable answer: it could not start, exited non-zero, timed out or printed no version."""
+
+
 class Capabilities:
     """The version of one rivet binary and the flags its subcommands accept, probed from `--help`."""
 
@@ -133,17 +138,23 @@ class Capabilities:
         out = self._run([binary, "--version"])
         match = _VERSION_RE.search(out)
         if not match:
-            raise RuntimeError(f"`{binary} --version` did not print a rivet version")
+            raise ProbeFailed(f"`{binary} --version` did not print a rivet version")
         self.version = tuple(int(g) for g in match.groups())
         self.version_text = ".".join(str(n) for n in self.version)
 
     @staticmethod
     def _run(argv: list[str]) -> str:
-        """Run a probe with a minimal environment and return its stdout."""
+        """Run a probe with a minimal environment and return its stdout; `ProbeFailed` for every probe that does not answer."""
         env = {"PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", "")}
-        done = subprocess.run(argv, capture_output=True, text=True, timeout=60, env=env, check=False)
+        shown = " ".join(argv)
+        try:
+            done = subprocess.run(argv, capture_output=True, text=True, timeout=PROBE_TIMEOUT, env=env, check=False)
+        except subprocess.TimeoutExpired as exc:
+            raise ProbeFailed(f"`{shown}` did not answer within {PROBE_TIMEOUT}s") from exc
+        except (OSError, ValueError) as exc:
+            raise ProbeFailed(f"`{shown}` could not be run: {type(exc).__name__}") from exc
         if done.returncode != 0:
-            raise RuntimeError(f"`{' '.join(argv)}` exited {done.returncode}")
+            raise ProbeFailed(f"`{shown}` exited {done.returncode}")
         return done.stdout
 
     def has_flag(self, subcommand: str, flag: str) -> bool:
@@ -162,7 +173,10 @@ _CACHE: dict[tuple, Capabilities] = {}
 
 def probe(binary: str) -> Capabilities:
     """Probe a binary once per process and per file identity."""
-    stat = os.stat(binary)
+    try:
+        stat = os.stat(binary)
+    except OSError as exc:
+        raise ProbeFailed(f"`{binary}` cannot be read: {type(exc).__name__}") from exc
     key = (binary, stat.st_mtime_ns, stat.st_size)
     if key not in _CACHE:
         _CACHE[key] = Capabilities(binary)
