@@ -83,8 +83,29 @@ def changed_globs(base: str) -> list[str]:
     return globs
 
 
-def run_mutmut(args: list[str]) -> subprocess.CompletedProcess:
-    """`mutmut run ...` with the project's own settings (`[tool.mutmut]`, `dev/` for the isolation plugin)."""
+PROGRESS = re.compile(r"(\d+)/(\d+)(?=\s)")
+
+
+def statuses() -> dict[str, str]:
+    """Every mutant mutmut generated, with its status (`not checked` until a run grades it), from mutants/*.meta."""
+    from mutmut.stats import status_by_exit_code
+
+    found = {}
+    for meta in sorted((ROOT / "mutants" / PACKAGE).rglob("*.meta")):
+        for name, code in json.loads(meta.read_text())["exit_code_by_key"].items():
+            found[name] = status_by_exit_code[code]
+    return found
+
+
+def matching(names, globs: list[str]) -> list[str]:
+    return [n for n in names if any(fnmatch.fnmatchcase(n, g) for g in globs)]
+
+
+def run_mutmut(args: list[str], label: str = "", globs: list[str] | None = None) -> subprocess.CompletedProcess:
+    """`mutmut run ...` with the project's own settings (`[tool.mutmut]`, `dev/` for the isolation plugin).
+
+    With `globs`, once mutmut has generated its mutants this prints how many of all of them the run covers, and
+    mutmut's progress `done/total` (total = every mutant of the package) is shown against that number instead."""
     env = {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, [str(ROOT / "dev"), os.environ.get("PYTHONPATH")]))}
     if env.get("RIVET_SRC"):  # mutmut's workers do not run in this directory: a relative checkout path would miss
         env["RIVET_SRC"] = str((ROOT / env["RIVET_SRC"]).resolve())
@@ -92,23 +113,36 @@ def run_mutmut(args: list[str]) -> subprocess.CompletedProcess:
     argv = [*MUTMUT, "run", *(["--max-children", children] if children else []), *args]
     print("+", " ".join(argv), flush=True)
     proc = subprocess.Popen(argv, cwd=ROOT, env=env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-    seen = []
+    seen, pending, count = [], "", None
     for chunk in iter(lambda: proc.stdout.read(4096), ""):  # streamed: a full run is silent for an hour otherwise
-        sys.stdout.write(chunk)
-        sys.stdout.flush()
         seen.append(chunk)
+        pending += chunk
+        *lines, pending = re.split(r"(\r|\n)", pending + "\x00")
+        pending = pending[:-1]
+        out = []
+        for piece in lines:
+            if globs is not None and count is None and "files mutated" in piece:
+                every = statuses()
+                count = len(matching(every, globs))
+                out.append(f"{piece}\nmutation gate: {label}: {count} of {len(every)} mutants\n")
+                continue
+            if count is not None and PROGRESS.search(piece) and "\U0001f389" in piece:
+                piece = f"{label}: " + PROGRESS.sub(lambda m, n=count: f"{m[1]}/{n}", piece, count=1)
+            out.append(piece)
+        sys.stdout.write("".join(out))
+        sys.stdout.flush()
+    sys.stdout.write(pending)
     return subprocess.CompletedProcess(argv, proc.wait(), "".join(seen)[-20000:], "")
 
 
-def not_killed() -> dict[str, str]:
-    """Every mutant of the last run whose status is not `killed`, by name (`mutmut results`)."""
-    out = subprocess.run([*MUTMUT, "results"], cwd=ROOT, check=True, capture_output=True, text=True).stdout
-    found = {}
-    for line in out.splitlines():
-        name, sep, status = line.strip().rpartition(": ")
-        if sep and name.startswith(PACKAGE + "."):
-            found[name] = status
-    return found
+def tally(globs: list[str], label: str) -> tuple[dict[str, str], list[str], int]:
+    """(not-killed mutants by name, the names graded, how many were killed) of the run's mutants; printed."""
+    graded = {n: s for n, s in statuses().items() if any(fnmatch.fnmatchcase(n, g) for g in globs)}
+    tested = sorted(n for n, s in graded.items() if s != "not checked")
+    killed = sum(1 for s in graded.values() if s == "killed")
+    left = {n: s for n, s in graded.items() if s != "killed"}
+    print(f"mutation gate: {label}: tested {len(tested)}, killed {killed}, not killed {len(left)}", flush=True)
+    return left, tested, killed
 
 
 def show(names: list[str]) -> None:
@@ -129,14 +163,15 @@ def gate_pr(base: str, shard: int | None) -> int:
         print(f"mutation gate: the diff from {base} touches no function of {PACKAGE}/; nothing to mutate")
         return 0
     print("mutation gate: functions touched:\n  " + "\n  ".join(globs), flush=True)
-    done = run_mutmut(globs)
+    label = "touched functions" if shard is None else f"shard {shard}"
+    done = run_mutmut(globs, label, globs)
     if done.returncode != 0:
         if "nothing matches" in done.stdout:
             print("mutation gate: the touched functions have no mutants in this shard")
             return 0
         print(f"mutation gate: mutmut run exited {done.returncode}")
         return 1
-    left = {n: s for n, s in not_killed().items() if any(fnmatch.fnmatchcase(n, g) for g in globs)}
+    left, _, _ = tally(globs, label)
     if left:
         print(f"mutation gate: {len(left)} mutant(s) of the touched functions not killed:")
         for name, status in sorted(left.items()):
@@ -173,32 +208,65 @@ def judge(left: dict[str, str]) -> int:
 
 
 def gate_full(shard: int | None, out: Path | None) -> int:
-    """Run every mutant (of one shard); judge against the ratchet, or write the shard's survivors to `out`."""
+    """Run every mutant (of one shard); judge against the ratchet, or write the shard's account to `out`."""
     globs = sharded([f"{PACKAGE}.*__mutmut_*"], shard)
-    done = run_mutmut(globs if shard is not None else [])
+    label = "all mutants" if shard is None else f"shard {shard}"
+    done = run_mutmut(globs if shard is not None else [], label, globs)
     if done.returncode != 0:
         print(f"mutation gate: mutmut run exited {done.returncode}")
         return 1
-    left = {n: s for n, s in not_killed().items() if any(fnmatch.fnmatchcase(n, g) for g in globs)}
+    left, tested, killed = tally(globs, label)
     if shard is None:
         return judge(left)
     assert out is not None
-    out.write_text(json.dumps({"shard": shard, "not_killed": left}, indent=1, sort_keys=True))
-    print(f"mutation gate: shard {shard}: {len(left)} not killed, written to {out}")
+    every = statuses()
+    doc = {
+        "shard": shard,
+        "total_mutants": len(every),
+        "mutants": len(matching(every, globs)),
+        "tested": tested,
+        "killed": killed,
+        "not_killed": left,
+    }
+    out.write_text(json.dumps(doc, indent=1, sort_keys=True))
+    print(f"mutation gate: shard {shard}: account written to {out}")
     return 0
 
 
 def gate_ratchet(folder: Path) -> int:
-    """Sum the ten shards' survivor files and judge the total."""
-    left: dict[str, str] = {}
-    shards = set()
+    """Check that the ten shards together graded every mutant exactly once, then judge their total."""
+    docs = {}
     for path in sorted(folder.rglob("*.json")):
         doc = json.loads(path.read_text())
-        shards.add(doc["shard"])
-        left.update(doc["not_killed"])
-    if shards != set(range(10)):
-        print(f"mutation gate: shards {sorted(set(range(10)) - shards)} reported nothing; the run is incomplete")
+        docs[doc["shard"]] = doc
+    if set(docs) != set(range(10)):
+        print(f"mutation gate: shards {sorted(set(range(10)) - set(docs))} reported nothing; the run is incomplete")
         return 1
+    print("| shard | mutants | tested | killed | not killed |\n|---|---|---|---|---|")
+    for i, doc in sorted(docs.items()):
+        print(f"| {i} | {doc['mutants']} | {len(doc['tested'])} | {doc['killed']} | {len(doc['not_killed'])} |")
+    totals = {doc["total_mutants"] for doc in docs.values()}
+    tested = [name for doc in docs.values() for name in doc["tested"]]
+    total = next(iter(totals))
+    print(
+        f"| all | {sum(d['mutants'] for d in docs.values())} | {len(tested)} | "
+        f"{sum(d['killed'] for d in docs.values())} | {sum(len(d['not_killed']) for d in docs.values())} |"
+    )
+    problems = []
+    if len(totals) != 1:
+        problems.append(f"the shards saw different totals {sorted(totals)}: they ran different code")
+    if len(set(tested)) != len(tested):
+        problems.append(f"{len(tested) - len(set(tested))} mutants were graded by more than one shard")
+    if len(set(tested)) != total:
+        problems.append(f"sum(tested) {len(set(tested))} != total mutants {total}: some mutants were graded by no shard")
+    for problem in problems:
+        print(f"mutation gate: {problem}")
+    if problems:
+        return 1
+    print(f"mutation gate: sum(tested) == total mutants == {total}")
+    left: dict[str, str] = {}
+    for doc in docs.values():
+        left.update(doc["not_killed"])
     return judge(left)
 
 
