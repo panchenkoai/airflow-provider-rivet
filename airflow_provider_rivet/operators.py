@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import json
+import logging
 import os
 import shutil
 import tempfile
@@ -32,6 +32,7 @@ from .invocation import (
     worker_environment,
 )
 from .preflight import PreflightRefusal, read_config
+from .tasklog import TaskLog
 
 XCOM_KEY = "return_value"
 
@@ -115,6 +116,7 @@ class RivetBaseOperator(BaseOperator):
         self.cwd = cwd
         self._proc: Any = None
         self._stop_requested = False
+        self._tasklog: TaskLog | None = None
 
     def _environment(self, secrets: Path) -> dict[str, str]:
         """The subprocess environment (`connections.build_environment`), with every Connection looked up here; key
@@ -140,12 +142,23 @@ class RivetBaseOperator(BaseOperator):
         return read_config(self.config, {str(k): str(v) for k, v in env.items()}, params_of(self.extra_args or ()))
 
     def _emit(self, record: dict[str, Any]) -> None:
-        """Write one structured line to the task log."""
-        line = json.dumps(record, sort_keys=True, default=str)
-        if record.get("event") == "rivet.warning":
-            self.log.warning("%s", line)
-        else:
-            self.log.info("%s", line)
+        """Keep one structured record: written as JSON at DEBUG, read into the task's readable lines (`tasklog`)."""
+        self._task_log().record(record)
+
+    def _task_log(self) -> TaskLog:
+        """This try's task log; `execute` starts a new one."""
+        if self._tasklog is None:
+            self._tasklog = TaskLog(self.command, self.export, self.table, self._write)
+        return self._tasklog
+
+    def _write(self, level: int, text: str) -> None:
+        """One line of the task log at a `logging` level."""
+        method = {logging.DEBUG: "debug", logging.INFO: "info", logging.WARNING: "warning"}.get(level, "error")
+        getattr(self.log, method)("%s", text)
+
+    def _finish(self, ti: Any, payload: dict[str, Any]) -> None:
+        """Write the task's readable block: the outcome's headline, a line per step, the notes."""
+        self._task_log().finish(payload, ti.try_number, ti.max_tries, self._stop_requested)
 
     def _hold(self, proc: Any) -> None:
         """Remember the running process so `on_kill` can stop it; one started after a stop is stopped at once (D40)."""
@@ -172,8 +185,10 @@ class RivetBaseOperator(BaseOperator):
         return [p["state_marker"] for p in values if isinstance(p, dict) and p.get("state_marker")]
 
     def _fail(self, ti: Any, payload: dict[str, Any], text: str, retry: bool) -> None:
-        """Publish the payload, then raise the exception Airflow retries or the one it does not."""
+        """Publish the payload and write the task's readable block, then raise the exception Airflow retries or the one
+        it does not."""
         ti.xcom_push(key=XCOM_KEY, value=payload)
+        self._finish(ti, payload)
         raise (AirflowException if retry else AirflowFailException)(text)
 
     def _refuse(self, ti: Any, refusal: PreflightRefusal) -> None:
@@ -188,6 +203,7 @@ class RivetBaseOperator(BaseOperator):
         run_id = str(context.get("run_id") or getattr(ti, "run_id", "run"))
         map_index = getattr(ti, "map_index", -1)
         task_part = ti.task_id if map_index in (-1, None) else f"{ti.task_id}[{map_index}]"
+        self._tasklog = TaskLog(self.command, self.export, self.table, self._write)
         secrets = Path(tempfile.mkdtemp(prefix="rivet-airflow-secrets-"))
         try:
             return self._run_with_secrets(ti, run_id, task_part, secrets)
@@ -243,10 +259,12 @@ class RivetBaseOperator(BaseOperator):
         if decision == "success":
             if self.command == "compact" and outcome.units and all(u.status == "skipped" for u in outcome.units):
                 ti.xcom_push(key=XCOM_KEY, value=payload)
+                self._finish(ti, payload)
                 raise AirflowSkipException(f"compact skipped: {outcome.skip_reason}")
             stops = [u.export for u in outcome.units if u.stop_reason == "max_events"]
             if stops:
                 self._emit({"event": "rivet.cdc.max_events", "exports": stops, "text": "stopped on max_events; backlog remains"})
+            self._finish(ti, payload)
             return payload
         assert outcome.error is not None
         failed = [u.export for u in outcome.units if u.status == "failed"]

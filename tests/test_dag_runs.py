@@ -231,7 +231,7 @@ def test_no_password_reaches_the_metadata_database_the_logs_or_an_exception(
         assert secret.decode() not in text, f"{secret!r} reached a log record or the process's stdout / stderr"
         assert scan(batch.state_dir / "logs", secret), "the fake did print it to its stderr file"
     assert scan(batch.home, str(batch.state_dir).encode()), "the scan sees the rendered fields: state_dir is in them"
-    assert "rivet.result" in text, "the scan sees the task's log records"
+    assert "rivet apply a → OK" in text, "the scan sees the task's log lines (the JSON records are at DEBUG)"
 
 
 MAPPED_SLACK_DAG = """\
@@ -279,10 +279,11 @@ def test_d11_the_slack_alert_of_a_mapped_rivet_task_names_the_code_of_its_own_in
     assert len(texts) == 2, texts
     for text in texts:
         assert "no rivet result was published" not in text, text
-        assert text.count("•") == 1, text
-    assert "*a*: `RIVET_CONFIG_CURSOR_COLUMN_CASE`" in "".join(texts) and "*b*: `RIVET_SOURCE_CDC_LOG_GAP`" in "".join(texts), (
-        texts
-    )
+    titles = sorted(t.split("\n")[0] for t in texts)
+    assert titles == [
+        ":x: *mapped_alert.run[0] — RIVET_CONFIG_CURSOR_COLUMN_CASE (final)*",
+        ":x: *mapped_alert.run[1] — RIVET_SOURCE_CDC_LOG_GAP (final)*",
+    ], titles
 
 
 def test_d24_a_refused_cdc_drain_blocks_load_and_compact_under_a_default_args_trigger_rule(cdc: DagRig) -> None:
