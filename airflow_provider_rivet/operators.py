@@ -22,6 +22,7 @@ from ._yaml import params_of
 from .connections import EnvSpec, build_environment, connection_url  # noqa: F401  (connection_url is re-exported)
 from .invocation import (
     CLOUD_ENV,
+    Busy,
     Outcome,
     Request,
     Stopped,
@@ -227,6 +228,10 @@ class RivetBaseOperator(BaseOperator):
             self._emit({"event": "rivet.stopped", "step": stop.step, "text": str(stop)})
             payload = {"command": self.command, "decision": "retry", "stopped_before": stop.step, "units": []}
             self._fail(ti, payload, str(stop), retry=True)
+        except Busy as busy:
+            self._emit({"event": "rivet.busy", "code": busy.code, "text": str(busy)})
+            payload = {"command": self.command, "decision": "retry", "busy": busy.code, "units": []}
+            self._fail(ti, payload, str(busy), retry=True)
         finally:
             self._proc = None
         return self._settle(ti, run_id, task_part, outcome)

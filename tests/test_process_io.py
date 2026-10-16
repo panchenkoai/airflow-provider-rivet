@@ -241,10 +241,10 @@ if gap == "before_first_step":
     invocation.run_preflight = run_preflight
 else:
     step = invocation._Session.step
-    def gated(self, name, argv, stdout_to=None):
+    def gated(self, name, argv, stdout_to=None, **kwargs):
         if name == "apply":
             stop_now()
-        return step(self, name, argv, stdout_to)
+        return step(self, name, argv, stdout_to, **kwargs)
     invocation._Session.step = gated
 
 t0 = time.monotonic()

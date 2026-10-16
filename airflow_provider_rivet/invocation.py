@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import contextlib
+import ctypes
 import fcntl
 import fnmatch
+import functools
 import hashlib
 import json
 import os
@@ -12,9 +15,10 @@ import shutil
 import signal as _signal
 import stat
 import subprocess
+import sys
 import tempfile
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -47,6 +51,10 @@ _SAFE = re.compile(r"[^A-Za-z0-9_.-]+")
 _PLAIN = re.compile(r"[a-z0-9_][a-z0-9_.-]{0,79}")
 _HASHED = re.compile(r".*-[0-9a-f]{12}")
 _LOG_FILE = re.compile(r"^(?P<attempt>.+)\.[a-z]+\.(?:stderr|stdout)\.log$")
+LOCK_POLL = 0.2  # seconds between two tries of a held export lock
+BUSY_CODE = "RIVET_AIRFLOW_EXPORT_BUSY"
+APPLIED_LOOKBACK = 50  # newest `rivet metrics` rows of an export searched for the run an earlier try's apply made
+PR_SET_PDEATHSIG = 1  # <linux/prctl.h>
 
 
 def worker_environment(
@@ -194,6 +202,19 @@ class Stopped(Exception):
         self.step = step
 
 
+class Busy(Exception):
+    """The export's lock stayed held for `lock_wait` seconds: a try of this task, or a rivet process one left behind,
+    still works on the export. No rivet process was started; the task is retried (G2)."""
+
+    code = BUSY_CODE
+
+    def __init__(self, lock: Path, unit: str, waited: int) -> None:
+        super().__init__(
+            f"[{BUSY_CODE}] the lock {lock} of {unit} stayed held for {waited} s: another try of this task, or a rivet "
+            "process an earlier try left running, still works on it. rivet was not started; the task is retried"
+        )
+
+
 class _Session:
     """One task's invocation: its preflight result, working files and collected degradations."""
 
@@ -209,6 +230,7 @@ class _Session:
         self.argvs: list[list[str]] = []
         self.stderr_path: str | None = None
         self.tmp: Path | None = None
+        self.lock_fd: int | None = None
         dag, run = (path_name(part) for part in request.label[:2])
         task = hashed_name(request.label[2])
         attempt = f"try{int(request.label[3])}"
@@ -281,11 +303,16 @@ class _Session:
             self.degraded.add("lock_wait")
         return flags
 
-    def step(self, name: str, argv: list[str], stdout_to: Path | None = None) -> _Step:
+    def step(
+        self, name: str, argv: list[str], stdout_to: Path | None = None, on_start: Callable[[int], Any] | None = None
+    ) -> _Step:
         """Run one rivet process with stdout and stderr sent to private files, and read its error line.
 
         A stop Airflow requested before this step raises `Stopped` instead of starting rivet: on Airflow 3 the SIGTERM
-        handler returns, so a stop that met no running process is seen only here (D40)."""
+        handler returns, so a stop that met no running process is seen only here (D40).
+
+        The process inherits the export's lock descriptor, so the lock is held as long as rivet lives, also when the
+        task process dies first; on Linux it gets SIGTERM when the task process dies (G2). `on_start` gets its pid."""
         if self.stopped is not None and self.stopped():
             raise Stopped(name)
         self.argvs.append(argv)
@@ -294,11 +321,22 @@ class _Session:
         self.emit({"event": "rivet.start", "step": name, "argv": argv, "stderr_path": str(stderr_path)})
         cwd = self.req.cwd or str(Path(self.req.config).resolve().parent)
         with _open_private(stdout_path) as out, _open_private(stderr_path) as err:
-            proc = subprocess.Popen(argv, stdout=out, stderr=err, stdin=subprocess.DEVNULL, env=dict(self.req.env), cwd=cwd)
+            proc = subprocess.Popen(
+                argv,
+                stdout=out,
+                stderr=err,
+                stdin=subprocess.DEVNULL,
+                env=dict(self.req.env),
+                cwd=cwd,
+                pass_fds=() if self.lock_fd is None else (self.lock_fd,),
+                preexec_fn=_parent_death_signal(),
+            )
             running = Running(proc)
             if self.on_process:
                 self.on_process(running)
             try:
+                if on_start is not None:
+                    on_start(proc.pid)
                 code = running.wait()
             except BaseException:
                 running.request_stop()
@@ -599,6 +637,92 @@ def _copy_query_files(config: Mapping[str, Any], source: Path, folder: Path, tou
         _write_atomic(folder / QUERY_OWNERS, json.dumps(claimed, sort_keys=True).encode())
 
 
+@functools.cache
+def _prctl() -> Any:
+    """libc's `prctl` on Linux, else `None`."""
+    if not sys.platform.startswith("linux"):
+        return None
+    try:
+        return ctypes.CDLL(None, use_errno=True).prctl
+    except (OSError, AttributeError):
+        return None
+
+
+def _parent_death_signal() -> Callable[[], None] | None:
+    """A `preexec_fn` that has the kernel send rivet SIGTERM when the thread that started it dies (Linux
+    `PR_SET_PDEATHSIG`): a task process killed outright (OOM, SIGKILL of the runner alone) no longer leaves an orphaned
+    rivet beside its retry. `None` where there is no such call; the export lock still covers that case (G2)."""
+    prctl = _prctl()
+    if prctl is None:
+        return None
+    parent = os.getpid()
+
+    def arm() -> None:
+        prctl(PR_SET_PDEATHSIG, int(_signal.SIGTERM), 0, 0, 0)
+        if os.getppid() != parent:  # the task process died before the call took effect
+            os.kill(os.getpid(), _signal.SIGTERM)
+
+    return arm
+
+
+def _lock_path(s: _Session) -> tuple[Path, str] | None:
+    """The export's lock file and what it covers; `None` for `plan` (read-only) and without a state directory.
+
+    run / cdc_run / apply share one lock per export (rivet's run lease covers the three); load / compact take one per
+    table where the binary narrows to a table, else one per export, as the load lease covers (G2)."""
+    if s.pf.state_dir is None or s.req.command == "plan":
+        return None
+    cmd, export, table = s.req.command, s.req.export, s.req.table
+    locks = _private_dir(s.pf.state_dir, "airflow", "locks")
+    whole = hashed_name("config", str(Path(s.req.config).resolve()))
+    if cmd in ("load", "compact"):
+        if table and s.pf.caps.has_flag(cmd, "--table"):
+            return _private_dir(locks, "table") / f"{hashed_name(export or '', table)}.lock", f"table `{table}` of `{export}`"
+        return locks / f"{path_name(export) if export else whole}.lock", f"export `{export}`" if export else "the config"
+    return _private_dir(locks, "run") / f"{path_name(export) if export else whole}.lock", (
+        f"export `{export}`" if export else "the config"
+    )
+
+
+@contextlib.contextmanager
+def _export_lock(s: _Session) -> Iterator[None]:
+    """Hold the export's exclusive lock while this task runs rivet: wait up to `lock_wait` seconds, then raise `Busy`.
+
+    Every rivet step inherits the descriptor (`step`), so a rivet that outlives the task keeps the lock and a retry
+    cannot start a second one beside it. The lock is released by an explicit unlock once the steps have ended: a copy
+    of the descriptor in any other process would keep a lock released by close alone held."""
+    found = _lock_path(s)
+    if found is None:
+        yield
+        return
+    path, unit = found
+    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+    try:
+        deadline = time.monotonic() + max(0, s.req.lock_wait)
+        waiting = False
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if s.stopped is not None and s.stopped():
+                    raise Stopped(s.req.command) from None
+                if not waiting:
+                    waiting = True
+                    s.emit({"event": "rivet.lock.wait", "lock": str(path), "unit": unit, "lock_wait": s.req.lock_wait})
+                if time.monotonic() >= deadline:
+                    raise Busy(path, unit, s.req.lock_wait) from None
+                time.sleep(LOCK_POLL)
+        s.lock_fd = fd
+        try:
+            yield
+        finally:
+            s.lock_fd = None
+            fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
 class Running:
     """A started rivet process: the step reaps it, `on_kill` may ask it to stop.
 
@@ -797,6 +921,13 @@ def _apply(s: _Session) -> Outcome:
     name = path_name(export, s.req.label[2], *series, _plan_inputs(s, export))
     artifact = _private_dir(s.work, "plans", s.run) / f"{name}.json"
     _refuse_foreign_artifact(artifact, export, cfg)
+    record = artifact.with_name(f"{artifact.stem}.apply.json")
+    done = _applied_by_earlier_try(s, cfg, export, artifact, record)
+    if done is not None:
+        step, unit = done
+        s.stderr_path = str(s.logs / f"{s.log_name}.metrics.stderr.log")
+        s.emit({"event": "rivet.apply.already_applied", "export": export, "run_id": unit.run_id, "artifact": str(artifact)})
+        return s.outcome(step, [unit], None)
     if not _unexpired(artifact):
         plan_argv = [s.pf.binary, "plan", "--config", cfg, "--export", export, "--format", "json"]
         plan_argv += ["--output", str(artifact), "--json-errors"]
@@ -814,7 +945,9 @@ def _apply(s: _Session) -> Outcome:
     else:
         s.degraded.add("apply_summary")
     argv += [*s.req.extra_args, *s.globals_for("apply")]
-    step = s.step("apply", argv)
+    started = {"export": export, "artifact": _digest(artifact), "started_at": datetime.now(UTC).isoformat(), "pid": None}
+    _write_atomic(record, json.dumps(started).encode())
+    step = s.step("apply", argv, on_start=lambda pid: _write_atomic(record, json.dumps({**started, "pid": pid}).encode()))
     error = s.classify(step)
     doc = s.result_file(summary, step) if has_summary else None
     summary.unlink(missing_ok=True)
@@ -824,16 +957,67 @@ def _apply(s: _Session) -> Outcome:
     return s.outcome(step, units, error)
 
 
-def _unit_from_metrics(s: _Session, cfg: str, export: str) -> UnitResult:
-    """Counts of the export's latest run from `rivet metrics --json`; best effort."""
-    argv = [s.pf.binary, "metrics", "--config", cfg, "--export", export, "--last", "1", "--json"]
+def _metrics_rows(s: _Session, cfg: str, export: str, last: int) -> tuple[_Step, list[dict[str, Any]]]:
+    """The export's newest `last` rows of `rivet metrics --json`, newest first; none when the call failed."""
+    argv = [s.pf.binary, "metrics", "--config", cfg, "--export", export, "--last", str(last), "--json"]
     out = s.work / f"{s.name}.metrics.json"
     step = s.step("metrics", argv, stdout_to=out)
     rows = _read_json(out)
     out.unlink(missing_ok=True)
+    if step.exit_status != 0 or not isinstance(rows, list):
+        return step, []
+    return step, [row for row in rows if isinstance(row, dict)]
+
+
+def _digest(path: Path) -> str | None:
+    """SHA-256 of a file's bytes, `None` when it cannot be read."""
+    try:
+        return hashlib.sha256(path.read_bytes()).hexdigest()
+    except OSError:
+        return None
+
+
+def _applied_by_earlier_try(s: _Session, cfg: str, export: str, artifact: Path, record: Path) -> tuple[_Step, UnitResult] | None:
+    """The successful run of the apply an earlier try of this series started, when rivet's state holds one (G1, G1b).
+
+    Before `rivet apply` the task records, beside the sealed plan, the plan's digest, when it started the process and
+    its pid. A try that died after that apply ended (the task process killed, a zombie) left the record and no result
+    Airflow saw. The record counts only for the same plan bytes, and a run is that apply's only when rivet's own run id
+    names it: `<export>_<UTC start, ms>_<pid of the process>`, with the recorded pid and a start no earlier than the
+    record's. Anything else, a plan replaced or gone, a record without a pid, a run `running`, `interrupted` or failed,
+    or no readable state, is `None`: the plan is applied as before."""
+    doc = _read_json(record)
+    if not isinstance(doc, dict) or doc.get("export") != export or type(doc.get("pid")) is not int:
+        return None
+    if doc.get("artifact") is None or doc.get("artifact") != _digest(artifact):
+        return None
+    try:
+        started = datetime.fromisoformat(str(doc["started_at"]))
+    except ValueError:
+        return None
+    if started.tzinfo is None:
+        return None
+    floor = started.replace(microsecond=started.microsecond // 1000 * 1000)
+    step, rows = _metrics_rows(s, cfg, export, APPLIED_LOOKBACK)
+    shape = re.compile(re.escape(export) + r"_(\d{8}T\d{6}\.\d{3})_(\d+)")
+    for row in rows:
+        match = shape.fullmatch(str(row.get("run_id")))
+        if row.get("export_name") != export or row.get("status") not in ("success", "skipped") or match is None:
+            continue
+        if int(match[2]) != doc["pid"] or datetime.strptime(match[1], "%Y%m%dT%H%M%S.%f").replace(tzinfo=UTC) < floor:
+            continue
+        unit = UnitResult(export, status=row["status"], run_id=row["run_id"])
+        unit.rows, unit.files = s.malformed(row.get("total_rows"), int), s.malformed(row.get("files_produced"), int)
+        return step, unit
+    return None
+
+
+def _unit_from_metrics(s: _Session, cfg: str, export: str) -> UnitResult:
+    """Counts of the export's latest run from `rivet metrics --json`; best effort."""
+    step, rows = _metrics_rows(s, cfg, export, 1)
     unit = UnitResult(export, status="success")
-    row = rows[0] if isinstance(rows, list) and rows and isinstance(rows[0], dict) else {}
-    if step.exit_status == 0 and row.get("export_name") == export:
+    row = rows[0] if rows else {}
+    if row.get("export_name") == export:
         if "status" in row:  # a `skip_empty` run that delivered nothing is `skipped` (D31)
             unit.status = s.status(row["status"])
             unit.skip_reason = s.malformed(row.get("skip_reason"), str)
@@ -879,18 +1063,9 @@ def _load(s: _Session) -> Outcome:
     else:
         s.degraded.add("load_result")
     argv += [*s.req.extra_args, *s.globals_for(cmd)]
-    lock = None
     if table and not by_table:
-        s.degraded.add("load_table_filter")
-        if s.pf.state_dir is not None:
-            locks = _private_dir(s.pf.state_dir, "airflow", "locks")
-            lock = open(locks / f"{path_name(export or 'config')}.lock", "w")
-            fcntl.flock(lock, fcntl.LOCK_EX)
-    try:
-        step = s.step(cmd, argv)
-    finally:
-        if lock is not None:
-            lock.close()
+        s.degraded.add("load_table_filter")  # the whole export is loaded, under the export's lock (`_lock_path`)
+    step = s.step(cmd, argv)
     error = s.classify(step)
     doc = s.result_file(result, step) if has_result else None
     result.unlink(missing_ok=True)
@@ -957,7 +1132,8 @@ def _invoke(request: Request, emit: Emit, on_process: Callable | None, stopped: 
         emit({"event": "rivet.warning", "warning": key, "text": text})
     session = _Session(request, pf, emit, on_process, stopped)
     try:
-        return _DISPATCH[request.command](session)
+        with _export_lock(session):
+            return _DISPATCH[request.command](session)
     finally:
         session.close()
 

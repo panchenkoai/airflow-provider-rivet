@@ -31,6 +31,9 @@ from airflow_provider_rivet.operators import (
 )
 
 OLD_BATCH = ["apply_summary", "lock_wait", "no_notify", "state_url_sqlite"]
+# An apply that failed retryably: its retry replays the sealed plan. A retry after an apply that SUCCEEDED applies
+# nothing (G1b, tests/test_retry.py), so the tests of how a retry finds and replays its plan start from a failure.
+FAILED_APPLY = {"exit": 2, "line": {"error": "network", "exit_class": 2}}
 METRICS = [{"export_name": "orders", "run_id": "orders_1", "total_rows": 500, "files_produced": 1}]
 
 
@@ -486,7 +489,8 @@ def test_without_a_state_directory_stderr_goes_to_a_private_file_and_never_to_th
 
 def test_log_files_are_private_and_only_the_last_tries_of_a_task_are_kept(rig: Rig) -> None:
     op = rig.operator(RivetApplyOperator, export="orders", log_keep=2)
-    paths = [Path(rig.run(op, FakeTI(try_number=n))[0]["stderr_path"]) for n in (1, 2, 3)]
+    # each try a new series (a clear), so each applies: a retry in one series does not apply a plan that succeeded (G1b)
+    paths = [Path(rig.run(op, FakeTI(try_number=n, max_tries=n + 1))[0]["stderr_path"]) for n in (1, 2, 3)]
     assert [p.exists() for p in paths] == [False, True, True]
     folder = paths[0].parent
     assert folder == rig.state_dir / "logs" / "dag" / invocation.hashed_name("task") and folder.name == "task-9aae63ebb719"
@@ -621,7 +625,7 @@ def test_a_malformed_error_object_falls_back_to_the_exit_table_and_says_so(rig: 
 
 
 def test_an_expired_sealed_plan_is_planned_again(rig: Rig) -> None:
-    rig.scenario(plan_expires_hours=-1)
+    rig.scenario(plan_expires_hours=-1, apply=FAILED_APPLY)
     op = rig.operator(RivetApplyOperator, export="orders")
     rig.run(op)
     rig.run(op, FakeTI(try_number=2))
@@ -917,14 +921,20 @@ def test_two_configs_with_one_export_name_in_one_run_each_plan_and_apply_their_o
     assert [mode(d) for d in (artifacts[0].parent, artifacts[0].parent.parent)] == [0o700, 0o700], (
         "plans/ and plans/<run>/ are private"
     )
-    rig.run(two, FakeTI(task_id=two.task_id, try_number=2))
-    steps = [c["argv"] for c in rig.calls() if c["argv"][0] in ("plan", "apply")]
-    assert [s[0] for s in steps][4:] == ["apply"] and steps[4][1] == str(artifacts[1]), "a retry replays its own task's plan"
+    rig.scenario(apply=FAILED_APPLY)
+    rig.run(two, FakeTI(task_id=two.task_id, try_number=2, max_tries=3))  # a clear: a new series whose apply fails
+    rig.scenario()
+    rig.run(two, FakeTI(task_id=two.task_id, try_number=3, max_tries=3))
+    steps = [c["argv"] for c in rig.calls() if c["argv"][0] in ("plan", "apply")][4:]
+    assert [s[0] for s in steps] == ["plan", "apply", "apply"] and steps[1][1] == steps[2][1], "a retry replays its plan"
+    replayed = json.loads(Path(steps[2][1]).read_text())["config_path"]
+    assert replayed == json.loads(artifacts[1].read_text())["config_path"], "a retry replays its own task's plan"
 
 
 def test_a_config_or_query_file_edited_between_two_tries_is_planned_again(rig: Rig) -> None:
     (rig.config_dir / "orders.sql").write_text("SELECT 1")
     rig.config.write_text(CONFIG_WITH_QUERY_FILE)
+    rig.scenario(apply=FAILED_APPLY)
     op = rig.operator(RivetApplyOperator, export="orders")
     rig.run(op)
     rig.run(op, FakeTI(try_number=2))
@@ -1008,9 +1018,11 @@ def through_a_symlink(rig: Rig) -> Path:
 @pytest.mark.parametrize("spelling", [other_case, other_normal_form, through_a_symlink], ids=["case", "unicode-form", "symlink"])
 def test_a_task_applies_its_own_plan_when_rivet_records_another_spelling_of_the_config(rig: Rig, spelling: object) -> None:
     op = rig.operator(RivetApplyOperator, export="orders", state_dir=str(spelling(rig)))
-    for attempt in (1, 2):
-        payload, _ = rig.run(op, FakeTI(try_number=attempt))
-        assert isinstance(payload, dict) and payload["decision"] == "success", payload
+    for attempt, play in ((1, FAILED_APPLY), (2, {})):
+        rig.scenario(apply=play)
+        payload, ti = rig.run(op, FakeTI(try_number=attempt))
+        payload = payload if isinstance(payload, dict) else ti.store[("task", "return_value")]
+        assert payload["decision"] == ("retry" if play else "success"), payload
     steps = [c["argv"] for c in rig.calls() if c["argv"][0] in ("plan", "apply")]
     assert [s[0] for s in steps] == ["plan", "apply", "apply"], "the task's own plan is applied and replayed, not refused"
     given, artifact = steps[0][steps[0].index("--config") + 1], Path(steps[1][1])
@@ -1087,7 +1099,7 @@ def test_a_file_at_the_artifact_path_that_is_no_plan_object_is_planned_over(rig:
 
 
 def test_the_scratch_files_of_two_tries_tasks_or_runs_are_separate_files(rig: Rig) -> None:
-    rig.scenario(flags=NEW_FLAGS)
+    rig.scenario(flags=NEW_FLAGS, apply=FAILED_APPLY)
     tis = [FakeTI(), FakeTI(try_number=2), FakeTI(task_id="other"), FakeTI()]
     tis[3].run_id = "manual__2026-10-07"
     for cls in (RivetRunOperator, RivetApplyOperator, RivetLoadOperator):

@@ -124,6 +124,30 @@ def stale_artifact(spec, argv, export):
     return snapshot is not None and "--force" not in argv and snapshot != cursors(spec).get(export)
 
 
+def run_id_of(export):
+    """rivet's `fresh_run_id` (src/pipeline/summary.rs): `<export>_<UTC %Y%m%dT%H%M%S%.3f>_<pid>`."""
+    now = datetime.now(UTC)
+    return f"{export}_{now:%Y%m%dT%H%M%S}.{now.microsecond // 1000:03d}_{os.getpid()}"
+
+
+def record_metric(row):
+    """rivet's `export_metrics` (src/state/metrics.rs): a `running` row while the run lives, replaced by its terminal
+    row when it ends; a process killed mid-run leaves its `running` row behind. Kept in `metrics.json` beside the fake."""
+    path = HERE / "metrics.json"
+    rows = json.loads(path.read_text()) if path.exists() else []
+    rows = [r for r in rows if r.get("run_id") != row["run_id"]] + [row]
+    path.write_text(json.dumps(rows))
+
+
+def counts_of(play, export):
+    """(rows, files) the play's summary reports for the export, 0 when it reports none."""
+    entries = (play.get("summary") or {}).get("per_export") if isinstance(play.get("summary"), dict) else None
+    for entry in entries if isinstance(entries, list) else []:
+        if isinstance(entry, dict) and entry.get("export_name") == export:
+            return entry.get("rows") or 0, entry.get("files") or 0
+    return 0, 0
+
+
 def canonical(path):
     """A path as rivet's `canonicalize()` records it: symlinks resolved, each component as its directory lists it."""
     out = os.sep
@@ -195,8 +219,19 @@ def main():
         print(json.dumps({**line, "code": "RIVET_PLAN_ARTIFACT_STALE"}), file=sys.stderr)
         return 5
     if sub == "metrics":
-        print(json.dumps(play.get("rows", [])))
+        if "rows" in play:
+            print(json.dumps(play["rows"]))
+        else:
+            held = json.loads((HERE / "metrics.json").read_text()) if (HERE / "metrics.json").exists() else []
+            held = [r for r in reversed(held) if export in ("", r["export_name"])]
+            print(json.dumps(held[: int(value_of(argv, "--last") or len(held))]))
         return play.get("exit", 0)
+    metric = None
+    if sub in ("run", "apply") and export:
+        rows, files = counts_of(play, export)
+        metric = {"export_name": export, "run_id": run_id_of(export), "status": "running", "total_rows": rows}
+        metric["files_produced"] = files
+        record_metric(metric)
     if play.get("stderr"):
         print(play["stderr"], file=sys.stderr)
     for name in spec.get("leak_env", []):
@@ -222,12 +257,21 @@ def main():
     if play.get("sleep"):
         if play.get("ignore_term"):
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        elif play.get("term_marker"):
+
+            def on_term(signum, frame):
+                Path(play["term_marker"]).write_text(str(os.getpid()))
+                os._exit(143)
+
+            signal.signal(signal.SIGTERM, on_term)
         Path(play["started"]).write_text(str(os.getpid()))
         time.sleep(play["sleep"])
     if play.get("signal"):
         os.kill(os.getpid(), getattr(signal, play["signal"]))
     if sub == "apply" and not play.get("exit"):
         cursors(spec, {export: str(int(cursors(spec).get(export) or 0) + 1)})
+    if metric is not None:
+        record_metric({**metric, "status": "failed" if play.get("exit") else "success"})
     return play.get("exit", 0)
 
 
