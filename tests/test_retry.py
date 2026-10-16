@@ -16,6 +16,7 @@ import pytest
 from airflow.exceptions import AirflowException, AirflowFailException
 from conftest import NEW_FLAGS, FakeTI, Rig
 
+from airflow_provider_rivet import invocation
 from airflow_provider_rivet.operators import RivetApplyOperator, RivetLoadOperator, RivetRunOperator
 
 FULL = {"per_export": [{"export_name": "orders", "status": "success", "mode": "full", "rows": 7, "files": 2}]}
@@ -302,3 +303,22 @@ def test_g2c_another_refusal_is_still_not_retried(rig: Rig) -> None:
     rig.scenario(flags=NEW_FLAGS, run={"exit": 5, "line": line})
     exc, _ = rig.run(rig.operator(RivetRunOperator, export="users"))
     assert type(exc) is AirflowFailException
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="PR_SET_PDEATHSIG exists on Linux only (CI is Linux)")
+def test_g2_a_child_whose_task_process_already_died_stops_whatever_sigterm_handler_it_inherited() -> None:
+    """The task process died before `prctl` took effect (here: the process running the call is a grandchild of the one
+    that armed it). The child must end before it can exec rivet as an orphan; a SIGTERM to itself ran the inherited
+    handler, which on Airflow 3 returns, and the child went on."""
+    arm = invocation._parent_death_signal()
+    child = os.fork()
+    if child == 0:  # pragma: no cover - the child
+        grandchild = os.fork()
+        if grandchild == 0:
+            signal.signal(signal.SIGTERM, lambda signum, frame: None)
+            arm()
+            os._exit(0)
+        _, status = os.waitpid(grandchild, 0)
+        os._exit(0 if os.waitstatus_to_exitcode(status) == -signal.SIGKILL else 1)
+    _, status = os.waitpid(child, 0)
+    assert os.waitstatus_to_exitcode(status) == 0, "the orphaned child survived its own stop"
