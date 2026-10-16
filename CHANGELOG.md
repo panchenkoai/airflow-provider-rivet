@@ -67,3 +67,11 @@ Changed before the first release, after review (see the README sections named):
   a callback in `default_args` fires once per failed task.
 - `connection_url`: a password without a login, IPv6 hosts, Oracle `service_name`, an encoded
   database name. The version has one source, `airflow_provider_rivet/__init__.py`.
+- `on_kill` only sends SIGTERM; the step that started rivet reaps it and kills it after 30 s.
+  It used to wait inside Airflow's SIGTERM handler on the lock the interrupted `wait` held, so
+  the task hung until the supervisor's SIGKILL and its secrets folder was never removed.
+- rivet's stderr is cut into lines at `\n` only: a `--json-errors` line whose message holds
+  U+2028, U+2029 or U+0085 was cut apart, so a retryable failure lost its code and its retry.
+  A stderr line that starts with `{` and is not JSON is recorded as `result_malformed`.
+- A summary file that is missing (`result_missing`) or not a JSON object (`result_malformed`)
+  after an exit-0 process is recorded in `degraded`. ("Works today / needs a newer rivet")

@@ -9,9 +9,11 @@ import json
 import os
 import re
 import shutil
+import signal as _signal
 import stat
 import subprocess
 import tempfile
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -36,6 +38,7 @@ CLOUD_ENV = {
     "azure": ("AZURE_*",),
 }
 STDERR_TAIL = 1 << 20
+STOP_GRACE = 30.0  # seconds a stopped rivet process gets between SIGTERM and SIGKILL
 QUERY_OWNERS = ".rivet_airflow_query_files.json"
 PLAN_ERRORS = (ValueError, KeyError, IndexError, TypeError, AttributeError)
 _SAFE = re.compile(r"[^A-Za-z0-9_.-]+")
@@ -166,6 +169,7 @@ class _Step:
     signal: int | None
     line: dict[str, Any] | None
     stdout_path: Path
+    broken: bool = False
 
 
 class _Session:
@@ -261,21 +265,23 @@ class _Session:
         cwd = self.req.cwd or str(Path(self.req.config).resolve().parent)
         with _open_private(stdout_path) as out, _open_private(stderr_path) as err:
             proc = subprocess.Popen(argv, stdout=out, stderr=err, stdin=subprocess.DEVNULL, env=dict(self.req.env), cwd=cwd)
+            running = Running(proc)
             if self.on_process:
-                self.on_process(proc)
+                self.on_process(running)
             try:
-                code = proc.wait()
+                code = running.wait()
             except BaseException:
-                _stop(proc)
+                running.request_stop()
+                running.wait()
                 raise
         if name != "metrics":
             self.stderr_path = str(stderr_path)
-        text = _tail(stderr_path)
+        lines = _lines(_tail(stderr_path))
         if self.req.stream_stderr:
-            for raw in text.splitlines():
+            for raw in lines:
                 self.emit({"event": "rivet.stderr", "step": name, "line": raw})
         signal = -code if code < 0 else None
-        return _Step(None if signal else code, signal, _error_line(text), stdout_path)
+        return _Step(None if signal else code, signal, _error_line(lines), stdout_path, _has_broken_object(lines))
 
     def classify(self, step: _Step) -> ErrorObject | None:
         """The process-level error object: read when rivet printed a well-formed one, built from the exit when not."""
@@ -288,7 +294,26 @@ class _Session:
                     self.degraded.add("error_object")
                 return error
             self.degraded.add("result_malformed")
+        elif step.signal is None and step.broken:
+            self.degraded.add("result_malformed")
         return error_from_exit(step.exit_status, step.signal)
+
+    def result_file(self, path: Path, step: _Step) -> Any:
+        """A `--summary-output` file rivet was asked for; on exit 0 an absent or non-JSON one is recorded (D18)."""
+        try:
+            doc = json.loads(path.read_text())
+        except OSError:
+            doc, missing = None, True
+        except ValueError:
+            doc, missing = None, False
+        else:
+            missing = False
+        if step.signal is None and step.exit_status == 0:
+            if missing:
+                self.degraded.add("result_missing")
+            elif not isinstance(doc, dict):
+                self.degraded.add("result_malformed")
+        return doc
 
     def unit_error(self, step: _Step, own: Any, export: str | None, table: str | None, shared: ErrorObject) -> ErrorObject:
         """A failed unit's object: its own, its `failures[]` entry, or the process-level one (recorded)."""
@@ -420,11 +445,14 @@ def _prune_logs(folder: Path, keep: int) -> None:
 
 
 def _tail(path: Path) -> str:
-    """The last STDERR_TAIL bytes of a file, as text."""
+    """The last STDERR_TAIL bytes of a file, as text; when that cuts a line, from the next whole line."""
     with open(path, "rb") as handle:
         size = handle.seek(0, os.SEEK_END)
-        handle.seek(max(0, size - STDERR_TAIL))
-        return handle.read().decode(errors="replace")
+        start = handle.seek(max(0, size - STDERR_TAIL))
+        data = handle.read()
+    if start > 0:
+        data = data[data.find(b"\n") + 1 :]
+    return data.decode(errors="replace")
 
 
 def copy_name(source: Path, only_export: str | None = None) -> str:
@@ -468,20 +496,53 @@ def _copy_query_files(config: Mapping[str, Any], source: Path, folder: Path, tou
         _write_atomic(folder / QUERY_OWNERS, json.dumps(claimed, sort_keys=True).encode())
 
 
-def _stop(proc: subprocess.Popen) -> None:
-    """Terminate a rivet process the task is abandoning, then kill it if it lingers."""
-    if proc.poll() is None:
-        proc.terminate()
+class Running:
+    """A started rivet process: the step reaps it, `on_kill` may ask it to stop.
+
+    `request_stop` runs inside Airflow's SIGTERM handler, on the thread that is inside `wait`, holding
+    `Popen._waitpid_lock`; so it only sends a signal and never waits or polls (D02). The reaping, and the SIGKILL
+    after STOP_GRACE seconds, happen in `wait` on the step's own loop.
+    """
+
+    def __init__(self, proc: subprocess.Popen) -> None:
+        self.proc = proc
+        self.stop_at: float | None = None
+
+    def request_stop(self) -> None:
+        """Send SIGTERM once and note when; nothing that takes the process's wait lock."""
+        if self.stop_at is not None or self.proc.returncode is not None:
+            return
+        self.stop_at = time.monotonic()
         try:
-            proc.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
+            os.kill(self.proc.pid, _signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+    def wait(self) -> int:
+        """Reap the process; once a stop was requested, kill it when it outlives the grace."""
+        while True:
+            try:
+                return self.proc.wait(timeout=0.2)
+            except subprocess.TimeoutExpired:
+                if self.stop_at is not None and time.monotonic() - self.stop_at >= STOP_GRACE:
+                    self.proc.kill()
 
 
-def _error_line(stderr_text: str) -> dict[str, Any] | None:
+def _lines(stderr_text: str) -> list[str]:
+    """The lines of rivet's stderr: cut at "\n" only, a trailing "\r" dropped (D01).
+
+    `str.splitlines` also cuts at U+2028, U+2029, U+0085 and C0 separators, which rivet leaves raw inside the JSON
+    string of a `--json-errors` line.
+    """
+    pieces = stderr_text.split("\n")
+    if pieces and pieces[-1] == "":
+        pieces.pop()
+    return [piece.removesuffix("\r") for piece in pieces]
+
+
+def _error_line(stderr: str | list[str]) -> dict[str, Any] | None:
     """The last line of the stderr tail that is a JSON object with `exit_class`: the `--json-errors` line."""
-    for raw in reversed(stderr_text.splitlines()):
+    for raw in reversed(_lines(stderr) if isinstance(stderr, str) else stderr):
         raw = raw.strip()
         if not raw.startswith("{"):
             continue
@@ -492,6 +553,18 @@ def _error_line(stderr_text: str) -> dict[str, Any] | None:
         if isinstance(obj, dict) and "exit_class" in obj:
             return obj
     return None
+
+
+def _has_broken_object(lines: list[str]) -> bool:
+    """True when a stderr line starts like a JSON object and does not parse: a cut or garbled error line (D01)."""
+    for raw in lines:
+        raw = raw.strip()
+        if raw.startswith("{"):
+            try:
+                json.loads(raw)
+            except ValueError:
+                return True
+    return False
 
 
 def _read_json(path: Path) -> Any:
@@ -606,7 +679,7 @@ def _run(s: _Session) -> Outcome:
     argv += ["--summary-output", str(summary), *s.req.extra_args, *s.globals_for("run")]
     step = s.step("run", argv)
     error = s.classify(step)
-    doc = _read_json(summary)
+    doc = s.result_file(summary, step)
     summary.unlink(missing_ok=True)
     return s.outcome(step, _run_units(s, step, doc, error), error)
 
@@ -635,7 +708,7 @@ def _apply(s: _Session) -> Outcome:
     argv += [*s.req.extra_args, *s.globals_for("apply")]
     step = s.step("apply", argv)
     error = s.classify(step)
-    doc = _read_json(summary) if has_summary else None
+    doc = s.result_file(summary, step) if has_summary else None
     summary.unlink(missing_ok=True)
     units = _run_units(s, step, doc, error)
     if error is None and not has_summary:
@@ -708,7 +781,7 @@ def _load(s: _Session) -> Outcome:
         if lock is not None:
             lock.close()
     error = s.classify(step)
-    doc = _read_json(result) if has_result else None
+    doc = s.result_file(result, step) if has_result else None
     result.unlink(missing_ok=True)
     rows = _entries(s, doc, "per_table")
     if not rows:

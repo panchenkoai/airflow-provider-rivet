@@ -97,6 +97,12 @@ DEGRADATIONS: dict[str, Degradation] = {
             "worker",
         ),
         Degradation(
+            "result_missing",
+            "the `--summary-output` file of a process that exited 0",
+            "units are built from the exit, as for a binary without the summary flag",
+            "output",
+        ),
+        Degradation(
             "result_malformed",
             "an error object or result entry with the contract's keys and types",
             "the entry is read by the exit-code table, a bad value is null, an unknown status counts as failed",
