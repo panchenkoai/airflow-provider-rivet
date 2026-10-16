@@ -197,3 +197,108 @@ def test_d02_on_kill_only_signals_and_never_waits_or_polls(rig: Rig, monkeypatch
     op.on_kill()
     op.on_kill()
     assert sent == [(4242, invocation._signal.SIGTERM)]
+
+
+GAP_CHILD = r"""
+import json, os, signal, sys, tempfile, time
+from pathlib import Path
+sys.path.insert(0, sys.argv[4])
+tmp, how, gap = Path(sys.argv[1]), sys.argv[2], sys.argv[3]
+(tmp / "tmp").mkdir()
+tempfile.tempdir = str(tmp / "tmp")
+from conftest import FakeTI, Rig
+from airflow_provider_rivet import invocation
+from airflow_provider_rivet.operators import RivetApplyOperator
+rig = Rig(tmp)
+op = rig.operator(RivetApplyOperator, export="orders")
+handled = []
+
+class Terminated(BaseException):
+    pass
+
+def on_term(signum, frame):
+    # Airflow 3's task runner calls on_kill and returns; Airflow 2's raises after it.
+    handled.append(signum)
+    op.on_kill()
+    if how == "raise":
+        raise Terminated()
+
+signal.signal(signal.SIGTERM, on_term)
+
+def stop_now():
+    # The SIGTERM lands here, with no rivet process running, and is handled before this returns.
+    os.kill(os.getpid(), signal.SIGTERM)
+    deadline = time.monotonic() + 5
+    while not handled and time.monotonic() < deadline:
+        time.sleep(0.01)
+
+if gap == "before_first_step":
+    preflight = invocation.run_preflight
+    def run_preflight(**kwargs):
+        pf = preflight(**kwargs)
+        stop_now()
+        return pf
+    invocation.run_preflight = run_preflight
+else:
+    step = invocation._Session.step
+    def gated(self, name, argv, stdout_to=None):
+        if name == "apply":
+            stop_now()
+        return step(self, name, argv, stdout_to)
+    invocation._Session.step = gated
+
+t0 = time.monotonic()
+try:
+    op.execute({"ti": FakeTI(), "run_id": "r"})
+    raised = None
+except BaseException as exc:
+    raised = type(exc).__name__
+print(json.dumps({"elapsed": time.monotonic() - t0, "raised": raised, "handled": len(handled),
+                  "steps": [c["argv"][0] for c in rig.calls()],
+                  "secrets": sorted(p.name for p in (tmp / "tmp").glob("rivet-airflow-secrets-*"))}))
+"""
+
+
+@pytest.mark.parametrize("how", ["return", "raise"])
+@pytest.mark.parametrize("gap", ["between_plan_and_apply", "before_first_step"])
+def test_d40_a_sigterm_while_no_rivet_runs_stops_the_next_step_from_starting(tmp_path: Path, how: str, gap: str) -> None:
+    """D40: SIGTERM between two steps (plan done, apply not started) or before the first: no rivet runs to hold it.
+
+    `on_kill` must still record the stop, so no later step starts rivet; the task fails and does not succeed. The
+    signal is delivered synchronously at the gap (a patched seam), not by a sleep race. `return` is Airflow 3's
+    handler, `raise` Airflow 2's.
+    """
+    script = tmp_path / "gap_child.py"
+    script.write_text(GAP_CHILD)
+    work = tmp_path / "work"
+    work.mkdir()
+    tests = str(Path(__file__).resolve().parent)
+    try:
+        done = subprocess.run(
+            [sys.executable, str(script), str(work), how, gap, tests], capture_output=True, text=True, timeout=25
+        )
+    except subprocess.TimeoutExpired:
+        pytest.fail("D40: execute did not return within 25 s of SIGTERM")
+    assert done.returncode == 0, done.stderr[-2000:]
+    report = json.loads(done.stdout.strip().splitlines()[-1])
+    assert report["handled"] == 1, "D40: the SIGTERM never reached the handler: the test proves nothing"
+    started = ["plan"] if gap == "between_plan_and_apply" else []
+    assert report["steps"] == started, f"D40: rivet was started after the stop: {report['steps']}"
+    expected = "AirflowException" if how == "return" else "Terminated"
+    assert report["raised"] == expected, f"D40: execute ended with {report['raised']!r}, not a stop Airflow retries"
+    assert report["elapsed"] < 10, f"D40: execute took {report['elapsed']:.1f} s after SIGTERM"
+    assert report["secrets"] == [], "D40: the rivet-airflow-secrets-* folder was left behind"
+
+
+def test_d40_a_process_started_after_the_stop_is_stopped_at_once(rig: Rig, monkeypatch: pytest.MonkeyPatch) -> None:
+    """D40: a SIGTERM between the step's stop check and `_hold` met no process; the process `_hold` then gets is stopped."""
+
+    class Fresh:
+        pid, returncode = 4243, None
+
+    sent: list[tuple[int, int]] = []
+    monkeypatch.setattr(invocation.os, "kill", lambda pid, sig: sent.append((pid, sig)))
+    op = rig.operator(RivetApplyOperator, export="orders")
+    op.on_kill()
+    op._hold(invocation.Running(Fresh()))
+    assert sent == [(4243, invocation._signal.SIGTERM)]

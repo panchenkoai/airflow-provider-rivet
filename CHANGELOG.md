@@ -139,6 +139,10 @@ is now the one place rivet's environment is assembled; README "Storage and wareh
 - `on_kill` only sends SIGTERM; the step that started rivet reaps it and kills it after 30 s.
   It used to wait inside Airflow's SIGTERM handler on the lock the interrupted `wait` held, so
   the task hung until the supervisor's SIGKILL and its secrets folder was never removed.
+- A stop Airflow requests while no rivet process runs (between `rivet plan` and `rivet apply`, or
+  before the first step) keeps every later step from starting: the task fails with a retryable
+  error and `stopped_before` in XCom. On Airflow 3, whose SIGTERM handler returns, the next step
+  used to start rivet and run it to completion after the stop. (D40)
 - rivet's stderr is cut into lines at `\n` only: a `--json-errors` line whose message holds
   U+2028, U+2029 or U+0085 was cut apart, so a retryable failure lost its code and its retry.
   A stderr line that starts with `{` and is not JSON is recorded as `result_malformed`.
