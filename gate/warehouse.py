@@ -200,14 +200,14 @@ def _schema_exists(cloud: Cloud, stack: str) -> bool:
     return any(r.get("name") == cloud.schema(stack) for r in rows)
 
 
-def prepare(cloud: Cloud, stack: str) -> None:
+def prepare(cloud: Cloud, stack: str, warehouses: Sequence[str] = WAREHOUSES) -> None:
     """The stack's BigQuery dataset and Snowflake schema (a schema an administrator made for the run is kept)."""
     _bq(f"--location={cloud.location}", "mk", "-f", "--dataset", f"{cloud.project}:{cloud.dataset(stack)}")
-    if not _schema_exists(cloud, stack):
+    if "snowflake" in warehouses and not _schema_exists(cloud, stack):
         _snow(cloud, f'CREATE SCHEMA IF NOT EXISTS {cloud.sf_database}."{cloud.schema(stack)}"')
 
 
-def leftovers(cloud: Cloud, stack: str) -> list[str]:
+def leftovers(cloud: Cloud, stack: str, warehouses: Sequence[str] = WAREHOUSES) -> list[str]:
     """What of one stack's dataset, schema and GCS prefix is still there; a listing that cannot answer raises."""
     left = []
     ds = f"{cloud.project}:{cloud.dataset(stack)}"
@@ -216,7 +216,7 @@ def leftovers(cloud: Cloud, stack: str) -> list[str]:
         left.append(f"bq:{ds}")
     elif "Not found" not in (shown.stdout + shown.stderr):
         raise RuntimeError(f"cannot tell whether {ds} is gone: {(shown.stderr or shown.stdout).strip()[-500:]}")
-    if _schema_exists(cloud, stack):
+    if "snowflake" in warehouses and _schema_exists(cloud, stack):
         left.append(f"snowflake:{cloud.sf_database}.{cloud.schema(stack)}")
     prefix = f"gs://{cloud.bucket}/{cloud.root(stack)}"
     listed = sh(["gcloud", "storage", "ls", "-r", prefix], timeout=600, check=False)
@@ -227,12 +227,13 @@ def leftovers(cloud: Cloud, stack: str) -> list[str]:
     return left
 
 
-def cleanup(cloud: Cloud, stack: str) -> None:
+def cleanup(cloud: Cloud, stack: str, warehouses: Sequence[str] = WAREHOUSES) -> None:
     """Remove what one stack wrote (the dataset, the schema, the GCS prefix), then list again: anything left raises."""
     _bq("rm", "-r", "-f", "--dataset", f"{cloud.project}:{cloud.dataset(stack)}", check=False)
-    _snow(cloud, f'DROP SCHEMA IF EXISTS {cloud.sf_database}."{cloud.schema(stack)}"', check=False)
+    if "snowflake" in warehouses:
+        _snow(cloud, f'DROP SCHEMA IF EXISTS {cloud.sf_database}."{cloud.schema(stack)}"', check=False)
     sh(["gcloud", "storage", "rm", "-r", "--quiet", f"gs://{cloud.bucket}/{cloud.root(stack)}"], timeout=600, check=False)
-    left = leftovers(cloud, stack)
+    left = leftovers(cloud, stack, warehouses)
     if left:
         raise RuntimeError(f"cloud cleanup left behind {left}")
 
@@ -492,13 +493,13 @@ class Leg:
     def prepare(self, stand: Any) -> None:
         """Configs in the stand, the dataset and the schema in the clouds."""
         write_configs(stand.rivet_dir, self.cloud, self.stack, self.tables)
-        prepare(self.cloud, self.stack)
+        prepare(self.cloud, self.stack, self.warehouses)
 
     def cleanup(self) -> None:
         sf = self._clients.pop("snowflake", None)
         if sf is not None:
             sf.close()
-        cleanup(self.cloud, self.stack)
+        cleanup(self.cloud, self.stack, self.warehouses)
 
     def inventory(self, stand: Any) -> dict[str, list[str]]:
         """The objects each warehouse holds after a cycle."""
