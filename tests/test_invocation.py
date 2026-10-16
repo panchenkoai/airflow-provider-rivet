@@ -936,3 +936,16 @@ def test_an_apply_reads_its_own_runs_counts_not_the_newest_row_of_its_export(rig
         ("orders", "success", own[0]["run_id"], 7, 2, None)
     ]
     assert "result_malformed" not in out.degraded
+
+
+@pytest.mark.parametrize(
+    ("command", "kwargs"),
+    [("run", {"export": "orders"}), ("apply", {"export": "orders"}), ("load", {"export": "users", "table": "users"})],
+)
+def test_the_global_flags_are_probed_on_the_subcommand_that_runs(rig: Rig, command: str, kwargs: dict) -> None:
+    """A binary that refuses `--help` of a subcommand it does not have (as clap does) still runs the task with the
+    global flags its own subcommand lists (`_apply` 151, 152: `globals_for` of a misspelt subcommand)."""
+    rig.scenario(flags=NEW_FLAGS, strict_help=True)
+    out, _ = attempt(rig, command, lock_wait=30, **kwargs)
+    assert isinstance(out, Outcome) and out.decision == "success", out
+    assert rig.argv(command)[-4:] == ["--json-errors", "--no-notify", "--lock-wait", "30"]

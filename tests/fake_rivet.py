@@ -186,7 +186,8 @@ def main():
     if "--help" in argv:
         if broken.get(sub) == "hang":
             time.sleep(90)
-        if broken.get(sub) == "exit":
+        if broken.get(sub) == "exit" or (spec.get("strict_help") and sub not in BASE_FLAGS):
+            # opt-in `strict_help`: as real rivet (clap), a subcommand it does not have is refused, exit 2
             print(f"error: unrecognized subcommand '{sub}'", file=sys.stderr)
             return 2
         flags = BASE_FLAGS.get(sub, []) + spec.get("flags", {}).get(sub, []) + spec.get("flags", {}).get("*", [])
