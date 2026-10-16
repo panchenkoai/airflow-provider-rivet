@@ -78,3 +78,49 @@ Changed before the first release, after review (see the README sections named):
   ("DAG builders")
 - On Airflow 3 the exceptions are imported from `airflow.sdk.exceptions`, not the deprecated
   `airflow.exceptions`.
+- A clear of a finished `RivetApplyOperator` plans again instead of replaying a sealed plan whose
+  cursor the successful apply already moved (rivet refused it `RIVET_PLAN_ARTIFACT_STALE` on
+  every clear for 24 h): the artifact is named by the try series (`max_tries`). (D04)
+- `RivetPlanOperator` and `build_batch_dag` read a plan of one export, which rivet prints as a
+  bare object with no campaign; it was a `KeyError` and an `internal` failure. (D10)
+- The sealed plan artifact is mode `0600` whatever rivet's umask, as the README said. (D38)
+- Expired plan artifacts and crashed ledgers untouched for 24 h are pruned. (D33)
+- An apply whose counts come from `rivet metrics --json` reports the row's status: a
+  `skip_empty` export that delivered nothing is `skipped` with its `skip_reason`. (D31)
+
+The environment built from Connections, after the 2026-10 bug hunt (`connections.build_environment`
+is now the one place rivet's environment is assembled; README "Storage and warehouse connections"):
+
+- A storage Connection that supplies a credential replaces the worker's variables of its kind
+  (`cloud_credentials`, `env_passthrough`): the worker's `AWS_SESSION_TOKEN` no longer rides beside
+  a Connection's static keys, nor its Azure account key beside a Connection's SAS token. (D12)
+- An AWS Connection with `role_arn`, `assume_role_*`, `profile_name` or keys in extras is refused
+  (`RIVET_AIRFLOW_CONNECTION_UNSUPPORTED`) instead of running as the worker's identity. (D13)
+- Snowflake: with a private key, the Connection's password reaches `snow` as
+  `PRIVATE_KEY_PASSPHRASE` (D14); a base64 `private_key_content` is decoded to PEM, and content
+  that is neither is refused (D15); the extra `region` is written to the `snow` connection (D19);
+  `config.toml` is written as TOML, so a non-BMP or control character in any field reads back
+  unchanged (D20).
+- `connection_url` maps the standard extras with a URL form (PostgreSQL `sslmode`, MongoDB `srv`,
+  `authSource`, ...) and refuses `iam`, `redshift`, `unix_socket` (D21); only a real IPv6 literal
+  is bracketed, with its zone encoded as `%25` (D23).
+- A ClickHouse Connection without a host is refused (`RIVET_AIRFLOW_CONNECTION_INCOMPLETE`)
+  instead of becoming `http://None`. (D22)
+- README: an Azure config reads `account_name: ${AZURE_STORAGE_ACCOUNT}`. (D32)
+- A Connection id no backend defines (`env_from_connections`, `connections`) is refused,
+  `RIVET_AIRFLOW_CONNECTION_MISSING`, with the refusal in XCom; it was retried with no XCom.
+- A config that is not UTF-8, nests too deep, holds a scalar Python cannot convert, or whose
+  `exports` is not a list of mappings with a string `name`, is refused
+  `RIVET_AIRFLOW_CONFIG_UNREADABLE`; it crashed with a traceback and was retried. The
+  Connection resolution reads the config through the same reader.
+- A rivet binary whose `--version` or `<sub> --help` probe fails or times out, in the preflight
+  or while argv is built, is refused `RIVET_AIRFLOW_BINARY_MISSING` with the refusal in XCom; it
+  raised a raw `RuntimeError` / `TimeoutExpired` and was retried.
+- `on_kill` only sends SIGTERM; the step that started rivet reaps it and kills it after 30 s.
+  It used to wait inside Airflow's SIGTERM handler on the lock the interrupted `wait` held, so
+  the task hung until the supervisor's SIGKILL and its secrets folder was never removed.
+- rivet's stderr is cut into lines at `\n` only: a `--json-errors` line whose message holds
+  U+2028, U+2029 or U+0085 was cut apart, so a retryable failure lost its code and its retry.
+  A stderr line that starts with `{` and is not JSON is recorded as `result_malformed`.
+- A summary file that is missing (`result_missing`) or not a JSON object (`result_malformed`)
+  after an exit-0 process is recorded in `degraded`. ("Works today / needs a newer rivet")

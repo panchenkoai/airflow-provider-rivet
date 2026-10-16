@@ -9,9 +9,11 @@ import json
 import os
 import re
 import shutil
+import signal as _signal
 import stat
 import subprocess
 import tempfile
+import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -19,7 +21,8 @@ from pathlib import Path
 from typing import Any
 
 from . import _yaml
-from .preflight import STATE_URL_ENV, Preflight, PreflightRefusal, run_preflight, state_kind
+from .capabilities import ProbeFailed
+from .preflight import STATE_URL_ENV, Preflight, PreflightRefusal, binary_unanswering, run_preflight, state_kind
 from .result import STATUSES, ErrorObject, UnitResult, error_from_exit, error_from_line, worst
 
 Emit = Callable[[dict[str, Any]], None]
@@ -36,7 +39,9 @@ CLOUD_ENV = {
     "azure": ("AZURE_*",),
 }
 STDERR_TAIL = 1 << 20
+STOP_GRACE = 30.0  # seconds a stopped rivet process gets between SIGTERM and SIGKILL
 QUERY_OWNERS = ".rivet_airflow_query_files.json"
+STALE_AFTER = 24 * 3600  # seconds after which an expired plan artifact or an untouched crashed ledger is pruned
 PLAN_ERRORS = (ValueError, KeyError, IndexError, TypeError, AttributeError)
 _SAFE = re.compile(r"[^A-Za-z0-9_.-]+")
 _PLAIN = re.compile(r"[a-z0-9_][a-z0-9_.-]{0,79}")
@@ -79,8 +84,19 @@ def undeclared_state_variables(env: Mapping[str, str], environ: Mapping[str, str
 
 
 def plan_layout(plan: Any) -> list[dict[str, Any]]:
-    """Waves of a `rivet plan --format json` document, lowest first; raises one of PLAN_ERRORS when it is not one."""
-    campaign = plan[0]["prioritization"]["campaign"]
+    """Waves of a `rivet plan --format json` document, lowest first; raises one of PLAN_ERRORS when it is not one.
+
+    Several planned exports print as an array whose objects carry the campaign; one planned export prints as its
+    bare object with no campaign, and its one wave is its own `export_recommendation` (D10).
+    """
+    if isinstance(plan, dict):
+        rec = plan["prioritization"]["export_recommendation"]
+        name = plan["export_name"]
+        if not isinstance(name, str) or rec.get("export_name", name) != name:
+            raise ValueError("the plan's recommendation names another export")
+        campaign = {"waves": [{"wave": int(rec["recommended_wave"]), "exports": [name]}], "ordered_exports": [rec]}
+    else:
+        campaign = plan[0]["prioritization"]["campaign"]
     cost = {e["export_name"]: e.get("cost_class") for e in campaign.get("ordered_exports", [])}
     waves = sorted(campaign["waves"], key=lambda w: w["wave"])
     layout = [
@@ -113,6 +129,7 @@ class Request:
     stream_stderr: bool = False
     log_keep: int | None = 10
     label: Sequence[Any] = ("dag", "run", "task", 1)
+    series: int | None = None
     upstream_markers: Sequence[str] = ()
 
 
@@ -166,6 +183,7 @@ class _Step:
     signal: int | None
     line: dict[str, Any] | None
     stdout_path: Path
+    broken: bool = False
 
 
 class _Session:
@@ -205,6 +223,8 @@ class _Session:
         """Drop the scratch directory of a diskless worker and the log files past the retention."""
         if self.tmp is not None:
             shutil.rmtree(self.tmp, ignore_errors=True)
+        else:
+            _prune_stale(self.work)
         if self.req.log_keep is not None:
             _prune_logs(self.logs, max(1, self.req.log_keep))
 
@@ -261,21 +281,23 @@ class _Session:
         cwd = self.req.cwd or str(Path(self.req.config).resolve().parent)
         with _open_private(stdout_path) as out, _open_private(stderr_path) as err:
             proc = subprocess.Popen(argv, stdout=out, stderr=err, stdin=subprocess.DEVNULL, env=dict(self.req.env), cwd=cwd)
+            running = Running(proc)
             if self.on_process:
-                self.on_process(proc)
+                self.on_process(running)
             try:
-                code = proc.wait()
+                code = running.wait()
             except BaseException:
-                _stop(proc)
+                running.request_stop()
+                running.wait()
                 raise
         if name != "metrics":
             self.stderr_path = str(stderr_path)
-        text = _tail(stderr_path)
+        lines = _lines(_tail(stderr_path))
         if self.req.stream_stderr:
-            for raw in text.splitlines():
+            for raw in lines:
                 self.emit({"event": "rivet.stderr", "step": name, "line": raw})
         signal = -code if code < 0 else None
-        return _Step(None if signal else code, signal, _error_line(text), stdout_path)
+        return _Step(None if signal else code, signal, _error_line(lines), stdout_path, _has_broken_object(lines))
 
     def classify(self, step: _Step) -> ErrorObject | None:
         """The process-level error object: read when rivet printed a well-formed one, built from the exit when not."""
@@ -288,7 +310,26 @@ class _Session:
                     self.degraded.add("error_object")
                 return error
             self.degraded.add("result_malformed")
+        elif step.signal is None and step.broken:
+            self.degraded.add("result_malformed")
         return error_from_exit(step.exit_status, step.signal)
+
+    def result_file(self, path: Path, step: _Step) -> Any:
+        """A `--summary-output` file rivet was asked for; on exit 0 an absent or non-JSON one is recorded (D18)."""
+        try:
+            doc = json.loads(path.read_text())
+        except OSError:
+            doc, missing = None, True
+        except ValueError:
+            doc, missing = None, False
+        else:
+            missing = False
+        if step.signal is None and step.exit_status == 0:
+            if missing:
+                self.degraded.add("result_missing")
+            elif not isinstance(doc, dict):
+                self.degraded.add("result_malformed")
+        return doc
 
     def unit_error(self, step: _Step, own: Any, export: str | None, table: str | None, shared: ErrorObject) -> ErrorObject:
         """A failed unit's object: its own, its `failures[]` entry, or the process-level one (recorded)."""
@@ -403,6 +444,34 @@ def _temp_base() -> Path:
     return path
 
 
+def _tighten(path: Path) -> None:
+    """Mode 0600 on a file rivet wrote through its umask (D38); a missing file is left to the step that reads it."""
+    try:
+        os.chmod(path, 0o600)
+    except FileNotFoundError:
+        pass
+
+
+def _prune_stale(work: Path, now: float | None = None) -> None:
+    """Remove expired plan artifacts and crashed ledgers untouched for STALE_AFTER, and the run folders left empty (D33)."""
+    cutoff = (time.time() if now is None else now) - STALE_AFTER
+    for kind in ("plans", "crashed"):
+        try:
+            files = [p for p in (work / kind).rglob("*") if p.is_file() and p.stat().st_mtime < cutoff]
+        except OSError:
+            continue
+        for path in files:
+            if _unexpired(path) if kind == "plans" else not isinstance(_read_json(path), list):
+                continue  # a replayable plan, or a ledger that is not one: left until a person deletes it
+            path.unlink(missing_ok=True)
+        if kind == "plans":
+            for folder in (work / kind).iterdir() if (work / kind).is_dir() else ():
+                try:
+                    folder.rmdir()
+                except OSError:
+                    pass
+
+
 def _prune_logs(folder: Path, keep: int) -> None:
     """Keep the stdout and stderr files of a task's newest `keep` tries; remove the older tries' files."""
     attempts: dict[str, list[Path]] = {}
@@ -420,11 +489,14 @@ def _prune_logs(folder: Path, keep: int) -> None:
 
 
 def _tail(path: Path) -> str:
-    """The last STDERR_TAIL bytes of a file, as text."""
+    """The last STDERR_TAIL bytes of a file, as text; when that cuts a line, from the next whole line."""
     with open(path, "rb") as handle:
         size = handle.seek(0, os.SEEK_END)
-        handle.seek(max(0, size - STDERR_TAIL))
-        return handle.read().decode(errors="replace")
+        start = handle.seek(max(0, size - STDERR_TAIL))
+        data = handle.read()
+    if start > 0:
+        data = data[data.find(b"\n") + 1 :]
+    return data.decode(errors="replace")
 
 
 def narrowed_exports(exports: list[Any], only_export: str) -> list[dict[str, Any]]:
@@ -484,20 +556,53 @@ def _copy_query_files(config: Mapping[str, Any], source: Path, folder: Path, tou
         _write_atomic(folder / QUERY_OWNERS, json.dumps(claimed, sort_keys=True).encode())
 
 
-def _stop(proc: subprocess.Popen) -> None:
-    """Terminate a rivet process the task is abandoning, then kill it if it lingers."""
-    if proc.poll() is None:
-        proc.terminate()
+class Running:
+    """A started rivet process: the step reaps it, `on_kill` may ask it to stop.
+
+    `request_stop` runs inside Airflow's SIGTERM handler, on the thread that is inside `wait`, holding
+    `Popen._waitpid_lock`; so it only sends a signal and never waits or polls (D02). The reaping, and the SIGKILL
+    after STOP_GRACE seconds, happen in `wait` on the step's own loop.
+    """
+
+    def __init__(self, proc: subprocess.Popen) -> None:
+        self.proc = proc
+        self.stop_at: float | None = None
+
+    def request_stop(self) -> None:
+        """Send SIGTERM once and note when; nothing that takes the process's wait lock."""
+        if self.stop_at is not None or self.proc.returncode is not None:
+            return
+        self.stop_at = time.monotonic()
         try:
-            proc.wait(timeout=30)
-        except subprocess.TimeoutExpired:
-            proc.kill()
-            proc.wait()
+            os.kill(self.proc.pid, _signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+
+    def wait(self) -> int:
+        """Reap the process; once a stop was requested, kill it when it outlives the grace."""
+        while True:
+            try:
+                return self.proc.wait(timeout=0.2)
+            except subprocess.TimeoutExpired:
+                if self.stop_at is not None and time.monotonic() - self.stop_at >= STOP_GRACE:
+                    self.proc.kill()
 
 
-def _error_line(stderr_text: str) -> dict[str, Any] | None:
+def _lines(stderr_text: str) -> list[str]:
+    """The lines of rivet's stderr: cut at "\n" only, a trailing "\r" dropped (D01).
+
+    `str.splitlines` also cuts at U+2028, U+2029, U+0085 and C0 separators, which rivet leaves raw inside the JSON
+    string of a `--json-errors` line.
+    """
+    pieces = stderr_text.split("\n")
+    if pieces and pieces[-1] == "":
+        pieces.pop()
+    return [piece.removesuffix("\r") for piece in pieces]
+
+
+def _error_line(stderr: str | list[str]) -> dict[str, Any] | None:
     """The last line of the stderr tail that is a JSON object with `exit_class`: the `--json-errors` line."""
-    for raw in reversed(stderr_text.splitlines()):
+    for raw in reversed(_lines(stderr) if isinstance(stderr, str) else stderr):
         raw = raw.strip()
         if not raw.startswith("{"):
             continue
@@ -508,6 +613,18 @@ def _error_line(stderr_text: str) -> dict[str, Any] | None:
         if isinstance(obj, dict) and "exit_class" in obj:
             return obj
     return None
+
+
+def _has_broken_object(lines: list[str]) -> bool:
+    """True when a stderr line starts like a JSON object and does not parse: a cut or garbled error line (D01)."""
+    for raw in lines:
+        raw = raw.strip()
+        if raw.startswith("{"):
+            try:
+                json.loads(raw)
+            except ValueError:
+                return True
+    return False
 
 
 def _read_json(path: Path) -> Any:
@@ -622,7 +739,7 @@ def _run(s: _Session) -> Outcome:
     argv += ["--summary-output", str(summary), *s.req.extra_args, *s.globals_for("run")]
     step = s.step("run", argv)
     error = s.classify(step)
-    doc = _read_json(summary)
+    doc = s.result_file(summary, step)
     summary.unlink(missing_ok=True)
     return s.outcome(step, _run_units(s, step, doc, error), error)
 
@@ -631,7 +748,11 @@ def _apply(s: _Session) -> Outcome:
     """`rivet plan -e X -o artifact` when no unexpired artifact exists, then `rivet apply artifact`."""
     export = s.req.export or ""
     cfg = s.config_for(None)
-    artifact = _private_dir(s.work, "plans", s.run) / f"{path_name(export, s.req.label[2], _plan_inputs(s, export))}.json"
+    # One sealed plan per try series (Airflow's `max_tries`, which a clear moves): a retry replays it, a clear after a
+    # success plans again instead of replaying a snapshot the successful apply already moved the cursor past (D04).
+    series = () if s.req.series is None else (f"s{int(s.req.series)}",)
+    name = path_name(export, s.req.label[2], *series, _plan_inputs(s, export))
+    artifact = _private_dir(s.work, "plans", s.run) / f"{name}.json"
     _refuse_foreign_artifact(artifact, export, cfg)
     if not _unexpired(artifact):
         plan_argv = [s.pf.binary, "plan", "--config", cfg, "--export", export, "--format", "json"]
@@ -641,6 +762,7 @@ def _apply(s: _Session) -> Outcome:
         if error is not None:
             return s.outcome(planned, [UnitResult(export, status="failed", error=error)], error)
         _refuse_foreign_artifact(artifact, export, cfg)
+        _tighten(artifact)
     has_summary = s.pf.caps.has_flag("apply", "--summary-output")
     summary = s.work / f"{s.name}.summary.json"
     argv = [s.pf.binary, "apply", str(artifact)]
@@ -651,7 +773,7 @@ def _apply(s: _Session) -> Outcome:
     argv += [*s.req.extra_args, *s.globals_for("apply")]
     step = s.step("apply", argv)
     error = s.classify(step)
-    doc = _read_json(summary) if has_summary else None
+    doc = s.result_file(summary, step) if has_summary else None
     summary.unlink(missing_ok=True)
     units = _run_units(s, step, doc, error)
     if error is None and not has_summary:
@@ -669,6 +791,9 @@ def _unit_from_metrics(s: _Session, cfg: str, export: str) -> UnitResult:
     unit = UnitResult(export, status="success")
     row = rows[0] if isinstance(rows, list) and rows and isinstance(rows[0], dict) else {}
     if step.exit_status == 0 and row.get("export_name") == export:
+        if "status" in row:  # a `skip_empty` run that delivered nothing is `skipped` (D31)
+            unit.status = s.status(row["status"])
+            unit.skip_reason = s.malformed(row.get("skip_reason"), str)
         unit.run_id = s.malformed(row.get("run_id"), str)
         unit.rows, unit.files = s.malformed(row.get("total_rows"), int), s.malformed(row.get("files_produced"), int)
     return unit
@@ -724,7 +849,7 @@ def _load(s: _Session) -> Outcome:
         if lock is not None:
             lock.close()
     error = s.classify(step)
-    doc = _read_json(result) if has_result else None
+    doc = s.result_file(result, step) if has_result else None
     result.unlink(missing_ok=True)
     rows = _entries(s, doc, "per_table")
     if not rows:
@@ -759,9 +884,17 @@ _DISPATCH = {"run": _run, "cdc_run": _run, "apply": _apply, "plan": _plan, "load
 
 
 def invoke(request: Request, emit: Emit, on_process: Callable | None = None) -> Outcome:
-    """Preflight, run and classify one rivet task."""
+    """Preflight, run and classify one rivet task; a probe of the binary that fails at any point is a refusal."""
     if request.command not in _DISPATCH:
         raise ValueError(f"unknown rivet command {request.command!r}")
+    try:
+        return _invoke(request, emit, on_process)
+    except ProbeFailed as exc:
+        raise binary_unanswering(exc) from exc
+
+
+def _invoke(request: Request, emit: Emit, on_process: Callable | None) -> Outcome:
+    """`invoke` with the probes' failures still raw: the binary's `<sub> --help` is read lazily while argv is built."""
     pf = run_preflight(
         rivet_bin=request.rivet_bin,
         config_path=request.config,

@@ -7,6 +7,7 @@ import os
 import stat
 import subprocess
 import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -97,8 +98,11 @@ def test_apply_on_a_binary_with_the_contract_flags_passes_them_and_degrades_noth
 
 def test_a_retry_reuses_the_sealed_plan_artifact(rig: Rig) -> None:
     op = rig.operator(RivetApplyOperator, export="orders")
+    rig.scenario(cursors={"orders": "5"}, apply={"exit": 2, "line": {"error": "connection reset by peer", "exit_class": 2}})
     rig.run(op)
-    rig.run(op, FakeTI(try_number=2))
+    rig.scenario()
+    payload, _ = rig.run(op, FakeTI(try_number=2))
+    assert payload["decision"] == "success"
     assert [c["argv"][0] for c in rig.calls()].count("plan") == 1
     assert [c["argv"][0] for c in rig.calls()].count("apply") == 2
 
@@ -376,11 +380,16 @@ def test_plan_swaps_the_layout_file_in_only_when_the_builder_can_read_it(rig: Ri
     target.write_text('["old"]')
     target.chmod(0o640)
     campaign = {
-        "waves": [{"wave": 1, "exports": ["orders"]}],
-        "ordered_exports": [{"export_name": "orders", "cost_class": "low"}],
+        "waves": [{"wave": 1, "exports": ["orders", "users"]}],
+        "ordered_exports": [{"export_name": "orders", "cost_class": "low"}, {"export_name": "users", "cost_class": "low"}],
     }
-    layout = [{"export_name": "orders", "prioritization": {"campaign": campaign}}]
-    for unusable in ([], [{"export_name": "orders"}], {"not": "a list"}, [{"prioritization": {"campaign": {"waves": "x"}}}]):
+    layout = [{"export_name": n, "prioritization": {"campaign": campaign}} for n in ("orders", "users")]
+    for unusable in (
+        [],
+        [{"export_name": "orders"}] * 2,
+        {"not": "a list"},
+        [{"prioritization": {"campaign": {"waves": "x"}}}] * 2,
+    ):
         rig.scenario(plan_list=unusable)
         exc, ti = rig.run(rig.operator(RivetPlanOperator, plan_file=str(target)))
         assert isinstance(exc, AirflowFailException) and json.loads(target.read_text()) == ["old"], unusable
@@ -388,7 +397,7 @@ def test_plan_swaps_the_layout_file_in_only_when_the_builder_can_read_it(rig: Ri
     rig.scenario(plan_list=layout)
     payload, _ = rig.run(rig.operator(RivetPlanOperator, plan_file=str(target)))
     assert payload["decision"] == "success" and json.loads(target.read_text()) == layout
-    assert read_plan_layout(str(target)) == [{"wave": 1, "exports": ["orders"], "heavy": []}]
+    assert read_plan_layout(str(target)) == [{"wave": 1, "exports": ["orders", "users"], "heavy": []}]
     assert mode(target) == 0o640, "the layout file keeps the mode the DAG processor reads it with"
     rig.scenario(plan={"exit": 1, "line": {"error": "bad config", "exit_class": 1}})
     exc, _ = rig.run(rig.operator(RivetPlanOperator, plan_file=str(target)))
@@ -754,8 +763,8 @@ def test_two_exports_whose_names_sanitise_to_one_get_their_own_plan_and_are_both
     ],
 )
 def test_two_dags_tasks_or_runs_whose_ids_sanitise_to_one_share_no_artifact_log_or_ledger(rig: Rig, ids: list) -> None:
-    def ti(which: int, try_number: int = 1) -> FakeTI:
-        made = FakeTI(try_number=try_number)
+    def ti(which: int, try_number: int = 1, max_tries: int = 2) -> FakeTI:
+        made = FakeTI(try_number=try_number, max_tries=max_tries)
         for field, value in ids[which].items():
             setattr(made, field, value)
         return made
@@ -763,7 +772,10 @@ def test_two_dags_tasks_or_runs_whose_ids_sanitise_to_one_share_no_artifact_log_
     keep = None if "run_id" in ids[0] else 1
     op = rig.operator(RivetApplyOperator, export="orders", log_keep=keep)
     first, _ = rig.run(op, ti(0))
-    second, _ = rig.run(op, ti(1))
+    rig.scenario(apply={"exit": 2, "line": {"error": "connection reset by peer", "exit_class": 2}})
+    _, failed = rig.run(op, ti(1))
+    second = failed.store[(failed.task_id, "return_value")]
+    rig.scenario()
     retried, _ = rig.run(op, ti(1, try_number=2))
     artifacts = [c["argv"][1] for c in rig.calls() if c["argv"][0] == "apply"]
     assert [c["argv"][0] for c in rig.calls()].count("plan") == 2, "the second id plans for itself; only its own retry replays"
@@ -773,7 +785,7 @@ def test_two_dags_tasks_or_runs_whose_ids_sanitise_to_one_share_no_artifact_log_
     assert logs[0].exists(), "pruning the second id's tries leaves the first id's files alone"
     assert logs[1].exists() is (keep is None) and logs[2].exists(), "retention counts the tries of one task of one DAG"
     rig.scenario(apply={"signal": "SIGKILL"})
-    crashed = [rig.run(op, ti(0, try_number=3))[0], rig.run(op, ti(1, try_number=4))[0]]
+    crashed = [rig.run(op, ti(0, try_number=3, max_tries=5))[0], rig.run(op, ti(1, try_number=4, max_tries=5))[0]]
     assert [type(c) for c in crashed] == [AirflowException, AirflowException], "each id has its own crashed budget"
 
 
@@ -1095,8 +1107,8 @@ def test_the_plan_scratch_file_is_not_shared_by_two_dags_refreshing_one_layout_f
 ) -> None:
     opened, real = [], invocation._open_private
     monkeypatch.setattr(invocation, "_open_private", lambda path: (opened.append(Path(path)), real(path))[1])
-    campaign = {"waves": [{"wave": 1, "exports": ["orders"]}], "ordered_exports": []}
-    rig.scenario(plan_list=[{"export_name": "orders", "prioritization": {"campaign": campaign}}])
+    campaign = {"waves": [{"wave": 1, "exports": ["orders", "users"]}], "ordered_exports": []}
+    rig.scenario(plan_list=[{"export_name": n, "prioritization": {"campaign": campaign}} for n in ("orders", "users")])
     target = rig.tmp / "pg.plan.json"
     op = rig.operator(RivetPlanOperator, plan_file=str(target))
     tis = [FakeTI(), FakeTI(), FakeTI(try_number=2)]
@@ -1153,6 +1165,71 @@ def test_an_unchanged_config_copy_is_not_replaced_while_another_task_may_read_it
     assert target.stat().st_ino == inode, "the same bytes were renamed over the file a parallel task reads"
     invocation._write_atomic(target, b"a: 2\n")
     assert target.read_bytes() == b"a: 2\n" and oct(target.stat().st_mode & 0o777) == "0o600"
+
+
+def test_a_cleared_apply_after_a_success_plans_again_instead_of_replaying_a_stale_plan(rig: Rig) -> None:
+    """D04: the successful apply moved the cursor, so the sealed snapshot is stale; a clear must not replay it."""
+    rig.scenario(cursors={"orders": "5"})
+    op = rig.operator(RivetApplyOperator, export="orders")
+    first, _ = rig.run(op)
+    assert first["decision"] == "success"
+    again, _ = rig.run(op, FakeTI(try_number=2, max_tries=3))
+    assert not isinstance(again, Exception), f"a clear after a success replayed the stale plan: {again}"
+    assert again["decision"] == "success"
+    assert [c["argv"][0] for c in rig.calls()].count("plan") == 2
+
+
+def test_a_bare_single_export_plan_is_a_layout(rig: Rig) -> None:
+    """D10: rivet prints one planned export as its bare object, with no campaign; the waves come from its recommendation."""
+    rec = {"export_name": "orders", "cost_class": "high", "recommended_wave": 2, "priority_score": 1}
+    rig.scenario(plan_list=[{"export_name": "orders", "prioritization": {"export_recommendation": rec}}])
+    target = rig.tmp / "pg.plan.json"
+    payload, _ = rig.run(rig.operator(RivetPlanOperator, plan_file=str(target)))
+    assert not isinstance(payload, Exception), payload
+    assert payload["decision"] == "success"
+    assert read_plan_layout(str(target)) == [{"wave": 2, "exports": ["orders"], "heavy": ["orders"]}]
+
+
+def test_the_sealed_plan_artifact_is_private_whatever_the_umask(rig: Rig) -> None:
+    """D38: rivet writes the artifact through the umask; the README promises 0600 for every file under airflow/."""
+    rig.scenario(apply={"exit": 2, "line": {"error": "connection reset by peer", "exit_class": 2}})
+    old = os.umask(0o022)
+    try:
+        rig.run(rig.operator(RivetApplyOperator, export="orders"))
+    finally:
+        os.umask(old)
+    artifact = Path(rig.argv("apply")[1])
+    assert mode(artifact) == 0o600
+
+
+def test_old_plan_artifacts_and_crashed_ledgers_are_pruned(rig: Rig) -> None:
+    """D33: expired plan artifacts and crashed ledgers past 24 h are removed, with the run folders they leave empty."""
+    work = rig.state_dir / "airflow" / "dag"
+    day_ago = time.time() - 25 * 3600
+    old_plan = work / "plans" / "old_run" / "orders__task.json"
+    live_plan = work / "plans" / "live_run" / "orders__task.json"
+    old_ledger, new_ledger = work / "crashed" / "old", work / "crashed" / "new"
+    for path in (old_plan, live_plan, old_ledger, new_ledger):
+        path.parent.mkdir(parents=True, exist_ok=True)
+    old_plan.write_text(json.dumps({"export_name": "orders", "expires_at": "2026-01-01T00:00:00+00:00"}))
+    live_plan.write_text(json.dumps({"export_name": "orders", "expires_at": "2999-01-01T00:00:00+00:00"}))
+    old_ledger.write_text("[[1, 2]]")
+    new_ledger.write_text("[[1, 2]]")
+    for path in (old_plan, live_plan, old_ledger):
+        os.utime(path, (day_ago, day_ago))
+    rig.run(rig.operator(RivetRunOperator, export="orders"))
+    assert not old_plan.exists() and not old_plan.parent.exists(), "an expired artifact of an old run is removed"
+    assert not old_ledger.exists(), "a crashed ledger untouched for 24 h is removed"
+    assert live_plan.exists() and new_ledger.exists(), "an unexpired artifact and a recent ledger stay"
+
+
+def test_an_apply_unit_from_metrics_takes_the_status_rivet_recorded(rig: Rig) -> None:
+    """D31: a skip_empty export that delivered nothing is `skipped` in metrics, and the apply unit says so."""
+    row = {**METRICS[0], "total_rows": 0, "files_produced": 0, "status": "skipped", "skip_reason": "source returned 0 rows"}
+    rig.scenario(metrics={"rows": [row]})
+    payload, _ = rig.run(rig.operator(RivetApplyOperator, export="orders"))
+    assert payload["units"][0]["status"] == "skipped"
+    assert payload["skip_reason"] == "source returned 0 rows"
 
 
 RECIPES = """\

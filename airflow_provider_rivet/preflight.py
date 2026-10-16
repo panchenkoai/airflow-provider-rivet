@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from . import _yaml
-from .capabilities import MIN_RIVET_VERSION, Capabilities, probe
+from .capabilities import MIN_RIVET_VERSION, Capabilities, ProbeFailed, probe
 
 MARKER_NAME = ".rivet_airflow_marker"
 STATE_DB_NAME = ".rivet_state.db"
@@ -66,16 +66,35 @@ def resolve_binary(rivet_bin: str, env: Mapping[str, str]) -> str:
     return found
 
 
+def binary_unanswering(exc: ProbeFailed) -> PreflightRefusal:
+    """The refusal for a binary that does not answer a probe, before the preflight or while argv is built."""
+    return PreflightRefusal("RIVET_AIRFLOW_BINARY_MISSING", f"the rivet binary does not answer its probes: {exc}")
+
+
 def read_config(config_path: str) -> dict[str, Any]:
-    """Parse the config as YAML; a refusal when it is missing or not a mapping."""
+    """Parse the config as YAML, the one reader of the file; a refusal when it cannot be read or has the wrong shape.
+
+    Text that is not UTF-8, nesting past Python's recursion limit and a scalar Python cannot convert are refusals like a
+    missing file: retrying cannot change any of them. `exports` must be a list of mappings with a string `name`.
+    """
     try:
-        doc = _yaml.load(Path(config_path).read_text())
-    except (OSError, _yaml.yaml.YAMLError) as exc:
+        doc = _yaml.load(Path(config_path).read_text(encoding="utf-8"))
+    except (OSError, ValueError, RecursionError, _yaml.yaml.YAMLError) as exc:
         raise PreflightRefusal(
             "RIVET_AIRFLOW_CONFIG_UNREADABLE", f"cannot read config {config_path}: {type(exc).__name__}"
         ) from exc
     if not isinstance(doc, dict):
         raise PreflightRefusal("RIVET_AIRFLOW_CONFIG_UNREADABLE", f"config {config_path} is not a YAML mapping")
+    exports = doc.get("exports")
+    if exports is not None and not isinstance(exports, list):
+        raise PreflightRefusal("RIVET_AIRFLOW_CONFIG_UNREADABLE", f"config {config_path}: `exports` is not a list")
+    for i, entry in enumerate(exports or []):
+        if not isinstance(entry, dict):
+            raise PreflightRefusal("RIVET_AIRFLOW_CONFIG_UNREADABLE", f"config {config_path}: `exports[{i}]` is not a mapping")
+        if "name" in entry and not isinstance(entry["name"], str):
+            raise PreflightRefusal(
+                "RIVET_AIRFLOW_CONFIG_UNREADABLE", f"config {config_path}: `exports[{i}].name` is not a string"
+            )
     return doc
 
 
@@ -156,8 +175,8 @@ def run_preflight(
     binary = resolve_binary(rivet_bin, env)
     try:
         caps = probe(binary)
-    except (OSError, RuntimeError) as exc:
-        raise PreflightRefusal("RIVET_AIRFLOW_BINARY_MISSING", str(exc)) from exc
+    except ProbeFailed as exc:
+        raise binary_unanswering(exc) from exc
     if not caps.new_enough():
         floor = ".".join(str(n) for n in MIN_RIVET_VERSION)
         raise PreflightRefusal(

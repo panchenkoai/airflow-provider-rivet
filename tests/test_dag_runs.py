@@ -37,7 +37,7 @@ def plan(dag_rig: DagRig, *waves: list[str]) -> str:
         "waves": [{"wave": i + 1, "exports": list(w)} for i, w in enumerate(waves)],
         "ordered_exports": [{"export_name": n, "cost_class": "high" if n in heavy else "low"} for w in waves for n in w],
     }
-    doc = [{"export_name": waves[0][0], "prioritization": {"campaign": campaign}}]
+    doc = [{"export_name": n, "prioritization": {"campaign": campaign}} for w in waves for n in w]
     path = dag_rig.tmp / "pg.plan.json"
     path.write_text(json.dumps(doc))
     dag_rig.scenario(**{**dag_rig.spec, "plan_list": doc})

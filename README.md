@@ -54,18 +54,19 @@ so the "rivet >=" column is the first release that carries that section.
 | `error_object` | `class`, `retryable`, `kind`, `action` on the `--json-errors` line | derives `class` and `retryable` from the printed line's integer `exit_class`; `kind` and `action` are null | D1/D2, rivet >= unreleased |
 | `per_unit_error` | `failures[]` and `per_export[].error` | when several units of one process failed, each carries the process-level object | D2/D3, rivet >= unreleased |
 | `stop_reason` | CDC `stop_reason` and `tables[]` | `stop_reason` is null: a `max_events` stop cannot be told from `caught_up` | D4, rivet >= unreleased |
-| `apply_summary` | `--summary-output` on `rivet apply` | reads run id and counts from `rivet metrics --json` after a successful apply | D3, rivet >= unreleased |
+| `apply_summary` | `--summary-output` on `rivet apply` | reads run id, counts, status and `skip_reason` (a `skip_empty` export that delivered nothing is `skipped`) from `rivet metrics --json` after a successful apply | D3, rivet >= unreleased |
 | `load_filter` | `--export` on `rivet load` / `rivet compact` | writes a single-export copy of the config and loads that | D3, rivet >= unreleased |
 | `load_table_filter` | `--table` on `rivet load` / `rivet compact` | the per-table task handles every table of its export; tasks of one export are serialised by a file lock in the state directory | D3, rivet >= unreleased |
 | `load_result` | `--summary-output` on `rivet load` / `rivet compact` | status is `loaded` / `compacted` on exit 0 and `failed` otherwise; `skipped`, `table` and row counts are unknown (null) | D3, rivet >= unreleased |
 
-Four more keys record something the worker or one output lacks, not the binary's version:
+Five more keys record something the worker or one output lacks, not the binary's version:
 
 | Key | What is missing | What the package does |
 |---|---|---|
 | `stderr_temp` | a state directory or `stderr_dir` on the worker | writes rivet's stdout and stderr to a private per-user directory under the temp directory (see Secrets); a pod loses them with its disk |
 | `crashed_ledger` | a readable and writable crashed-budget ledger | without a state directory: a crash is retried only within the first `crashed_retries` tries of the task instance; with a ledger that cannot be read or written: no crash retry at all |
-| `result_malformed` | an error object or a result entry with the contract's keys and types | a malformed error object is ignored and the task is classified by the exit-code table; a value of the wrong type is null; a status outside the contract's words counts as `failed` |
+| `result_malformed` | an error object or a result entry with the contract's keys and types; also a stderr line that starts with `{` and is not JSON, or a summary file of an exit-0 process that is not a JSON object | a malformed error object is ignored and the task is classified by the exit-code table; a value of the wrong type is null; a status outside the contract's words counts as `failed` |
+| `result_missing` | the `--summary-output` file of a process that exited 0 | rivet could not write it (it only warns); the units are built as if the binary had no summary flag: one unit per requested export or table, status from the exit |
 | `exit_zero_failed_unit` | a non-zero exit when the summary reports a failed unit | the task fails, classified by the worst failed unit (`data_integrity` > `internal` > `refusal` > `schema_drift` > `retryable` > `generic`, ADR-0039 D2) |
 
 Not detectable, so not recorded per task:
@@ -92,12 +93,12 @@ builds it, runs the process, reads the outputs and classifies.
 
 | Operator | Runs | Notes |
 |---|---|---|
-| `RivetApplyOperator` | `rivet plan -e X --format json -o <artifact>` then `rivet apply <artifact>` | a retry replays the same sealed artifact while it is unexpired |
+| `RivetApplyOperator` | `rivet plan -e X --format json -o <artifact>` then `rivet apply <artifact>` | a retry replays the same sealed artifact while it is unexpired; a clear plans again |
 | `RivetRunOperator` | `rivet run [-e X] --summary-output <file>` | the fallback when sealed apply is not wanted; also runs a whole config |
 | `RivetCdcRunOperator` | `rivet run -e X --summary-output <file>` for a `mode: cdc` export | one bounded drain; succeeds on `max_events`, reports it, never loops |
 | `RivetLoadOperator` | `rivet load` | per export, per table where the binary can narrow |
 | `RivetCompactOperator` | `rivet compact` | a compaction rivet reports as `skipped` becomes an Airflow skip |
-| `RivetPlanOperator` | `rivet plan --format json` | rewrites the plan layout file atomically, only when the output is a layout `build_batch_dag` can read (waves with exports); the file keeps its mode |
+| `RivetPlanOperator` | `rivet plan --format json` | rewrites the plan layout file atomically, only when the output is a layout `build_batch_dag` can read (waves with exports; one planned export, which rivet prints as a bare object with no campaign, is one wave from its `export_recommendation`); the file keeps its mode |
 
 ```python
 from airflow_provider_rivet.operators import RivetApplyOperator
@@ -306,7 +307,7 @@ SQLite state in `state_dir`.
      `.rivet_airflow_query_files.json`, which records the config directory each one came from.
    - a relative `cdc.checkpoint`, which resolves beside the copied config, that is, here.
    - `airflow/<dag_id>/`: sealed plan artifacts
-     (`plans/<run_id>/<export>__<task_id>__<inputs>-<hash>.json`), the crashed ledger, scratch
+     (`plans/<run_id>/<export>__<task_id>__s<max_tries>__<inputs>-<hash>.json`), the crashed ledger, scratch
      files; `airflow/locks/<export>.lock`.
    - `logs/<dag_id>/<task_id>-<hash>/`: rivet's stdout and stderr, one file per step and try.
    - **How a name becomes a path.** A DAG id, task id, run id or export name that is one lower-case
@@ -319,11 +320,14 @@ SQLite state in `state_dir`.
      therefore never share a directory, a sealed plan, a log file or a ledger, also on a file
      system that ignores case. A task's log folder always carries the hash, also for a plain
      task id, so it is never a folder an older layout wrote to.
-   - **One sealed plan per task, config and export.** The artifact's name is made from the
-     export, the task id (with the map index) and `<inputs>`: a digest of the config's absolute
+   - **One sealed plan per task, try series, config and export.** The artifact's name is made from the
+     export, the task id (with the map index), the try series (`s<max_tries>`; Airflow moves
+     `max_tries` when a task is cleared) and `<inputs>`: a digest of the config's absolute
      path, the config's bytes and the export's `query_file`. Two tasks of one DAG run never
      share a plan, also when they run two configs that both have an export of one name; a
-     retry of the same task replays its own plan; a config or query file edited between two
+     retry of the same task replays its own plan; a clear starts a new series and plans again,
+     so a clear after a successful apply never replays a cursor snapshot that apply already
+     moved past (rivet would refuse it `RIVET_PLAN_ARTIFACT_STALE`); a config or query file edited between two
      tries is planned again under a new name.
    - A retry replays its own plan only while the resolved config path and the config's bytes
      are unchanged. A config reached through a symlink that is re-pointed between two tries
@@ -336,7 +340,8 @@ SQLite state in `state_dir`.
    - The artifact records the export and the config it was planned from (`export_name`,
      `config_path`). `apply` refuses a plan object in which either is missing or is not the
      task's own (`RIVET_AIRFLOW_PLAN_ARTIFACT_FOREIGN`), expired or not, and leaves the file as
-     it is, so the retry is refused for the same reason until a person deletes it. The config
+     it is, so the retry is refused for the same reason until a person deletes it (or, once it has
+     expired and is 24 h old, the pruning below removes it). The config
      is compared as a file, not as text: another case, Unicode form or symlink of the same
      file is the task's own, and a recorded path that no longer exists is not. A file at
      that path that is not a JSON object (empty, cut short) is planned over.
@@ -395,7 +400,12 @@ SQLite state in `state_dir`.
      worker. `env_passthrough=["RIVET_STATE_URL", "MY_*"]` extends the list with names or
      shell-style patterns. `cloud_credentials=["gcp", "aws", "azure"]` adds
      `GOOGLE_APPLICATION_CREDENTIALS` and `GOOGLE_CLOUD_PROJECT`, `AWS_*`, `AZURE_*` for a
-     destination or warehouse that authenticates from the environment.
+     destination or warehouse that authenticates from the environment. A storage Connection
+     (`connections=`, below) that supplies a credential of one of these kinds **replaces** the
+     worker's variables of that kind, whichever way they were passed: the worker's
+     `AWS_SESSION_TOKEN` never rides beside a Connection's static keys, nor its account key beside
+     a Connection's SAS token. A Connection that supplies no credential (an AWS one with only a
+     region, a GCP one with only a project) leaves the worker's identity in place.
   2. `env={NAME: value}`. It is not templated and not stored in the metadata database, but it
      is whatever your DAG file computes: do not write a secret literal there.
   3. `env_from_connections={ENV_NAME: conn_id}`, which builds a URL from an Airflow Connection's
@@ -403,9 +413,19 @@ SQLite state in `state_dir`.
      comes from `{ENV_NAME: (conn_id, "postgresql")}`, else the connection extra `rivet_scheme`,
      else the connection type (`postgres`, `mysql`, `mssql`, `mongo`, `oracle`); a type that
      names no rivet scheme, such as `generic`, is refused before rivet starts
-     (`RIVET_AIRFLOW_CONNECTION_SCHEME`). A password without a login is kept, an IPv6 host is
-     bracketed, an Oracle connection's extra `service_name` is used as the path, and the extra
-     `rivet_params` adds a query string.
+     (`RIVET_AIRFLOW_CONNECTION_SCHEME`). A password without a login is kept, an IPv6 literal is
+     bracketed with its zone encoded (`fe80::1%eth0` becomes `[fe80::1%25eth0]`), any other host
+     is kept as written (`db:5432` with an empty port field), an Oracle connection's extra
+     `service_name` is used as the path. The standard extras that have a URL form become query
+     parameters: PostgreSQL `sslmode`, `application_name`, `connect_timeout`; MongoDB `srv` (the
+     `mongodb+srv` scheme, which takes no port), `authSource`, `authMechanism`, `replicaSet`,
+     `tls`/`ssl`, `allow_insecure`, `directConnection`, `readPreference`, `appName`. An extra
+     that changes how the hook authenticates and has no URL form (PostgreSQL `iam`, `redshift`;
+     MySQL `unix_socket`) is refused (`RIVET_AIRFLOW_CONNECTION_UNSUPPORTED`). Other extras are
+     client-library settings and are not read. The extra `rivet_params` is appended as written
+     and wins over a mapped extra of the same name. A `conn_id` no backend
+     defines, here or in `connections=[...]`, is refused before rivet starts
+     (`RIVET_AIRFLOW_CONNECTION_MISSING`), not retried.
   4. `connections=[conn_id, ...]`: storage and warehouse Connections, see below.
 
   argv carries the config path, export names and flags.
@@ -425,8 +445,11 @@ SQLite state in `state_dir`.
 - **Retention.** When a task ends, the files of its newest `log_keep` tries (default 10, counted
   per task across runs) are kept and the older ones are removed. `log_keep=None` keeps
   everything. Only the task's own folder is looked at; a file of an older layout is never
-  removed (see "Upgrading a state directory"). Sealed plan artifacts and crashed ledgers under `airflow/<dag_id>/` are small and
-  are not pruned.
+  removed (see "Upgrading a state directory"). Under `airflow/<dag_id>/`, a sealed plan artifact
+  that has expired and was last written over 24 h ago is removed (with the `plans/<run_id>/`
+  folder it leaves empty), and so is a crashed ledger untouched for 24 h (a crash of that series
+  more than 24 h after its last one starts a fresh budget). A ledger that is not the ledger's JSON
+  is left for a person to delete.
 - `stream_stderr=True` copies stderr into the task log when each step ends. It is the one way
   raw stderr reaches the task log, and it is for debugging: it puts possibly data-bearing text
   into a store with wider access than the worker.
@@ -443,10 +466,10 @@ that is none of them is refused before rivet starts (`RIVET_AIRFLOW_CONNECTION_K
 | Kind (connection type) | Read from the Connection | rivet gets | The config names it |
 |---|---|---|---|
 | `gcp` (`google_cloud_platform`) | extra `keyfile_dict` (written to a file) or `key_path`; `project` | `GOOGLE_APPLICATION_CREDENTIALS`, `GOOGLE_CLOUD_PROJECT` | nothing: GCS and BigQuery read it |
-| `aws` (`aws`) | login, password; extras `aws_session_token`, `region_name`, `endpoint_url` | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_REGION`, `AWS_ENDPOINT_URL` | `access_key_env: AWS_ACCESS_KEY_ID`, `secret_key_env: AWS_SECRET_ACCESS_KEY` (+ `session_token_env`) |
-| `azure` (`wasb`) | login (account), password (key); extra `sas_token` | `AZURE_STORAGE_ACCOUNT`, `AZURE_STORAGE_KEY`, `AZURE_STORAGE_SAS_TOKEN` | `account_key_env: AZURE_STORAGE_KEY` or `sas_token_env: AZURE_STORAGE_SAS_TOKEN` |
-| `snowflake` (`snowflake`) | extras `account`, `role`, `warehouse`, `database`, `private_key_content` (written to a file) or `private_key_file`; else the password | a `snow` connection named as `load.connection` in a private `SNOWFLAKE_HOME`; `RIVET_SNOWFLAKE_KEY` | `load.connection` |
-| `clickhouse` (`clickhouse`, or any type with `rivet_kind: clickhouse`) | host, port, login, password; extra `secure` or `protocol` | `RIVET_CLICKHOUSE_URL`, `RIVET_CLICKHOUSE_USER`, `RIVET_CLICKHOUSE_PASSWORD`, and the password also under the config's own `password_env` (`rivet init` writes `CLICKHOUSE_PASSWORD`) | `url: ${RIVET_CLICKHOUSE_URL}`, `user: ${RIVET_CLICKHOUSE_USER}`, `password_env: RIVET_CLICKHOUSE_PASSWORD` (or any name) |
+| `aws` (`aws`) | login, password; extras `aws_session_token`, `region_name`, `endpoint_url`. A role (`role_arn`, `assume_role_*`), a `profile_name`, or keys in extras (also under `session_kwargs`) are refused, `RIVET_AIRFLOW_CONNECTION_UNSUPPORTED`: rivet signs with static or session keys only | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_REGION`, `AWS_ENDPOINT_URL` | `access_key_env: AWS_ACCESS_KEY_ID`, `secret_key_env: AWS_SECRET_ACCESS_KEY` (+ `session_token_env`) |
+| `azure` (`wasb`) | login (account), password (key); extra `sas_token` | `AZURE_STORAGE_ACCOUNT`, `AZURE_STORAGE_KEY`, `AZURE_STORAGE_SAS_TOKEN` | `account_name: ${AZURE_STORAGE_ACCOUNT}` (rivet reads no account variable of its own), and `account_key_env: AZURE_STORAGE_KEY` or `sas_token_env: AZURE_STORAGE_SAS_TOKEN` |
+| `snowflake` (`snowflake`) | extras `account`, `region`, `role`, `warehouse`, `database`, `private_key_content` (PEM, or base64 of PEM as Airflow's SnowflakeHook takes it; written to a file) or `private_key_file`; with a key the password is the key's passphrase, else the login password | a `snow` connection named as `load.connection` in a private `SNOWFLAKE_HOME`; `RIVET_SNOWFLAKE_KEY`; `PRIVATE_KEY_PASSPHRASE` for an encrypted key | `load.connection` |
+| `clickhouse` (`clickhouse`, or any type with `rivet_kind: clickhouse`) | host (required, `RIVET_AIRFLOW_CONNECTION_INCOMPLETE` without one), port, login, password; extra `secure` or `protocol` | `RIVET_CLICKHOUSE_URL`, `RIVET_CLICKHOUSE_USER`, `RIVET_CLICKHOUSE_PASSWORD`, and the password also under the config's own `password_env` (`rivet init` writes `CLICKHOUSE_PASSWORD`) | `url: ${RIVET_CLICKHOUSE_URL}`, `user: ${RIVET_CLICKHOUSE_USER}`, `password_env: RIVET_CLICKHOUSE_PASSWORD` (or any name) |
 
 The config keeps what is not a secret (bucket, project, dataset, database, schema); the
 Connection holds who may write there. The Snowflake loader runs the `snow` CLI, which must be on
