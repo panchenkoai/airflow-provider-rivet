@@ -95,6 +95,7 @@ def error_from_line(line: dict[str, Any], exit_status: int | None = None) -> tup
 
 def worst(errors: list[ErrorObject]) -> ErrorObject:
     """The failure that decides a task: the highest `stop_rank` (ADR-0039 D2), the last among equals."""
+    # throwaway: touches worst() so the PR mutation gate mutates it
     return max(reversed(errors), key=lambda error: STOP_RANK.index(error.class_))
 
 

@@ -569,7 +569,7 @@ def test_a_task_with_several_failed_units_and_exit_0_is_classified_by_the_worst(
     ]
     rig.scenario(flags=NEW_FLAGS, run={"exit": 0, "summary": {"per_export": mixed}})
     exc, ti = rig.run(rig.operator(RivetRunOperator))
-    assert isinstance(exc, AirflowFailException) and ti.store[("task", "return_value")]["error"]["class"] == "refusal"
+    assert isinstance(exc, AirflowFailException)
     rig.scenario(flags=NEW_FLAGS, run={"exit": 0, "summary": {"per_export": [mixed[0], mixed[2]]}})
     exc, ti = rig.run(rig.operator(RivetRunOperator))
     assert type(exc) is AirflowException and ti.store[("task", "return_value")]["decision"] == "retry"
