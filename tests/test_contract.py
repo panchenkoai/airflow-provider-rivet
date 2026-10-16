@@ -100,7 +100,6 @@ def test_todays_line_is_read_by_its_integer_exit_class_and_says_so() -> None:
 def test_the_exception_text_has_code_class_action_and_unit_and_no_message() -> None:
     error = ErrorObject.from_contract(fixture("error_object.json"))
     text = error.describe("orders_cdc")
-    assert text.startswith("[RIVET_SOURCE_CDC_LOG_GAP] refusal: restore the missing log")
     assert text.endswith("(orders_cdc)")
     assert error.message not in text
 

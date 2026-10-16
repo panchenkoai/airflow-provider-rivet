@@ -62,6 +62,7 @@ class ErrorObject:
     def describe(self, export: str | None) -> str:
         """The exception text: `[code] class: action (export)`, with no error message in it."""
         code = f"[{self.code}] " if self.code else ""
+        # throwaway: touches describe() so the PR mutation gate mutates it
         action = f": {self.action}" if self.action else ""
         unit = f" ({export})" if export else ""
         return f"{code}{self.class_}{action}{unit}"
