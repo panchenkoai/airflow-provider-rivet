@@ -8,6 +8,11 @@ would then be shared across concurrent workers:
   killed that way is counted as detected when no test saw it;
 - pytest's base temp directory, whose old numbered entries a starting session may prune.
 
+A mutant can also turn a loop unbounded in memory (`_yaml.substitute` with `i = None` scans the same `${` forever,
+growing its output list): mutmut's CPU-time limit comes too late, and on a CI runner the kernel's OOM killer then
+takes the runner itself. So each worker's data segment is capped (`MUTANTS_MEM_LIMIT_MB`, default 2048): the mutant
+dies with MemoryError, which is a detection, and the run goes on.
+
 So each process gets a base temp of its own, and Airflow's ORM is pointed at `apr-mutmut-<pid>.db` once the session
 has collected its tests. Every pytest session in one process (mutmut runs several: stats, clean run, then one per
 forked worker) executes `tests/conftest.py` again, which makes a new AIRFLOW_HOME, while Airflow read its dags folder
@@ -19,6 +24,7 @@ is pointed at the session's AIRFLOW_HOME as well. Loaded by `-p mutmut_isolation
 from __future__ import annotations
 
 import os
+import resource
 import shutil
 import tempfile
 from pathlib import Path
@@ -30,7 +36,10 @@ _OWNED: list[Path] = []
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_configure(config: pytest.Config) -> None:
-    """Before the tmp_path factory exists: a base temp directory of this process."""
+    """Before the tmp_path factory exists: a base temp directory and a memory cap of this process."""
+    cap = int(os.environ.get("MUTANTS_MEM_LIMIT_MB", "2048")) << 20
+    _, hard = resource.getrlimit(resource.RLIMIT_DATA)
+    resource.setrlimit(resource.RLIMIT_DATA, (cap if hard == resource.RLIM_INFINITY else min(cap, hard), hard))
     base = Path(tempfile.gettempdir()) / f"apr-mutmut-{os.getpid()}"
     shutil.rmtree(base, ignore_errors=True)
     config.option.basetemp = str(base)

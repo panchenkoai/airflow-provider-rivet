@@ -4,7 +4,7 @@
 .PHONY: mutants mutants-results mutants-clean
 
 mutants:  ## run every mutant (resumes: finished mutants keep their result in mutants/), then list the survivors
-	dev/mutants.sh mutmut run
+	dev/mutants.sh
 	dev/mutants.sh mutmut results
 
 mutants-results:  ## the survivors, timeouts and other non-killed mutants of the last run

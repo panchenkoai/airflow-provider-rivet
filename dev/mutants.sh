@@ -12,9 +12,11 @@ cd "$(dirname "$0")/.."
 RIVET_SRC="$(cd "${RIVET_SRC:-../rivet}" && pwd)"
 MUTMUT="${MUTMUT:-mutmut==3.8.0}"
 IMAGE="${MUTANTS_IMAGE:-ghcr.io/astral-sh/uv:python3.13-bookworm}"
-[ "$#" -gt 0 ] || set -- mutmut run
+[ "$#" -gt 0 ] || set -- mutmut run --max-children "${MUTANTS_MAX_CHILDREN:-3}"
+# Capped (MUTANTS_DOCKER_ARGS overrides): the run shares the Docker VM with whatever else the host runs, and a
+# mutant may grow memory without bound (dev/mutmut_isolation.py caps each worker as well).
 # shellcheck disable=SC2086
-exec docker run --rm --init ${MUTANTS_DOCKER_ARGS:-} \
+exec docker run --rm --init ${MUTANTS_DOCKER_ARGS:---memory 4g --cpus 3} \
   -v "$PWD:/work" -v "$RIVET_SRC:/rivet:ro" \
   -v apr-mutants-venv:/venv -v apr-mutants-uvcache:/uvcache \
   -e UV_PROJECT_ENVIRONMENT=/venv -e UV_CACHE_DIR=/uvcache -e UV_LINK_MODE=copy -e RIVET_SRC=/rivet \
