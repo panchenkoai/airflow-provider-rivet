@@ -69,7 +69,7 @@ filterwarnings = ["ignore::DeprecationWarning"]
 # Mutation testing (README, "Mutation testing"; run by `make mutants`): only the product package is mutated —
 # not tests/, gate/ or examples/, which are copied so the documentation tests that read them still run.
 source_paths = ["airflow_provider_rivet/"]
-also_copy = ["README.md", "CHANGELOG.md", "LICENSE", "RIVET_CONTRACT_REF", ".github/", "examples/", "gate/", "dev/"]
+also_copy = ["README.md", "CHANGELOG.md", "LICENSE", "RIVET_CONTRACT_REF", ".github/", "docs/", "examples/", "gate/", "dev/"]
 # Workers fork from a server that only collected the tests: a process that has already RUN the suite (mutmut's
 # default `fork`) hangs on macOS when forked, and Airflow's dags folder is fixed by the first session's AIRFLOW_HOME.
 process_isolation = "forkserver"
