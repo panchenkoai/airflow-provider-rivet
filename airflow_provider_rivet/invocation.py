@@ -678,7 +678,9 @@ def _parent_death_signal() -> Callable[[], None] | None:
     def arm() -> None:
         prctl(PR_SET_PDEATHSIG, int(_signal.SIGTERM), 0, 0, 0)
         if os.getppid() != parent:  # the task process died before the call took effect
-            os.kill(os.getpid(), _signal.SIGTERM)
+            # SIGKILL, not SIGTERM: this forked child still runs the task process's SIGTERM handler, and Airflow 3's
+            # returns, so the child went on to exec rivet as the orphan this exists to prevent
+            os.kill(os.getpid(), _signal.SIGKILL)
 
     return arm
 

@@ -603,8 +603,9 @@ def test_prctl_reports_its_errno() -> None:
 
 
 def in_a_child(arm: Any, grandchild: bool) -> tuple[int, int | None]:
-    """Run `arm` in a forked child (or in a child's child), as `subprocess` runs a `preexec_fn`; (how that process
-    ended as os.waitstatus, the parent-death signal it reported)."""
+    """Run `arm` in a forked child (or in a child's child), as `subprocess` runs a `preexec_fn` in a task process
+    whose SIGTERM handler returns (Airflow 3's task runner calls `on_kill` and returns); (how that process ended as
+    os.waitstatus, the parent-death signal it reported)."""
     read, write = os.pipe()
     pid = os.fork()
     if pid == 0:  # pragma: no cover - the child
@@ -613,23 +614,24 @@ def in_a_child(arm: Any, grandchild: bool) -> tuple[int, int | None]:
                 inner = os.fork()
                 if inner:
                     _, status = os.waitpid(inner, 0)
-                    os.write(write, json.dumps({"status": status}).encode())
+                    os.write(write, (json.dumps({"status": status}) + "\n").encode())
                     os._exit(0)
             os.close(read)
+            signal.signal(signal.SIGTERM, lambda signum, frame: None)
             try:
                 arm()
             except BaseException:
                 os._exit(3)
             got = ctypes.c_int(-1)
             invocation._prctl()(2, ctypes.byref(got), 0, 0, 0)  # PR_GET_PDEATHSIG
-            os.write(write, json.dumps({"pdeathsig": got.value}).encode())
+            os.write(write, (json.dumps({"pdeathsig": got.value}) + "\n").encode())
             os._exit(0)
         finally:
             os._exit(4)
     os.close(write)
     _, status = os.waitpid(pid, 0)
     with os.fdopen(read) as pipe:
-        report = json.loads(pipe.read() or "{}")
+        report = {k: v for line in pipe.read().splitlines() for k, v in json.loads(line).items()}
     return report.get("status", status), report.get("pdeathsig")
 
 
@@ -642,9 +644,10 @@ def test_the_started_process_asks_for_sigterm_when_its_parent_dies() -> None:
 @pytest.mark.skipif(not LINUX, reason="PR_SET_PDEATHSIG exists on Linux only (the mutation runs are Linux)")
 def test_a_process_whose_parent_died_before_the_call_stops_itself() -> None:
     """The task process died before `prctl` took effect (here: the process that runs the call is not a child of the
-    one that armed it): it ends itself with SIGTERM instead of running rivet as an orphan."""
-    status, _ = in_a_child(invocation._parent_death_signal(), grandchild=True)
-    assert os.waitstatus_to_exitcode(status) == -signal.SIGTERM
+    one that armed it): it must end before it can exec rivet as an orphan, whatever SIGTERM handler the task process
+    installed. A SIGTERM to itself ran Airflow 3's handler, which returns, and the child went on to exec rivet."""
+    status, pdeathsig = in_a_child(invocation._parent_death_signal(), grandchild=True)
+    assert os.waitstatus_to_exitcode(status) == -signal.SIGKILL, (status, pdeathsig)
 
 
 def test_without_prctl_there_is_no_preexec_function(monkeypatch: pytest.MonkeyPatch) -> None:
