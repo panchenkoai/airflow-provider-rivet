@@ -53,6 +53,7 @@ _HASHED = re.compile(r".*-[0-9a-f]{12}")
 _LOG_FILE = re.compile(r"^(?P<attempt>.+)\.[a-z]+\.(?:stderr|stdout)\.log$")
 LOCK_POLL = 0.2  # seconds between two tries of a held export lock
 BUSY_CODE = "RIVET_AIRFLOW_EXPORT_BUSY"
+APPLY_RUN_UNKNOWN = "RIVET_AIRFLOW_APPLY_RUN_UNKNOWN"  # an apply exited 0 and no `rivet metrics` row is its run
 APPLIED_LOOKBACK = 50  # newest `rivet metrics` rows of an export searched for the run an earlier try's apply made
 PR_SET_PDEATHSIG = 1  # <linux/prctl.h>
 
@@ -968,15 +969,23 @@ def _apply(s: _Session) -> Outcome:
     else:
         s.degraded.add("apply_summary")
     argv += [*s.req.extra_args, *s.globals_for("apply")]
-    started = {"export": export, "artifact": _digest(artifact), "started_at": datetime.now(UTC).isoformat(), "pid": None}
+    now = datetime.now(UTC)
+    started = {"export": export, "artifact": _digest(artifact), "started_at": now.isoformat(), "pid": None}
     _write_atomic(record, json.dumps(started).encode())
-    step = s.step("apply", argv, on_start=lambda pid: _write_atomic(record, json.dumps({**started, "pid": pid}).encode()))
+    pids: list[int] = []
+
+    def on_start(pid: int) -> None:
+        pids.append(pid)
+        _write_atomic(record, json.dumps({**started, "pid": pid}).encode())
+
+    step = s.step("apply", argv, on_start=on_start)
     error = s.classify(step)
     doc = s.result_file(summary, step) if has_summary else None
     summary.unlink(missing_ok=True)
     units = _run_units(s, step, doc, error)
     if error is None and not has_summary:
-        units = [_unit_from_metrics(s, cfg, export)]
+        units = [_unit_from_metrics(s, cfg, export, pids[-1] if pids else None, now)]
+        error = units[0].error
     return s.outcome(step, units, error)
 
 
@@ -1020,32 +1029,50 @@ def _applied_by_earlier_try(s: _Session, cfg: str, export: str, artifact: Path, 
         return None
     if started.tzinfo is None:
         return None
-    floor = started.replace(microsecond=started.microsecond // 1000 * 1000)
     step, rows = _metrics_rows(s, cfg, export, APPLIED_LOOKBACK)
+    row = apply_run_row(rows, export, doc["pid"], started)
+    if row is None:
+        return None
+    unit = UnitResult(export, status=row["status"], run_id=row["run_id"])
+    unit.rows, unit.files = s.malformed(row.get("total_rows"), int), s.malformed(row.get("files_produced"), int)
+    return step, unit
+
+
+def apply_run_row(rows: list[dict[str, Any]], export: str, pid: Any, started: datetime) -> dict[str, Any] | None:
+    """The `rivet metrics` row of the run one `rivet apply` process made, ended `success` or `skipped`; `None` when no
+    row is (G1b). rivet's run id names the process: `<export>_<UTC start, ms>_<pid>`, with that pid and a start no
+    earlier than `started` (the moment before the process was spawned, cut to the millisecond). The one rule both
+    readers use: a retry looking for its earlier try's apply, and an apply reading its own counts."""
+    if type(pid) is not int:
+        return None
+    floor = started.replace(microsecond=started.microsecond // 1000 * 1000)
     shape = re.compile(re.escape(export) + r"_(\d{8}T\d{6}\.\d{3})_(\d+)")
     for row in rows:
         match = shape.fullmatch(str(row.get("run_id")))
         if row.get("export_name") != export or row.get("status") not in ("success", "skipped") or match is None:
             continue
-        if int(match[2]) != doc["pid"] or datetime.strptime(match[1], "%Y%m%dT%H%M%S.%f").replace(tzinfo=UTC) < floor:
+        if int(match[2]) != pid or datetime.strptime(match[1], "%Y%m%dT%H%M%S.%f").replace(tzinfo=UTC) < floor:
             continue
-        unit = UnitResult(export, status=row["status"], run_id=row["run_id"])
-        unit.rows, unit.files = s.malformed(row.get("total_rows"), int), s.malformed(row.get("files_produced"), int)
-        return step, unit
+        return row
     return None
 
 
-def _unit_from_metrics(s: _Session, cfg: str, export: str) -> UnitResult:
-    """Counts of the export's latest run from `rivet metrics --json`; best effort."""
-    step, rows = _metrics_rows(s, cfg, export, 1)
-    unit = UnitResult(export, status="success")
-    row = rows[0] if rows else {}
-    if row.get("export_name") == export:
-        if "status" in row:  # a `skip_empty` run that delivered nothing is `skipped` (D31)
-            unit.status = s.status(row["status"])
-            unit.skip_reason = s.malformed(row.get("skip_reason"), str)
-        unit.run_id = s.malformed(row.get("run_id"), str)
-        unit.rows, unit.files = s.malformed(row.get("total_rows"), int), s.malformed(row.get("files_produced"), int)
+def _unit_from_metrics(s: _Session, cfg: str, export: str, pid: Any, started: datetime) -> UnitResult:
+    """The unit of an apply that exited 0 on a binary without `apply --summary-output`: the `rivet metrics --json` row
+    of this apply's own run (`apply_run_row`), never the newest row, which another run of the export may have written.
+    No such row is a failed unit with a code: the task cannot say what the apply did."""
+    _, rows = _metrics_rows(s, cfg, export, APPLIED_LOOKBACK)
+    row = apply_run_row(rows, export, pid, started)
+    if row is None:
+        action = (
+            f"rivet apply exited 0, and `rivet metrics` lists no run of this apply process (run id {export}_<start>_<pid>); "
+            f"read `rivet metrics --export {export}` before clearing the task"
+        )
+        error = ErrorObject(APPLY_RUN_UNKNOWN, None, "generic", None, False, action)
+        return UnitResult(export, status="failed", error=error)
+    unit = UnitResult(export, status=row["status"], run_id=row["run_id"])  # `skipped`: delivered nothing (D31)
+    unit.skip_reason = s.malformed(row.get("skip_reason"), str)
+    unit.rows, unit.files = s.malformed(row.get("total_rows"), int), s.malformed(row.get("files_produced"), int)
     return unit
 
 

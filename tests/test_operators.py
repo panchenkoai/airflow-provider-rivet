@@ -34,7 +34,6 @@ OLD_BATCH = ["apply_summary", "lock_wait", "no_notify", "state_url_sqlite"]
 # An apply that failed retryably: its retry replays the sealed plan. A retry after an apply that SUCCEEDED applies
 # nothing (G1b, tests/test_retry.py), so the tests of how a retry finds and replays its plan start from a failure.
 FAILED_APPLY = {"exit": 2, "line": {"error": "network", "exit_class": 2}}
-METRICS = [{"export_name": "orders", "run_id": "orders_1", "total_rows": 500, "files_produced": 1}]
 
 
 def entry(name: str, status: str = "success", **more: object) -> dict:
@@ -55,14 +54,14 @@ def assert_no_secret(rig: Rig, payload: object) -> None:
 
 
 def test_apply_success_on_todays_binary(rig: Rig) -> None:
-    rig.scenario(metrics={"rows": METRICS})
+    rig.scenario(apply={"summary": {"per_export": [{"export_name": "orders", "rows": 500, "files": 1}]}})
     payload, _ = rig.run(rig.operator(RivetApplyOperator, export="orders"))
     cfg = str(rig.copy())
     plan = rig.argv("plan")
     artifact = plan[plan.index("--output") + 1]
     assert plan == ["plan", "--config", cfg, "--export", "orders", "--format", "json", "--output", artifact, "--json-errors"]
     assert rig.argv("apply") == ["apply", artifact, "--json-errors"]
-    assert rig.argv("metrics") == ["metrics", "--config", cfg, "--export", "orders", "--last", "1", "--json"]
+    assert rig.argv("metrics") == ["metrics", "--config", cfg, "--export", "orders", "--last", "50", "--json"]
     assert Path(artifact).is_relative_to(rig.state_dir)
     assert Path(cfg).read_text() == rig.config.read_text()
     assert all(c["env"]["RIVET_PG_URL"] == SECRET for c in rig.calls())
@@ -73,7 +72,7 @@ def test_apply_success_on_todays_binary(rig: Rig) -> None:
             "export": "orders",
             "table": None,
             "status": "success",
-            "run_id": "orders_1",
+            "run_id": payload["units"][0]["run_id"],
             "rows": 500,
             "files": 1,
             "stop_reason": None,
@@ -1237,8 +1236,8 @@ def test_old_plan_artifacts_and_crashed_ledgers_are_pruned(rig: Rig) -> None:
 
 def test_an_apply_unit_from_metrics_takes_the_status_rivet_recorded(rig: Rig) -> None:
     """D31: a skip_empty export that delivered nothing is `skipped` in metrics, and the apply unit says so."""
-    row = {**METRICS[0], "total_rows": 0, "files_produced": 0, "status": "skipped", "skip_reason": "source returned 0 rows"}
-    rig.scenario(metrics={"rows": [row]})
+    row = {"total_rows": 0, "files_produced": 0, "status": "skipped", "skip_reason": "source returned 0 rows"}
+    rig.scenario(apply={"metric": row})
     payload, _ = rig.run(rig.operator(RivetApplyOperator, export="orders"))
     assert payload["units"][0]["status"] == "skipped"
     assert payload["skip_reason"] == "source returned 0 rows"

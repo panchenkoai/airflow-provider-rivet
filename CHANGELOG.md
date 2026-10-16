@@ -17,6 +17,11 @@ First release, against rivet 0.31.0 and the contract of ADR-0039; Python 3.12+, 
 - Preflight: binary present and at least 0.31.0, state location by deployment (a pod needs
   PostgreSQL state and refuses CDC), state directory checks, a warning for `notifications:`.
 - Secrecy: XCom and the task log never carry the error message; raw stderr goes to a file.
+- On a binary without `apply --summary-output`, an apply's unit is the `rivet metrics` row of its own
+  run (run id `<export>_<start>_<pid>`, the rule a retry uses to find an earlier try's apply), not
+  the newest row: another run of the export no longer gives the task its run id and counts, and its
+  `running` or `failed` row no longer ends the task green. No row of this apply fails the task,
+  `RIVET_AIRFLOW_APPLY_RUN_UNKNOWN`.
 - `slack_failure_callback` for the Slack provider: a one-line title per failed task,
   `dag.task — <rivet code> (final|retryable)` (else the exception's class), with the run id and
   the task-log link; with a bot token and `channel=` the error text (rivet's error line for the

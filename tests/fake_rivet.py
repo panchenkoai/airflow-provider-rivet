@@ -274,7 +274,11 @@ def main():
     if sub == "apply" and not play.get("exit"):
         cursors(spec, {export: str(int(cursors(spec).get(export) or 0) + 1)})
     if metric is not None:
-        record_metric({**metric, "status": "failed" if play.get("exit") else "success"})
+        # opt-in: `metric` overrides fields of the run's terminal row (a `skip_empty` run ends `skipped`), and
+        # `metrics_after` rows are recorded after it, as another run of the export would (newer than this one)
+        record_metric({**metric, "status": "failed" if play.get("exit") else "success", **play.get("metric", {})})
+        for row in play.get("metrics_after", []):
+            record_metric(row)
     return play.get("exit", 0)
 
 
