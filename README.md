@@ -59,13 +59,14 @@ so the "rivet >=" column is the first release that carries that section.
 | `load_table_filter` | `--table` on `rivet load` / `rivet compact` | the per-table task handles every table of its export; tasks of one export are serialised by a file lock in the state directory | D3, rivet >= unreleased |
 | `load_result` | `--summary-output` on `rivet load` / `rivet compact` | status is `loaded` / `compacted` on exit 0 and `failed` otherwise; `skipped`, `table` and row counts are unknown (null) | D3, rivet >= unreleased |
 
-Four more keys record something the worker or one output lacks, not the binary's version:
+Five more keys record something the worker or one output lacks, not the binary's version:
 
 | Key | What is missing | What the package does |
 |---|---|---|
 | `stderr_temp` | a state directory or `stderr_dir` on the worker | writes rivet's stdout and stderr to a private per-user directory under the temp directory (see Secrets); a pod loses them with its disk |
 | `crashed_ledger` | a readable and writable crashed-budget ledger | without a state directory: a crash is retried only within the first `crashed_retries` tries of the task instance; with a ledger that cannot be read or written: no crash retry at all |
-| `result_malformed` | an error object or a result entry with the contract's keys and types | a malformed error object is ignored and the task is classified by the exit-code table; a value of the wrong type is null; a status outside the contract's words counts as `failed` |
+| `result_malformed` | an error object or a result entry with the contract's keys and types; also a stderr line that starts with `{` and is not JSON, or a summary file of an exit-0 process that is not a JSON object | a malformed error object is ignored and the task is classified by the exit-code table; a value of the wrong type is null; a status outside the contract's words counts as `failed` |
+| `result_missing` | the `--summary-output` file of a process that exited 0 | rivet could not write it (it only warns); the units are built as if the binary had no summary flag: one unit per requested export or table, status from the exit |
 | `exit_zero_failed_unit` | a non-zero exit when the summary reports a failed unit | the task fails, classified by the worst failed unit (`data_integrity` > `internal` > `refusal` > `schema_drift` > `retryable` > `generic`, ADR-0039 D2) |
 
 Not detectable, so not recorded per task:
@@ -397,7 +398,9 @@ SQLite state in `state_dir`.
      names no rivet scheme, such as `generic`, is refused before rivet starts
      (`RIVET_AIRFLOW_CONNECTION_SCHEME`). A password without a login is kept, an IPv6 host is
      bracketed, an Oracle connection's extra `service_name` is used as the path, and the extra
-     `rivet_params` adds a query string.
+     `rivet_params` adds a query string. A `conn_id` no backend defines, here or in
+     `connections=[...]`, is refused before rivet starts (`RIVET_AIRFLOW_CONNECTION_MISSING`),
+     not retried.
   4. `connections=[conn_id, ...]`: storage and warehouse Connections, see below.
 
   argv carries the config path, export names and flags.
