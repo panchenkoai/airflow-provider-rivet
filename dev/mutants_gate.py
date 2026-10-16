@@ -86,6 +86,8 @@ def changed_globs(base: str) -> list[str]:
 def run_mutmut(args: list[str]) -> subprocess.CompletedProcess:
     """`mutmut run ...` with the project's own settings (`[tool.mutmut]`, `dev/` for the isolation plugin)."""
     env = {**os.environ, "PYTHONPATH": os.pathsep.join(filter(None, [str(ROOT / "dev"), os.environ.get("PYTHONPATH")]))}
+    if env.get("RIVET_SRC"):  # mutmut's workers do not run in this directory: a relative checkout path would miss
+        env["RIVET_SRC"] = str((ROOT / env["RIVET_SRC"]).resolve())
     children = os.environ.get("MUTANTS_MAX_CHILDREN")
     argv = [*MUTMUT, "run", *(["--max-children", children] if children else []), *args]
     print("+", " ".join(argv), flush=True)
