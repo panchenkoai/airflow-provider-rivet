@@ -28,14 +28,44 @@ def value_of(argv, flag):
     return argv[argv.index(flag) + 1] if flag in argv else None
 
 
+def params_of(argv):
+    """`-p KEY=VALUE` / `--param KEY=VALUE` (the spellings the package passes through)."""
+    out = {}
+    for i, arg in enumerate(argv[:-1]):
+        if arg in ("-p", "--param") and "=" in argv[i + 1]:
+            key, value = argv[i + 1].split("=", 1)
+            out[key] = value
+    return out
+
+
+def substitute(text, params):
+    """rivet's `resolve_vars` (src/config/resolve.rs): `${name}` from `-p` then the environment, spliced into the raw
+    text before the YAML parse; an unset name is refused."""
+    out, i = [], 0
+    while (start := text.find("${", i)) >= 0:
+        end = text.find("}", start)
+        if end < 0:
+            break
+        name = text[start + 2 : end]
+        if name and name not in params and name not in os.environ:
+            raise KeyError(f"'${{{name}}}' in the config is unresolved")
+        out += [text[i:start], params.get(name, os.environ.get(name, "")) if name else ""]
+        i = end + 1
+    return "".join(out + [text[i:]])
+
+
 def read_config(argv):
-    """The parsed config a call names, and its directory."""
+    """The parsed config a call names as rivet reads it, its directory, and the refusal rivet prints when it cannot."""
     cfg = value_of(argv, "--config")
     if not cfg:
-        return {}, None
+        return {}, None, None
     import yaml
 
-    return yaml.safe_load(Path(cfg).read_text()) or {}, Path(cfg).resolve().parent
+    try:
+        doc = yaml.safe_load(substitute(Path(cfg).read_text(), params_of(argv))) or {}
+    except (KeyError, yaml.YAMLError) as exc:
+        return {}, Path(cfg).resolve().parent, f"config file '{cfg}': {type(exc).__name__}"
+    return doc, Path(cfg).resolve().parent, None
 
 
 def query_files(sub, argv, doc, base):
@@ -101,15 +131,18 @@ def main():
         flags = BASE_FLAGS.get(sub, []) + spec.get("flags", {}).get(sub, []) + spec.get("flags", {}).get("*", [])
         print("Usage: rivet " + sub + " [OPTIONS]\n\nOptions:\n" + "\n".join(f"      {f} <X>" for f in flags))
         return 0
-    doc, base = read_config(argv)
+    doc, base, unreadable = read_config(argv)
     refusal, sql = query_files(sub, argv, doc, base) if base else (None, {})
+    refusal = unreadable or refusal
     export, table = unit_of(sub, argv, doc)
     seen = {k: os.environ.get(k) for k in spec.get("record_env", [])}
     call = {"argv": argv, "env": seen, "env_keys": sorted(os.environ), "cwd": os.getcwd(), "sql": sql, "export": export}
+    call["config"] = doc if spec.get("record_config") and not unreadable else None
     with open(HERE / "calls.jsonl", "a") as log:
         log.write(json.dumps(call) + "\n")
     if refusal:
-        print(json.dumps({"error": f"config file '{value_of(argv, '--config')}': {refusal}", "exit_class": 1}), file=sys.stderr)
+        text = refusal if unreadable else f"config file '{value_of(argv, '--config')}': {refusal}"
+        print(json.dumps({"error": text, "exit_class": 1}), file=sys.stderr)
         return 1
     play = {}
     for key in (f"{sub}:{export}:{table}", f"{sub}:{export}", sub):
