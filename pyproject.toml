@@ -29,7 +29,7 @@ slack = ["apache-airflow-providers-slack>=8.0"]
 
 [dependency-groups]
 dev = ["pytest>=8", "pre-commit>=4", "ruff==0.17.1"]
-gate = ["duckdb>=1.1", "pytz", "pytest>=8"]
+gate = ["duckdb>=1.1", "pytz", "pytest>=8", "pyyaml>=6", "google-cloud-bigquery>=3.25", "snowflake-connector-python>=3.12"]
 
 [tool.uv]
 required-version = ">=0.6.3"

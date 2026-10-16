@@ -67,3 +67,10 @@ Changed before the first release, after review (see the README sections named):
   a callback in `default_args` fires once per failed task.
 - `connection_url`: a password without a login, IPv6 hosts, Oracle `service_name`, an encoded
   database name. The version has one source, `airflow_provider_rivet/__init__.py`.
+- Live gate (`python -m gate`, not part of the package): the warehouse leg is graded by values a
+  second client reads back (google-cloud-bigquery, snowflake-connector-python, ClickHouse HTTP)
+  against the source, per warehouse, mode and table; it printed an inventory and graded nothing.
+  Only the BigQuery batch compaction may not be skipped; the cloud cleanup lists again and fails
+  on a leftover; the Snowflake sweep drops only the gate's own schema shape, quoted; the run tag
+  names the compose project and image; the `Live gate` workflow takes the `-glibc2.28` asset or
+  the ghcr.io image, which start on Debian 12.

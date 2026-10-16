@@ -6,6 +6,7 @@ import ast
 import base64
 import json
 import os
+import secrets
 import shutil
 import subprocess
 import time
@@ -126,13 +127,16 @@ class Stand:
         work: Path,
         warehouses: tuple[str, ...] = (),
         connections: dict[str, str] | None = None,
+        tag: str | None = None,
     ) -> None:
         self.flavor = FLAVORS[version]
+        # The run tag keeps two gate runs of one Airflow version apart: each `down -v` and image build is its own.
+        self.tag = tag or secrets.token_hex(4)
         self.rivet_bin = rivet_bin
         self.dir = work / f"airflow-{version}"
         self.rivet_dir = self.dir / "rivet"
-        self.project = "rivet-gate-af" + version.replace(".", "")
-        self.image = f"rivet-gate-airflow:{version}"
+        self.project = f"rivet-gate-af{version.replace('.', '')}-{self.tag}"
+        self.image = f"rivet-gate-airflow:{version}-{self.tag}"
         self.ui_port = 0
         self.source_dsn = ""
         self.clickhouse_port = 0
@@ -209,8 +213,9 @@ class Stand:
         write_env_file(self.dir / "gate-connections.env", self.connections)
 
     def down(self) -> None:
-        """Remove the project's containers and volumes (a leftover from an earlier run too)."""
+        """Remove the project's containers, volumes and image (a leftover of an earlier attempt of this run too)."""
         sh(["docker", "compose", "-p", self.project, "down", "-v", "--remove-orphans"], timeout=900, check=False)
+        sh(["docker", "image", "rm", "-f", self.image], timeout=300, check=False)
 
     def up(self) -> None:
         """Lay out, build, start, and wait until the API answers."""

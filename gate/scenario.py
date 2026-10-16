@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -177,16 +177,18 @@ def grade_runs(
     run_id: str,
     states: dict[str, str],
     tasks_of: dict[str, list[str]],
-    may_skip: tuple[str, ...] = (),
+    may_skip: Mapping[str, tuple[str, ...]] | None = None,
 ) -> dict[str, dict[str, Any]]:
-    """Every DAG run succeeded and every rivet task in it too (a task named in `may_skip` may be skipped)."""
+    """Every DAG run succeeded and every rivet task in it too (a task whose id starts with a prefix `may_skip` gives
+    for its DAG may be skipped)."""
+    may_skip = may_skip or {}
     tasks = {}
     for dag, wanted in tasks_of.items():
         tasks[dag] = stand.tasks(dag, run_id)
         bad = {
             t: i["state"]
             for t, i in tasks[dag].items()
-            if t in wanted and i["state"] != "success" and not (i["state"] == "skipped" and t.startswith(may_skip))
+            if t in wanted and i["state"] != "success" and not (i["state"] == "skipped" and t.startswith(may_skip.get(dag, ())))
         }
         missing = sorted(set(wanted) - set(tasks[dag]))
         problems = ([f"run {states.get(dag)}"] if states.get(dag) != "success" else []) + ([f"tasks {bad}"] if bad else [])
@@ -311,7 +313,9 @@ def run_cycle(
     marks = grade_base(stand, v, name, run_id, ops, new, files_after, high_water, history, tasks)
     if leg:
         grade_runs(stand, v, name, run_id, states, leg.tasks, may_skip=leg.may_skip)
-        leg.grade(stand, v, name, DELETED_BY_BATCH[name])
+        if sabotage == "warehouse-value" and name == "delta":
+            print(f"SABOTAGE {leg.sabotage()}", flush=True)
+        leg.grade(stand, v, name, {t: DELETED_BY_BATCH[name] if t == "gate_orders" else 0 for t in TABLES})
     return files_after, marks
 
 

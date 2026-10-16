@@ -533,7 +533,18 @@ writers on one SQLite file overlap on every cycle. Oracles: DuckDB over the Parq
 DuckDB's postgres scanner (delta == source rows past the previous high-water; newest version per key == source;
 CDC snapshot + changes replayed by `__seq` == source; exact operation counts), the stored cursor read by a plain
 SQLite / psql client, and the Airflow REST API (run and task states, XCom rows == rows in the files).
-`--sabotage drop-delta-file` must turn it red. Each stack is torn down with its volumes before and after.
+`--sabotage drop-delta-file` must turn it red. Each stack is torn down with its volumes before and after; the
+compose project and the image carry the run tag (`--tag`, default `%m%d%H%M` + 4 hex), so two runs never share one.
+
+With `--warehouses bigquery,snowflake,clickhouse` each stack also extracts to GCS and loads (and compacts) into the
+three warehouses from Airflow Connections. Each warehouse is read back by a client the loader does not use
+(google-cloud-bigquery, snowflake-connector-python with the key of the local `snow` connection, ClickHouse over HTTP
+as JSON), every value is brought to one form (integer, integer cents, epoch microseconds, text) and compared with the
+source: the batch current state equals the source with exactly the keys the cycle deleted left over (an incremental
+extract cannot see a delete); the CDC current state without the rows flagged `__is_deleted` equals the source; the
+BigQuery batch buffer `<table>__changes` is gone after `compact`, which only that DAG may not skip. The cleanup lists
+the dataset, schema and GCS prefix again and fails on anything left; the sweep of runs older than a day drops only
+names of the gate's own shape.
 
 rivet's release gate runs it on every release candidate (`dev/release_oracle/airflow_provider.py`, pinned by
 `dev/release_oracle/airflow-provider.ref`); the `Live gate` workflow here runs it against a released binary.

@@ -28,12 +28,22 @@ jobs:
       - name: Download the rivet Linux binary
         env:
           GH_TOKEN: ${{ github.token }}
+        # The image is Debian 12 (glibc 2.36): the plain `-linux-gnu` asset needs glibc 2.38+ and cannot start there.
+        # A release from 0.32 on carries a `-glibc2.28` asset; an older one is taken from its Debian ghcr.io image.
         run: |
           tag="${{ inputs.rivet }}"
           [ -n "$tag" ] || tag=$(gh release view -R panchenkoai/rivet --json tagName -q .tagName)
-          gh release download "$tag" -R panchenkoai/rivet -p "rivet-$tag-x86_64-unknown-linux-gnu.tar.gz" -D rivet-dl
-          tar -xzf rivet-dl/*.tar.gz -C rivet-dl
-          find rivet-dl -type f -name rivet -exec cp {} ./rivet-bin \;
+          case "$tag" in v*) ;; *) tag="v$tag" ;; esac
+          asset="rivet-$tag-x86_64-unknown-linux-gnu-glibc2.28.tar.gz"
+          if gh release view "$tag" -R panchenkoai/rivet --json assets -q '.assets[].name' | grep -qxF "$asset"; then
+            gh release download "$tag" -R panchenkoai/rivet -p "$asset" -D rivet-dl
+            tar -xzf "rivet-dl/$asset" -C rivet-dl
+            find rivet-dl -type f -name rivet -exec cp {} ./rivet-bin \;
+          else
+            docker create --name rivet-src --platform linux/amd64 "ghcr.io/panchenkoai/rivet:$tag"
+            docker cp rivet-src:/usr/local/bin/rivet ./rivet-bin
+            docker rm rivet-src
+          fi
           chmod +x rivet-bin
       - run: uv run --only-group gate python -m gate --rivet-bin ./rivet-bin --verdicts verdicts.jsonl
       - if: always()

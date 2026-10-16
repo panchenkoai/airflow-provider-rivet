@@ -1,4 +1,4 @@
-"""python -m gate --rivet-bin <linux rivet> [--airflow 2.10.5,3.3.2] [--verdicts out.jsonl] [--keep] [--sabotage drop-delta-file]
+"""python -m gate --rivet-bin <linux rivet> [--airflow 2.10.5,3.3.2] [--verdicts out.jsonl] [--keep] [--sabotage drop-delta-file|warehouse-value]
 
 Exit 0 only when every cell ran and passed; each stack is torn down (volumes too) before and after it runs.
 """
@@ -16,7 +16,7 @@ from pathlib import Path
 
 from .scenario import TABLES, Verdicts, play
 from .stand import FLAVORS, Stand
-from .warehouse import WAREHOUSES, Cloud, Leg, connections, sweep
+from .warehouse import TAG_SHAPE, WAREHOUSES, Cloud, Leg, connections, sweep
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -37,7 +37,15 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--sf-warehouse", default="RIVET_LOAD_TEST")
     ap.add_argument("--sf-database", default="RIVET_LOAD_TEST")
     ap.add_argument("--sf-integration", default="RIVET_GCS")
-    ap.add_argument("--sabotage", choices=["drop-delta-file"], help="break one output on purpose: the gate must go red")
+    ap.add_argument(
+        "--sabotage",
+        choices=["drop-delta-file", "warehouse-value"],
+        help="break one output on purpose (a delta file; one BigQuery value after the load): the gate must go red",
+    )
+    ap.add_argument(
+        "--tag",
+        help="run tag (default: %%m%%d%%H%%M + 4 hex): names the compose projects, images, dataset, schema and GCS prefix",
+    )
     args = ap.parse_args(argv)
 
     versions = [v.strip() for v in args.airflow.split(",") if v.strip()]
@@ -47,10 +55,12 @@ def main(argv: list[str] | None = None) -> int:
     warehouses = tuple(w for w in args.warehouses.split(",") if w)
     if set(warehouses) - set(WAREHOUSES):
         ap.error(f"unknown warehouse(s) {sorted(set(warehouses) - set(WAREHOUSES))}; known: {list(WAREHOUSES)}")
+    tag = args.tag or time.strftime("%m%d%H%M") + secrets.token_hex(2)
+    if not TAG_SHAPE.fullmatch(tag):
+        ap.error(f"--tag {tag!r} is not 8 digits and 4 lower-case hex digits (the shape the cloud sweep recognises)")
     cloud = None
     if warehouses:
         keyfile = args.gcp_keyfile or Path.home() / ".config/gcloud/application_default_credentials.json"
-        tag = time.strftime("%m%d%H%M") + secrets.token_hex(2)
         cloud = Cloud(
             keyfile,
             args.gcs_bucket,
@@ -68,8 +78,8 @@ def main(argv: list[str] | None = None) -> int:
     rows: list[dict[str, str]] = []
     for version in versions:
         conns = connections(cloud) if cloud else {}
-        stand = Stand(version, args.rivet_bin.resolve(), work.resolve(), warehouses, conns)
-        leg = Leg(cloud, version, TABLES) if cloud else None
+        stand = Stand(version, args.rivet_bin.resolve(), work.resolve(), warehouses, conns, tag=tag)
+        leg = Leg(cloud, version, TABLES, warehouses) if cloud else None
         verdicts = Verdicts(version)
         try:
             verdicts.guard("stand-up", stand.up)
