@@ -133,17 +133,22 @@ class Client:
         return {"ok": True, "channel": "C0123", "ts": f"1760612345.00010{len(self.calls)}"}
 
 
-def fake_slack(monkeypatch: pytest.MonkeyPatch, client: Client | None = None, sent: list | None = None) -> None:
-    """Replace both Slack hooks: the bot hook hands out `client`, the webhook hook records (conn_id, text)."""
+def fake_slack(monkeypatch: pytest.MonkeyPatch, client: Client | None = None, sent: list | None = None) -> list[tuple]:
+    """Replace both Slack hooks: the bot hook hands out `client`, the webhook hook records (conn_id, text).
+
+    Returns every hook built, as (hook class name, its keyword arguments), so a test checks the connection id and the
+    hook settings the callback passed (both hooks take keywords only)."""
+    built: list[tuple[str, dict]] = []
 
     class SlackHook:
-        def __init__(self, slack_conn_id: str, **kwargs: Any) -> None:
-            assert slack_conn_id == "slack_bot"
+        def __init__(self, **kwargs: Any) -> None:
+            built.append(("SlackHook", kwargs))
             self.client = client
 
     class SlackWebhookHook:
-        def __init__(self, slack_webhook_conn_id: str, **kwargs: Any) -> None:
-            self.conn_id = slack_webhook_conn_id
+        def __init__(self, **kwargs: Any) -> None:
+            built.append(("SlackWebhookHook", kwargs))
+            self.conn_id = kwargs.get("slack_webhook_conn_id")
 
         def send(self, text: str) -> Any:
             sent.append((self.conn_id, text))
@@ -153,6 +158,7 @@ def fake_slack(monkeypatch: pytest.MonkeyPatch, client: Client | None = None, se
         module = types.ModuleType(name)
         setattr(module, hook.__name__, hook)
         monkeypatch.setitem(sys.modules, name, module)
+    return built
 
 
 class OneTI(FakeTI):
@@ -175,10 +181,13 @@ def test_the_bot_posts_the_title_then_the_error_text_as_a_code_block_in_its_thre
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, tmp_path: Path
 ) -> None:
     client = Client()
-    fake_slack(monkeypatch, client)
+    built = fake_slack(monkeypatch, client)
     caplog.set_level(logging.INFO)
     payload = {**RETRYABLE, "stderr_path": stderr_file(tmp_path, UNREADABLE_LINE.replace("127.0.0.1:1", "<db> & co"))}
-    slack_failure_callback("slack_bot", channel="C0123")(failed_context(payload, raised("operator text")))
+    slack_failure_callback("slack_bot", channel="C0123", timeout=7, proxy="http://proxy:3128")(
+        failed_context(payload, raised("operator text"))
+    )
+    assert built == [("SlackHook", {"slack_conn_id": "slack_bot", "timeout": 7, "proxy": "http://proxy:3128"})]
     (first, top), (second, reply) = client.calls
     assert first == second == "chat_postMessage"
     assert top["channel"] == "C0123" and top["text"] == "d.apply.users — RIVET_PLAN_SOURCE_UNREADABLE (retryable)"
@@ -203,9 +212,10 @@ def test_the_webhook_fallback_sends_title_link_and_error_text_as_one_message(
     monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, planted: str
 ) -> None:
     sent: list[tuple[str, str]] = []
-    fake_slack(monkeypatch, sent=sent)
+    built = fake_slack(monkeypatch, sent=sent)
     caplog.set_level(logging.INFO)
-    slack_failure_callback("slack_rivet")(failed_context(PREFLIGHT, raised(f"refused {planted}")))
+    slack_failure_callback("slack_rivet", timeout=5)(failed_context(PREFLIGHT, raised(f"refused {planted}")))
+    assert built == [("SlackWebhookHook", {"slack_webhook_conn_id": "slack_rivet", "timeout": 5})]
     [(conn_id, text)] = sent
     assert conn_id == "slack_rivet"
     assert text.split("\n") == [
@@ -308,4 +318,6 @@ def test_the_fake_slack_hooks_have_the_shape_of_the_slack_providers_hooks() -> N
     assert hasattr(slack.SlackHook, "client"), "the bot path takes the WebClient from `SlackHook.client`"
     assert {"channel", "text", "blocks", "thread_ts"} <= set(inspect.signature(WebClient.chat_postMessage).parameters)
     assert "slack_webhook_conn_id" in inspect.signature(webhook.SlackWebhookHook.__init__).parameters
+    for hook in (slack.SlackHook, webhook.SlackWebhookHook):  # the hook settings the alert tests pass through
+        assert {"timeout", "proxy"} <= set(inspect.signature(hook.__init__).parameters), hook
     assert "text" in inspect.signature(webhook.SlackWebhookHook.send).parameters

@@ -667,7 +667,11 @@ CI checks rivet out at the commit in `RIVET_CONTRACT_REF` and runs the suite on 
 3.x under Airflow's constraints files.
 
 The tests need no rivet binary and no running Airflow: a fake `rivet` script replays each
-scenario (and enforces rivet's own `query_file` rule, tied to the Rust source by a test).
+scenario (and enforces rivet's own `query_file` rule, tied to the Rust source by a test). It accepts only the
+subcommands and flags of the rivet it impersonates (0.31.0, or `main` = `RIVET_CONTRACT_REF`) and refuses the rest
+with clap's exit 2, as rivet does; that surface is `tests/rivet_cli_surface.json`, read from rivet's
+`src/cli/args.rs`. A test fails when it drifts: after bumping `RIVET_CONTRACT_REF`, regenerate it with
+`uv run python tests/rivet_cli_surface.py`. A command line the fake refused fails the test that did not expect it.
 `tests/test_dag_runs.py` runs the builders' DAGs through `dag.test()` against a SQLite metadata
 database created in a throwaway `AIRFLOW_HOME`, with real task instances and trigger rules.
 

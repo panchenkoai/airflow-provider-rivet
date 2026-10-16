@@ -153,10 +153,13 @@ def test_exit_2_with_an_object_is_retried(rig: Rig) -> None:
 
 
 def test_exit_2_without_an_object_is_not_retried(rig: Rig) -> None:
-    rig.scenario(apply={"exit": 2, "stderr": "error: unexpected argument '--bogus' found"})
+    """clap's refusal of an unknown flag: exit 2 and a usage error, no `--json-errors` object (the fake refuses the flag
+    itself now, as rivet does; it used to accept it and replay a scripted exit 2)."""
     exc, ti = rig.run(rig.operator(RivetApplyOperator, export="orders", extra_args=["--bogus"]))
     assert isinstance(exc, AirflowFailException)
-    assert "--bogus" in rig.argv("apply")
+    [refused] = rig.invocations("refused")
+    assert refused["argv"][0] == "apply" and "--bogus" in refused["argv"]
+    assert refused["refusal"].startswith("error: unexpected argument '--bogus' found")
     error = ti.store[("task", "return_value")]["error"]
     assert (error["class"], error["exit_code"], error["retryable"]) == ("generic", 1, False)
 
@@ -836,7 +839,7 @@ def test_a_worker_state_url_the_task_does_not_pass_on_is_refused_before_rivet_st
         assert ti.store[("task", "return_value")]["preflight_refusal"] == "RIVET_AIRFLOW_STATE_ENV_NOT_PASSED"
         text = str(exc)
         assert "RIVET_STATE_URL" in text and 'env_passthrough=["RIVET_STATE_URL"]' in text and "env_from_connections" in text
-        blob = text + json.dumps(ti.store[("task", "return_value")]) + json.dumps(rig.records) + caplog.text
+        blob = text + json.dumps(ti.store[("task", "return_value")]) + json.dumps(rig.records) + caplog.text + rig.task_log.text()
         assert "st4te-pw" not in blob and "state-db" not in blob, "the value is never shown"
     assert not rig.calls(), "rivet is not started on an empty SQLite state"
     assert not (rig.state_dir / "logs").exists() and not list(rig.state_dir.glob("*.yaml"))

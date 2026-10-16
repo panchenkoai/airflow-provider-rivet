@@ -9,19 +9,172 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-BASE_FLAGS = {
-    "run": ["--config", "--export", "--summary-output", "--json", "--json-errors"],
-    "plan": ["--config", "--export", "--format", "--output", "--json-errors"],
-    "apply": ["--resume", "--force", "--json-errors"],
-    "load": ["--config", "--run-id", "--pool", "--json-errors"],
-    "compact": ["--config", "--run-id", "--pool", "--json-errors"],
-    "metrics": ["--config", "--export", "--last", "--json", "--json-errors"],
-}
 QUERY_FILE_RULES = (
     "query_file must be a relative path",
     "query_file path must not contain '..'",
     "resolves outside the config directory",
 )
+
+
+class Clap(Exception):
+    """clap's refusal of a command line: exit 2, its message on stderr (src/cli/args.rs `parse_cli`; clap 4)."""
+
+    def __init__(self, message, usage=None):
+        tail = f"\n\nUsage: {usage}" if usage else ""
+        super().__init__(f"error: {message}{tail}\n\nFor more information, try '--help'.")
+
+
+def surface_of(spec):
+    """The CLI of the rivet this scenario impersonates (`rivet_cli_surface.json`, regenerated from rivet's clap
+    definitions by tests/rivet_cli_surface.py): `cli` names it, else the version (`main` for any but a release in it).
+
+    `flags` adds what a newer rivet would have, per subcommand or `*` for every one: `--name` a switch, `--name <V>` a
+    flag with a value. The fake accepts those and nothing else rivet does not."""
+    table = json.loads((HERE / "rivet_cli_surface.json").read_text())
+    version = spec.get("version", "0.31.0")
+    key = spec.get("cli") or (version if version in table else "main")
+    return table[key], spec.get("flags", {})
+
+
+def extra_option(text):
+    """A scenario's extra flag as the surface spells an option."""
+    name, _, value = text.partition(" ")
+    return {
+        "long": name[2:],
+        "short": None,
+        "aliases": [],
+        "switch": not value,
+        "multiple": False,
+        "num_args": None,
+        "value_name": value.strip("<>") or None,
+        "kind": "string",
+        "values": None,
+        "required": False,
+    }
+
+
+def shown(opt):
+    """How clap names an option in its messages: `--config <CONFIG>`."""
+    return f"--{opt['long']}" + ("" if opt["switch"] else f" <{opt['value_name']}>")
+
+
+def usage(path, cmd, globals_):
+    """clap's usage line of a (sub)command."""
+    words = ["rivet", *path, "[OPTIONS]"]
+    if cmd.get("subcommands"):
+        return " ".join([*words, "<COMMAND>"])
+    words += [shown(o) for o in cmd["options"] if o["required"]]
+    return " ".join(words + [f"<{p['name'].upper()}>" if p["required"] else f"[{p['name'].upper()}]" for p in cmd["positionals"]])
+
+
+def help_text(path, cmd, globals_):
+    """`rivet <sub> --help` as clap prints it: one line per option, the flag first."""
+    lines = [f"Usage: {usage(path, cmd, globals_)}", ""]
+    if cmd.get("subcommands"):
+        lines += ["Commands:"] + [f"  {name}" for name in [*cmd["subcommands"], "help"]] + [""]
+    lines.append("Options:")
+    for opt in [*cmd["options"], *globals_]:
+        short = f"-{opt['short']}, " if opt["short"] else "    "
+        lines.append(f"  {short}{shown(opt)}")
+        lines += [f"          [aliases: --{a}]" for a in opt["aliases"]]
+    lines.append("  -h, --help  Print help")
+    if not path:
+        lines.append("  -V, --version  Print version")
+    return "\n".join(lines)
+
+
+def check_value(opt, value):
+    """clap's value parser for an option: an integer type or a `ValueEnum`."""
+    if opt["kind"] == "int" and not value.isdigit():
+        reason = "cannot parse integer from empty string" if not value else "invalid digit found in string"
+        raise Clap(f"invalid value '{value}' for '{shown(opt)}': {reason}")
+    if opt["kind"] == "enum" and value not in opt["values"]:
+        raise Clap(f"invalid value '{value}' for '{shown(opt)}'\n  [possible values: {', '.join(opt['values'])}]")
+
+
+def parse_cli(argv, surface, extras):
+    """Walk argv as clap would: ("help", text) for `--help`, ("version", None), or ("run", subcommand path).
+
+    Refuses with `Clap` what real rivet refuses: an unknown subcommand, an unknown flag, a flag's missing or invalid
+    value, a single-valued flag given twice, a missing required flag or positional, a stray positional. Not modelled:
+    argument groups, `requires` and `conflicts_with` (no command line of the package reaches them)."""
+    globals_ = surface["globals"]
+    cmd, path, seen, positionals, i = {"options": [], "positionals": [], "subcommands": surface["subcommands"]}, [], {}, [], 0
+    while i < len(argv):
+        arg = argv[i]
+        i += 1
+        options = cmd["options"] + globals_
+        if arg in ("-h", "--help"):
+            return "help", help_text(path, cmd, globals_)
+        if arg in ("-V", "--version") and not path:
+            return "version", None
+        if arg == "--" and not cmd.get("subcommands"):
+            positionals += argv[i:]
+            break
+        if arg.startswith("-") and len(arg) > 1:
+            name, eq, inline = arg.partition("=") if arg.startswith("--") else (arg[:2], "", arg[2:].removeprefix("="))
+            eq = eq or (inline and not arg.startswith("--"))
+            opt = next(
+                (
+                    o
+                    for o in options
+                    if (name.startswith("--") and name[2:] in [o["long"], *o["aliases"]])
+                    or (not name.startswith("--") and o["short"] == name[1:])
+                ),
+                None,
+            )
+            if opt is None:
+                raise Clap(
+                    f"unexpected argument '{arg if not eq or arg.startswith('--') else name}' found", usage(path, cmd, globals_)
+                )
+            if opt["long"] in seen and not opt["multiple"] and not opt.get("global"):
+                raise Clap(f"the argument '{shown(opt)}' cannot be used multiple times", usage(path, cmd, globals_))
+            seen[opt["long"]] = opt
+            if opt["switch"]:
+                if eq:
+                    raise Clap(f"unexpected value '{inline}' for '{shown(opt)}' found; no more were expected")
+                continue
+            values = [inline] if eq else []
+            while not values or opt["num_args"]:
+                if i >= len(argv) or (argv[i].startswith("-") and len(argv[i]) > 1):
+                    break
+                values.append(argv[i])
+                i += 1
+            if not values:
+                if i < len(argv):
+                    nxt = argv[i]
+                    known = any(
+                        nxt.partition("=")[0][2:] in [o["long"], *o["aliases"]] or nxt[1:2] == o["short"] for o in options
+                    )
+                    if not known:
+                        raise Clap(f"unexpected argument '{nxt}' found", usage(path, cmd, globals_))
+                raise Clap(f"a value is required for '{shown(opt)}' but none was supplied")
+            for value in values:
+                check_value(opt, value)
+            continue
+        if cmd.get("subcommands"):
+            if arg == "help":
+                return "help", help_text(path, cmd, globals_)
+            if arg not in cmd["subcommands"]:
+                raise Clap(f"unrecognized subcommand '{arg}'", usage(path, cmd, globals_))
+            path.append(arg)
+            cmd = cmd["subcommands"][arg]
+            if len(path) == 1:
+                for flag in extras.get(arg, []) + extras.get("*", []):
+                    cmd = {**cmd, "options": [*cmd["options"], extra_option(flag)]}
+            continue
+        positionals.append(arg)
+    if cmd.get("subcommands"):
+        if not path:
+            raise Clap("'rivet' requires a subcommand but one was not provided", usage(path, cmd, globals_))
+        raise Clap(f"'rivet {' '.join(path)}' requires a subcommand but one was not provided", usage(path, cmd, globals_))
+    if len(positionals) > len(cmd["positionals"]):
+        raise Clap(f"unexpected argument '{positionals[len(cmd['positionals'])]}' found", usage(path, cmd, globals_))
+    missing = [shown(o) for o in cmd["options"] if o["required"] and o["long"] not in seen]
+    missing += [f"<{p['name'].upper()}>" for p in cmd["positionals"][len(positionals) :] if p["required"]]
+    if missing:
+        raise Clap("the following required arguments were not provided:\n  " + "\n  ".join(missing), usage(path, cmd, globals_))
+    return "run", path
 
 
 def value_of(argv, flag):
@@ -163,26 +316,43 @@ def canonical(path):
     return out
 
 
+def record_invocation(argv, kind, refusal=None):
+    """Every start of the binary, probes and refused command lines included, with its whole environment and how it
+    ended (`invocations.jsonl` beside the fake; `Rig.invocations`)."""
+    row = {"argv": argv, "kind": kind, "env": dict(os.environ), "refusal": refusal}
+    with open(HERE / "invocations.jsonl", "a") as log:
+        log.write(json.dumps(row) + "\n")
+
+
 def main():
     """Answer `--version` / `--help`, or replay the scenario for the subcommand."""
     spec = json.loads((HERE / "scenario.json").read_text())
     argv = sys.argv[1:]
     broken = spec.get("probe_broken", {})
-    if argv == ["--version"]:
+    surface, extras = surface_of(spec)
+    try:
+        verdict, out = parse_cli(argv, surface, extras)
+    except Clap as refusal:
+        record_invocation(argv, "refused", str(refusal))
+        print(refusal, file=sys.stderr)
+        return 2
+    if verdict == "version":
+        record_invocation(argv, "probe")
         if broken.get("--version") == "hang":
             time.sleep(90)
         print(f"rivet {spec.get('version', '0.31.0')} (fake)")
         return 0
-    sub = argv[0]
-    if "--help" in argv:
-        if broken.get(sub) == "hang":
+    if verdict == "help":
+        record_invocation(argv, "probe")
+        if broken.get(argv[0]) == "hang":
             time.sleep(90)
-        if broken.get(sub) == "exit":
-            print(f"error: unrecognized subcommand '{sub}'", file=sys.stderr)
+        if broken.get(argv[0]) == "exit":
+            print(f"error: unrecognized subcommand '{argv[0]}'", file=sys.stderr)
             return 2
-        flags = BASE_FLAGS.get(sub, []) + spec.get("flags", {}).get(sub, []) + spec.get("flags", {}).get("*", [])
-        print("Usage: rivet " + sub + " [OPTIONS]\n\nOptions:\n" + "\n".join(f"      {f} <X>" for f in flags))
+        print(out)
         return 0
+    record_invocation(argv, "call")
+    sub = argv[0]
     doc, base, unreadable = read_config(argv)
     refusal, sql = query_files(sub, argv, doc, base) if base else (None, {})
     refusal = unreadable or refusal

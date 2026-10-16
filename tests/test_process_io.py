@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 from airflow.exceptions import AirflowException, AirflowFailException
-from conftest import Rig
+from conftest import NEW_FLAGS, Rig
 
 from airflow_provider_rivet import invocation
 from airflow_provider_rivet.operators import RivetApplyOperator, RivetLoadOperator, RivetRunOperator
@@ -91,8 +91,7 @@ def test_d01_a_broken_json_line_is_recorded_as_result_malformed(rig: Rig) -> Non
 @pytest.mark.parametrize("command", ["run", "apply", "load"])
 def test_d18_an_exit_zero_without_a_readable_summary_is_recorded(rig: Rig, command: str, play: dict, key: str) -> None:
     """D18: `--summary-output` was passed, rivet exited 0, and the file is absent or not JSON: recorded in degraded."""
-    flags = {"apply": ["--summary-output"], "load": ["--export", "--table", "--summary-output"]}
-    rig.scenario(flags=flags, **{command: play})
+    rig.scenario(flags={k: NEW_FLAGS[k] for k in ("apply", "load")}, **{command: play})
     cls = {"run": RivetRunOperator, "apply": RivetApplyOperator, "load": RivetLoadOperator}[command]
     payload, _ = rig.run(rig.operator(cls, export="orders"))
     assert payload["decision"] == "success"

@@ -16,13 +16,12 @@ from typing import Any
 
 import pytest
 from airflow.exceptions import AirflowException, AirflowFailException, AirflowSkipException
-from conftest import NEW_FLAGS, SECRET, FakeTI, Rig, fixture
+from conftest import NEW_FLAGS, SECRET, FakeTI, Rig, TaskLog, fixture
 
 from airflow_provider_rivet import invocation
 from airflow_provider_rivet.capabilities import DEGRADATIONS
 from airflow_provider_rivet.operators import (
     RivetApplyOperator,
-    RivetBaseOperator,
     RivetCdcRunOperator,
     RivetCompactOperator,
     RivetLoadOperator,
@@ -35,40 +34,16 @@ SQLITE = f"  note     SQLite state is single-host — see {GUIDE}"
 OLD_LACKS = "  note     this binary lacks: apply_summary, lock_wait, no_notify (the operator works around them)"
 
 
-class Recorder:
-    """Stands in for the operator's logger: keeps (level name, text) of every line."""
-
-    def __init__(self) -> None:
-        self.lines: list[tuple[str, str]] = []
-
-    def _at(self, level: str) -> Any:
-        def write(msg: str, *args: Any, **_: Any) -> None:
-            self.lines.append((level, msg % args if args else msg))
-
-        return write
-
-    def __getattr__(self, name: str) -> Any:
-        if name in ("debug", "info", "warning", "error", "exception", "critical"):
-            return self._at(name.upper().replace("EXCEPTION", "ERROR"))
-        raise AttributeError(name)
-
-    def shown(self) -> list[str]:
-        """The lines a default Airflow task log shows (INFO and above), with their level."""
-        return [f"{level} {text}" for level, text in self.lines if level != "DEBUG"]
-
-
 @pytest.fixture
-def log(monkeypatch: pytest.MonkeyPatch) -> Recorder:
-    """Every operator's log goes to one recorder; each clock reading of the task log is one second later."""
-    recorder = Recorder()
-    monkeypatch.setattr(RivetBaseOperator, "log", property(lambda self: recorder))
+def log(task_log: TaskLog, monkeypatch: pytest.MonkeyPatch) -> TaskLog:
+    """The task log of every operator of the test (conftest `task_log`); each clock reading is one second later."""
     try:
         from airflow_provider_rivet import tasklog
     except ImportError:  # the base has no readable block: the exact-text assertion is what fails there
-        return recorder
+        return task_log
     ticks = itertools.count()
     monkeypatch.setattr(tasklog, "clock", lambda: float(next(ticks)))
-    return recorder
+    return task_log
 
 
 def red_keywords() -> list[str]:
@@ -90,7 +65,7 @@ def summary(name: str, rows: int, files: int, run_id: str, status: str = "succes
 # --- golden: success ------------------------------------------------------------------------------------------------
 
 
-def test_golden_apply_success_with_counts(rig: Rig, log: Recorder) -> None:
+def test_golden_apply_success_with_counts(rig: Rig, log: TaskLog) -> None:
     """Success with counts on a binary with the contract's flags: the headline says OK, the counts, the time, the run."""
     rig.scenario(flags=NEW_FLAGS, apply={"summary": summary("orders", 30, 1, "orders_20261016T092509")})
     payload, _ = rig.run(rig.operator(RivetApplyOperator, export="orders"))
@@ -103,7 +78,7 @@ def test_golden_apply_success_with_counts(rig: Rig, log: Recorder) -> None:
     ]
 
 
-def test_golden_apply_success_on_a_degraded_binary(rig: Rig, log: Recorder) -> None:
+def test_golden_apply_success_on_a_degraded_binary(rig: Rig, log: TaskLog) -> None:
     """The owner's case: rivet 0.31.0 (no apply summary, no --lock-wait, no --no-notify) and SQLite state. The missing
     flags are one note, not a `degraded: [...]` dump that reads like a fault; counts come from `rivet metrics`."""
     rig.scenario(metrics={"rows": [{"export_name": "users", "run_id": "users_1", "total_rows": 30, "files_produced": 1}]})
@@ -119,7 +94,7 @@ def test_golden_apply_success_on_a_degraded_binary(rig: Rig, log: Recorder) -> N
     ]
 
 
-def test_golden_run_of_the_whole_config_lists_each_export(rig: Rig, log: Recorder) -> None:
+def test_golden_run_of_the_whole_config_lists_each_export(rig: Rig, log: TaskLog) -> None:
     """Several units: the headline sums them, one line per unit follows the step."""
     two = {"per_export": summary("orders", 500, 2, "orders_1")["per_export"] + summary("users", 7, 1, "users_1")["per_export"]}
     rig.scenario(flags=NEW_FLAGS, run={"summary": two})
@@ -134,7 +109,7 @@ def test_golden_run_of_the_whole_config_lists_each_export(rig: Rig, log: Recorde
     ]
 
 
-def test_golden_cdc_max_events_is_a_note(rig: Rig, log: Recorder) -> None:
+def test_golden_cdc_max_events_is_a_note(rig: Rig, log: TaskLog) -> None:
     rig.scenario(
         flags=NEW_FLAGS, run={"summary": summary("orders_cdc", 9, 1, "orders_cdc_1", mode="cdc", stop_reason="max_events")}
     )
@@ -151,7 +126,7 @@ def test_golden_cdc_max_events_is_a_note(rig: Rig, log: Recorder) -> None:
 # --- golden: skipped ------------------------------------------------------------------------------------------------
 
 
-def test_golden_skipped_nothing_to_do(rig: Rig, log: Recorder) -> None:
+def test_golden_skipped_nothing_to_do(rig: Rig, log: TaskLog) -> None:
     """A `skip_empty` apply that delivered nothing: SKIPPED with rivet's reason, not OK with zero rows."""
     rows = [{"export_name": "users", "run_id": "users_2", "status": "skipped", "skip_reason": "empty", "total_rows": 0}]
     rig.scenario(metrics={"rows": rows})
@@ -160,7 +135,7 @@ def test_golden_skipped_nothing_to_do(rig: Rig, log: Recorder) -> None:
     assert log.shown()[0] == "INFO rivet apply users → SKIPPED: nothing to do (empty) in 7.0 s (run users_2)"
 
 
-def test_golden_compact_skipped_is_an_airflow_skip_with_the_same_headline(rig: Rig, log: Recorder) -> None:
+def test_golden_compact_skipped_is_an_airflow_skip_with_the_same_headline(rig: Rig, log: TaskLog) -> None:
     rig.scenario(
         flags=NEW_FLAGS,
         compact={
@@ -179,7 +154,7 @@ def test_golden_compact_skipped_is_an_airflow_skip_with_the_same_headline(rig: R
     ]
 
 
-def test_golden_skipped_already_applied_by_an_earlier_try(rig: Rig, log: Recorder) -> None:
+def test_golden_skipped_already_applied_by_an_earlier_try(rig: Rig, log: TaskLog) -> None:
     """G1b: the retry finds the run its earlier try's apply made and applies nothing; the headline says so."""
     rig.scenario(flags=NEW_FLAGS, apply={"summary": summary("orders", 30, 1, "ignored")})
     op = rig.operator(RivetApplyOperator, export="orders")
@@ -197,7 +172,7 @@ def test_golden_skipped_already_applied_by_an_earlier_try(rig: Rig, log: Recorde
 # --- golden: failures -----------------------------------------------------------------------------------------------
 
 
-def test_golden_refused_final_with_its_action(rig: Rig, log: Recorder) -> None:
+def test_golden_refused_final_with_its_action(rig: Rig, log: TaskLog) -> None:
     """A refusal: one ERROR headline, REFUSED, its code, `final`, the registry action; the stderr path, never its text."""
     line = fixture("json_errors.json")
     rig.scenario(flags=NEW_FLAGS, apply={"exit": 5, "line": line})
@@ -216,7 +191,7 @@ def test_golden_refused_final_with_its_action(rig: Rig, log: Recorder) -> None:
     ]
 
 
-def test_golden_stale_plan_refused_on_todays_binary(rig: Rig, log: Recorder) -> None:
+def test_golden_stale_plan_refused_on_todays_binary(rig: Rig, log: TaskLog) -> None:
     """The owner's failure example: `RIVET_PLAN_ARTIFACT_STALE` from a binary that prints no `class` (exit 5)."""
     op = rig.operator(RivetApplyOperator, export="users")
     rig.scenario(cursors={"users": "5"}, apply={"exit": 2, "line": {"error": "network", "exit_class": 2}})
@@ -240,7 +215,7 @@ def test_golden_stale_plan_refused_on_todays_binary(rig: Rig, log: Recorder) -> 
     ]
 
 
-def test_golden_transient_failure_says_it_is_retried(rig: Rig, log: Recorder) -> None:
+def test_golden_transient_failure_says_it_is_retried(rig: Rig, log: TaskLog) -> None:
     """A retryable failure reads differently from a final one: WARNING, `retryable`, and that Airflow retries it."""
     line = {"error": "connection reset", "exit_class": 2, "code": "RIVET_SOURCE_CONNECT", "class": "retryable", "retryable": True}
     rig.scenario(flags=NEW_FLAGS, run={"exit": 2, "line": line})
@@ -259,7 +234,7 @@ def test_golden_transient_failure_says_it_is_retried(rig: Rig, log: Recorder) ->
     assert log.shown()[0] == "WARNING rivet run orders → FAILED [RIVET_SOURCE_CONNECT], retryable, no try left (try 3 of 3)"
 
 
-def test_golden_crashed_by_a_signal(rig: Rig, log: Recorder) -> None:
+def test_golden_crashed_by_a_signal(rig: Rig, log: TaskLog) -> None:
     rig.scenario(flags=NEW_FLAGS, run={"signal": "SIGKILL"})
     exc, ti = rig.run(rig.operator(RivetRunOperator, export="orders", crashed_retries=1), FakeTI(try_number=1))
     assert type(exc) is AirflowException
@@ -272,7 +247,7 @@ def test_golden_crashed_by_a_signal(rig: Rig, log: Recorder) -> None:
     assert log.shown()[0] == "ERROR rivet run orders → CRASHED: rivet ended by signal 9, final: the crash budget is used up"
 
 
-def test_golden_stopped_before_rivet_started(rig: Rig, log: Recorder) -> None:
+def test_golden_stopped_before_rivet_started(rig: Rig, log: TaskLog) -> None:
     """Airflow stopped the task between two steps: STOPPED, and which step was not run."""
     op = rig.operator(RivetApplyOperator, export="orders")
     op.on_kill()
@@ -284,7 +259,7 @@ def test_golden_stopped_before_rivet_started(rig: Rig, log: Recorder) -> None:
     ]
 
 
-def test_golden_stopped_while_rivet_ran(rig: Rig, log: Recorder, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_golden_stopped_while_rivet_ran(rig: Rig, log: TaskLog, monkeypatch: pytest.MonkeyPatch) -> None:
     """Airflow killed the task while rivet ran: the kill reads STOPPED by Airflow, not as a crash of rivet."""
     rig.scenario(flags=NEW_FLAGS, run={"signal": "SIGTERM"})
     op = rig.operator(RivetRunOperator, export="orders")
@@ -303,7 +278,7 @@ def test_golden_stopped_while_rivet_ran(rig: Rig, log: Recorder, monkeypatch: py
     ]
 
 
-def test_golden_busy_lock(rig: Rig, log: Recorder, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_golden_busy_lock(rig: Rig, log: TaskLog, monkeypatch: pytest.MonkeyPatch) -> None:
     import fcntl
     import os
 
@@ -326,7 +301,7 @@ def test_golden_busy_lock(rig: Rig, log: Recorder, monkeypatch: pytest.MonkeyPat
     ]
 
 
-def test_golden_refused_before_rivet_started(rig: Rig, log: Recorder) -> None:
+def test_golden_refused_before_rivet_started(rig: Rig, log: TaskLog) -> None:
     op = rig.operator(RivetRunOperator, export="orders", connections=["no_such_conn"])
     exc, _ = rig.run(op)
     assert isinstance(exc, AirflowFailException)
@@ -339,16 +314,25 @@ def test_golden_refused_before_rivet_started(rig: Rig, log: Recorder) -> None:
 # --- what moved to DEBUG, and what no success line may hold ---------------------------------------------------------
 
 
-def test_the_structured_records_are_kept_at_debug(rig: Rig, log: Recorder) -> None:
+def test_the_structured_records_are_kept_at_debug(rig: Rig, log: TaskLog) -> None:
     """argv, every unit and the result record are still written, as JSON at DEBUG, and none of them at INFO."""
     rig.scenario(flags=NEW_FLAGS, apply={"summary": summary("orders", 30, 1, "orders_1")})
     rig.run(rig.operator(RivetApplyOperator, export="orders"))
-    debug = [json.loads(text) for level, text in log.lines if level == "DEBUG"]
+    debug = [json.loads(text) for text in log.debug()]
     events = [d["event"] for d in debug]
     assert {"rivet.start", "rivet.step", "rivet.unit", "rivet.result", "rivet.warning"} <= set(events)
     assert debug[events.index("rivet.start")]["argv"][0].endswith("rivet")
-    assert debug == rig.records
+    # one record per line, keys sorted: the line a reader greps is the same text for the same record
+    assert log.debug() == [json.dumps(d, sort_keys=True) for d in debug]
     assert not any(text.startswith("{") for level, text in log.lines if level != "DEBUG")
+
+
+def test_a_record_holding_a_value_json_cannot_write_still_reaches_the_log_as_text(rig: Rig, log: TaskLog) -> None:
+    """A record is written whatever it holds: a path, a timestamp or a set is its `str`, never a TypeError that loses
+    the line (and the task) on the way to the log."""
+    op = rig.operator(RivetRunOperator, export="orders")
+    op._emit({"event": "rivet.test", "path": Path("/state/x.log"), "b": 1})
+    assert log.lines == [("DEBUG", '{"b": 1, "event": "rivet.test", "path": "/state/x.log"}')]
 
 
 PG_STATE = {"RIVET_PG_URL": SECRET, "RIVET_STATE_URL": "postgresql://s@h/db"}
@@ -405,7 +389,7 @@ SUCCESS_PATHS = {
 
 
 @pytest.mark.parametrize("path", sorted(SUCCESS_PATHS))
-def test_no_line_of_a_successful_task_is_coloured_red(rig: Rig, log: Recorder, path: str, tmp_path: Path) -> None:
+def test_no_line_of_a_successful_task_is_coloured_red(rig: Rig, log: TaskLog, path: str, tmp_path: Path) -> None:
     """No INFO / WARNING line of a successful task holds a word of Airflow's default `color_log_error_keywords`, matched
     as Airflow's UI matches it (case-insensitive substring); on the base, `rivet.start` held `--json-errors`."""
     cls, kwargs, scenario = SUCCESS_PATHS[path]
@@ -423,7 +407,7 @@ def test_no_line_of_a_successful_task_is_coloured_red(rig: Rig, log: Recorder, p
     assert not red, red
 
 
-def test_no_line_of_a_retry_that_finds_its_apply_done_is_coloured_red(rig: Rig, log: Recorder) -> None:
+def test_no_line_of_a_retry_that_finds_its_apply_done_is_coloured_red(rig: Rig, log: TaskLog) -> None:
     rig.scenario(flags=NEW_FLAGS, apply={"summary": summary("orders", 30, 1, "x")})
     op = rig.operator(RivetApplyOperator, export="orders")
     rig.run(op, FakeTI(try_number=1))
@@ -432,7 +416,7 @@ def test_no_line_of_a_retry_that_finds_its_apply_done_is_coloured_red(rig: Rig, 
     assert not [line for line in log.shown() if any(word in line.lower() for word in words)]
 
 
-def test_a_failure_headline_is_coloured_red(rig: Rig, log: Recorder) -> None:
+def test_a_failure_headline_is_coloured_red(rig: Rig, log: TaskLog) -> None:
     """The other side of the oracle: a final failure's headline is an ERROR line (Airflow colours it whatever it says)."""
     rig.scenario(flags=NEW_FLAGS, run={"exit": 3, "line": {"error": "x", "exit_class": 3}})
     rig.run(rig.operator(RivetRunOperator, export="orders"))
@@ -449,7 +433,7 @@ def test_every_degradation_reads_as_words_without_a_red_keyword() -> None:
     assert not [t for t in texts if any(word in t.lower() for word in words)]
 
 
-def test_the_readable_lines_hold_no_secret_and_no_rivet_text(rig: Rig, log: Recorder) -> None:
+def test_the_readable_lines_hold_no_secret_and_no_rivet_text(rig: Rig, log: TaskLog) -> None:
     """rivet's stderr (which leaks the URL here) and its error message stay out of every line, DEBUG included."""
     line = {"error": "row 4111-1111 refused", "exit_class": 5, "code": "RIVET_X"}
     rig.scenario(run={"exit": 5, "line": line})

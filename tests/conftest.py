@@ -5,9 +5,12 @@ from __future__ import annotations
 import hashlib
 import importlib.util
 import json
+import logging
 import os
+import shutil
 import sys
 import tempfile
+from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
@@ -21,12 +24,19 @@ PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 RIVET_SRC = Path(os.environ.get("RIVET_SRC") or PACKAGE_ROOT.parent / "rivet").resolve()
 FIXTURES = RIVET_SRC / "tests" / "fixtures" / "scheduler"
 SECRET = "postgresql://rivet:s3cr3t-pw@db.internal:5432/app"
+# Flags no rivet release has yet, which the package probes `--help` for (capabilities.DEGRADATIONS). The fake binary
+# accepts them only in a scenario that declares them, as a switch (`--name`) or with a value (`--name <V>`).
 NEW_FLAGS = {
-    "*": ["--no-notify", "--lock-wait"],
-    "apply": ["--summary-output"],
-    "load": ["--export", "--table", "--summary-output"],
-    "compact": ["--export", "--table", "--summary-output"],
+    "*": ["--no-notify", "--lock-wait <SECONDS>"],
+    "apply": ["--summary-output <PATH>"],
+    "load": ["--export <EXPORT>", "--table <TABLE>", "--summary-output <PATH>"],
+    "compact": ["--export <EXPORT>", "--table <TABLE>", "--summary-output <PATH>"],
 }
+# What a process's environment holds whatever its parent passed: macOS CoreFoundation's variable, and the LC_CTYPE the
+# fake's own Python interpreter sets when it coerces a C locale (PEP 538). Real rivet would see neither from the package.
+PLATFORM_ENV = {"__CF_USER_TEXT_ENCODING", "LC_CTYPE"}
+# A probe of the binary (`--version`, `<sub> --help`) runs with these variables only (capabilities.Capabilities._run).
+PROBE_ENV = {"PATH", "HOME"}
 CONFIG = """\
 source:
   type: postgres
@@ -102,6 +112,7 @@ class Rig:
         script = self.bin / "rivet"
         script.write_text(f"#!{sys.executable}\n{body}")
         script.chmod(0o755)
+        shutil.copy(Path(__file__).parent / "rivet_cli_surface.json", self.bin / "rivet_cli_surface.json")
         self.state_dir = tmp / "state"
         self.state_dir.mkdir()
         self.config_dir = tmp / "cfg"
@@ -129,26 +140,50 @@ class Rig:
         log = self.bin / "calls.jsonl"
         return [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
 
+    def invocations(self, kind: str | None = None) -> list[dict]:
+        """Every start of the fake binary (`kind`: "probe", "call" or "refused"), each with its whole environment."""
+        log = self.bin / "invocations.jsonl"
+        rows = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+        if kind == "refused":
+            self.refusals_read = True
+        return [r for r in rows if kind in (None, r["kind"])]
+
+    def probes(self) -> list[dict]:
+        """The `--version` / `<sub> --help` probes the fake binary answered."""
+        return self.invocations("probe")
+
+    def assert_probes_minimal_env(self, allowed: set[str] = PROBE_ENV) -> None:
+        """Every probe saw no variable beyond `allowed`, with the values the worker has: a probe that inherits the
+        worker's environment hands its secrets (Fernet key, cloud keys, the Connection's URL) to a process that needs none."""
+        probes = self.probes()
+        assert probes, "no probe reached the binary"
+        for row in probes:
+            extra = set(row["env"]) - allowed - PLATFORM_ENV
+            assert not extra, f"{row['argv']} saw {sorted(extra)}"
+            for name in allowed & set(row["env"]):
+                assert row["env"][name] == os.environ.get(name, ""), f"{row['argv']}: {name} is not the worker's"
+
+    def unread_refusals(self) -> list[dict]:
+        """Command lines the fake refused as clap would (exit 2) that the test never looked at: a test that passes over
+        one is green by a refusal it did not mean (the rig fixtures fail such a test at teardown)."""
+        if getattr(self, "refusals_read", False):
+            return []
+        log = self.bin / "invocations.jsonl"
+        rows = [json.loads(line) for line in log.read_text().splitlines()] if log.exists() else []
+        return [r for r in rows if r["kind"] == "refused"]
+
     def argv(self, sub: str) -> list[str]:
         """The argv of the last call of one subcommand."""
         return [c["argv"] for c in self.calls() if c["argv"][0] == sub][-1]
 
     def operator(self, cls: Any, **kwargs: Any) -> Any:
-        """An operator wired to the fake binary, recording its structured log lines."""
+        """An operator wired to the fake binary. Its structured records are read back from the task log (`task_log`)."""
         kwargs.setdefault("task_id", "task")
         kwargs.setdefault("config", str(self.config))
         kwargs.setdefault("state_dir", str(self.state_dir))
         kwargs.setdefault("env", {"RIVET_PG_URL": SECRET})
         kwargs.setdefault("deployment", "local")
-        op = cls(rivet_bin=str(self.bin / "rivet"), retries=2, **kwargs)
-        original = op._emit
-
-        def record(entry: dict) -> None:
-            self.records.append(entry)
-            original(entry)
-
-        op._emit = record
-        return op
+        return cls(rivet_bin=str(self.bin / "rivet"), retries=2, **kwargs)
 
     def run(self, op: Any, ti: FakeTI | None = None) -> tuple[Any, FakeTI]:
         """Execute an operator; return (payload or raised exception, the task instance)."""
@@ -173,10 +208,65 @@ def own_temp_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     return path
 
 
+class TaskLog(logging.Handler):
+    """The task log as Airflow writes it: every line the operators' logger emits, formatted by `logging` the way a task
+    log handler formats it (`%(message)s` is `msg % args`), at DEBUG and above.
+
+    `lines` holds (level name, message) per line; `records` the structured records parsed back from their DEBUG JSON
+    lines, i.e. from the text that reached the log, not from the dict before `TaskLog.record` formatted it."""
+
+    def __init__(self) -> None:
+        super().__init__(logging.DEBUG)
+        self.setFormatter(logging.Formatter("%(levelname)s %(message)s"))
+        self.lines: list[tuple[str, str]] = []
+        self.records: list[dict] = []
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            self.format(record)
+        except Exception:  # a line `logging` cannot format never reaches the log: it is dropped, as a handler drops it
+            self.handleError(record)
+            return
+        self.lines.append((record.levelname, record.message))
+        if record.levelno == logging.DEBUG and record.message.startswith("{"):
+            self.records.append(json.loads(record.message))
+
+    def shown(self) -> list[str]:
+        """The lines a default Airflow task log shows (INFO and above), each as `LEVEL text`."""
+        return [f"{level} {text}" for level, text in self.lines if level != "DEBUG"]
+
+    def debug(self) -> list[str]:
+        """The exact text of every DEBUG line."""
+        return [text for level, text in self.lines if level == "DEBUG"]
+
+    def text(self) -> str:
+        """The whole log, one `LEVEL text` per line."""
+        return "\n".join(f"{level} {text}" for level, text in self.lines)
+
+
 @pytest.fixture
-def rig(tmp_path: Path) -> Rig:
-    """A fresh rig per test."""
-    return Rig(tmp_path)
+def task_log(monkeypatch: pytest.MonkeyPatch) -> TaskLog:
+    """Every operator of the test logs through one real `logging.Logger` (the name Airflow gives an operator's logger,
+    DEBUG, no propagation) into one `TaskLog`."""
+    from airflow_provider_rivet.operators import RivetBaseOperator
+
+    capture = TaskLog()
+    logger = logging.Logger("airflow.task.operators.airflow_provider_rivet.operators", logging.DEBUG)
+    logger.addHandler(capture)
+    monkeypatch.setattr(RivetBaseOperator, "log", property(lambda self: logger))
+    return capture
+
+
+@pytest.fixture
+def rig(tmp_path: Path, task_log: TaskLog) -> Iterator[Rig]:
+    """A fresh rig per test; a command line the fake refused and the test did not read fails it."""
+    rig = Rig(tmp_path)
+    rig.task_log, rig.records = task_log, task_log.records
+    yield rig
+    refused = rig.unread_refusals()
+    assert not refused, (
+        f"rivet refused a command line (exit 2) the test did not expect: {refused[0]['argv']}: {refused[0]['refusal']}"
+    )
 
 
 @pytest.fixture(scope="session")
@@ -253,6 +343,11 @@ class DagRig(Rig):
 
 
 @pytest.fixture
-def dag_rig(tmp_path: Path, airflow_db: str) -> DagRig:
-    """A fresh rig per test over the session's metadata database."""
-    return DagRig(tmp_path, airflow_db)
+def dag_rig(tmp_path: Path, airflow_db: str) -> Iterator[DagRig]:
+    """A fresh rig per test over the session's metadata database; unread refusals fail it, as for `rig`."""
+    rig = DagRig(tmp_path, airflow_db)
+    yield rig
+    refused = rig.unread_refusals()
+    assert not refused, (
+        f"rivet refused a command line (exit 2) the test did not expect: {refused[0]['argv']}: {refused[0]['refusal']}"
+    )
