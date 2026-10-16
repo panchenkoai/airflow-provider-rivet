@@ -287,3 +287,24 @@ def test_d11_the_slack_alert_of_a_mapped_rivet_task_names_the_code_of_its_own_in
     assert "*a*: `RIVET_CONFIG_CURSOR_COLUMN_CASE`" in "".join(texts) and "*b*: `RIVET_SOURCE_CDC_LOG_GAP`" in "".join(texts), (
         texts
     )
+
+
+def test_d24_a_refused_cdc_drain_blocks_load_and_compact_under_a_default_args_trigger_rule(cdc: DagRig) -> None:
+    """D24: with `trigger_rule="all_done"` in default_args, load and compact ran after a refused drain."""
+    cdc.scenario(run=REFUSED)
+    args = {"retries": 0, "trigger_rule": "all_done"}
+    state, tasks = cdc.run_dag("build_cdc_dag", "cdc_all_done", export="orders_cdc", tables=["orders"], default_args=args)
+    assert [c[0] for c in cdc.ran()] == ["run"], "no load and no compaction follows a refused drain"
+    assert (tasks["run"], tasks["load.orders"], tasks["compact.orders"], state) == (FAILED, BLOCKED, BLOCKED, FAILED), tasks
+
+
+DAY_NAMES = ("daily orders", "orders:v2")
+
+
+def test_d29_exports_whose_names_are_no_task_ids_run_and_load_under_their_real_names(dag_rig: DagRig) -> None:
+    """D29: `daily orders` and `orders:v2` broke the DAG import; now they get sanitised task ids and rivet sees the names."""
+    exports = "".join(f"  - {{name: {json.dumps(n)}, query: SELECT 1, mode: full}}\n" for n in DAY_NAMES)
+    dag_rig.config.write_text(f"source:\n  type: postgres\n  url_env: RIVET_PG_URL\nexports:\n{exports}")
+    state, tasks = dag_rig.run_dag("build_batch_dag", "odd_names", exports=list(DAY_NAMES), extract="run")
+    assert state == OK and tasks.pop("watcher") == SKIPPED and set(tasks.values()) == {OK} and len(tasks) == 4, tasks
+    assert sorted(dag_rig.ran()) == sorted((step, n) for n in DAY_NAMES for step in ("run", "load")), dag_rig.ran()
