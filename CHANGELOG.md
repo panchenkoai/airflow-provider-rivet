@@ -28,6 +28,19 @@ First release, against rivet 0.31.0 and the contract of ADR-0039; Python 3.12+, 
 
 Changed before the first release, after review (see the README sections named):
 
+- A retry after the task process died past a successful `rivet apply` no longer applies the plan
+  again: a `mode: full` export was extracted twice and an incremental one was refused
+  `RIVET_PLAN_ARTIFACT_STALE` (a failed task, its load skipped). The task records the apply it
+  starts beside the sealed plan and, on a retry, takes the run rivet's state shows for that
+  process as its result (`rivet.apply.already_applied`). ("Retries")
+- Two tries of one export no longer run rivet at once: every task but `plan` holds a per-export
+  (per-table for a load with `--table`) lock file whose descriptor rivet inherits, so a rivet that
+  outlives its task keeps it; a task that finds it held for `lock_wait` seconds starts no rivet and
+  is retried (`RIVET_AIRFLOW_EXPORT_BUSY`). The degraded per-table load lock was freed when the task
+  process died while its rivet ran on. On Linux rivet gets SIGTERM when its task process dies.
+  ("Overlap")
+- rivet's busy refusals `RIVET_STATE_RUN_IN_PROGRESS` and `RIVET_LOAD_TABLE_BUSY` (exit 5, "wait,
+  then repeat") are retried instead of failing the task. ("Retries")
 - **A DAG run with a failed task is a failed run.** Both builders end in a `watcher` task
   (`one_failed`). A failed `plan` blocks every extract; a failed CDC `run` blocks every load and
   compaction (`load.T` was `all_done`); extract tasks are `all_success` and ordering goes through
