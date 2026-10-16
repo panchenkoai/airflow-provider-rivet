@@ -33,6 +33,7 @@ jobs:
           sparse-checkout: |
             tests/fixtures/scheduler
             src/config
+            src/cli
       - name: Pin rivet to RIVET_CONTRACT_REF
         run: git -C rivet fetch --depth 1 origin "$(cat RIVET_CONTRACT_REF)" && git -C rivet checkout --quiet FETCH_HEAD
       - name: Tests on the locked environment
