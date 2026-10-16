@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
+import re
 from collections.abc import Mapping, Sequence
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -23,7 +25,43 @@ from .operators import (
 
 ORDER_ONLY = "all_done"
 WATCHER_ID = "watcher"
+GATE = "all_success"
 DEFAULT_ARGS = {"retries": 2, "retry_delay": timedelta(minutes=5)}
+NOT_IN_TASK_ID = re.compile(r"[^A-Za-z0-9_.-]")  # ASCII only: Airflow 3 cannot run a non-ASCII task id
+
+
+def task_name(name: str) -> str:
+    """The task id part for an export or table name: itself when it is ASCII `[A-Za-z0-9_.-]`, else sanitised plus a hash (D29).
+
+    The hash is of the real name, so `daily orders` and `daily_orders` never share an id; the real name stays in `export=`.
+    """
+    safe = NOT_IN_TASK_ID.sub("_", name)
+    if safe == name and name:
+        return name
+    return f"{safe}_{hashlib.sha256(name.encode()).hexdigest()[:8]}"
+
+
+def _names(field: str, value: Any) -> list[str]:
+    """A list of export or table names; a bare string would be split into one task per character (D28)."""
+    if isinstance(value, str | bytes):
+        raise ValueError(f"`{field}` is a list of names, not a string: write {field}=[{value!r}]")
+    return list(value)
+
+
+def _common(config: str, state_dir: str | None, operator_kwargs: Mapping[str, Any] | None) -> dict[str, Any]:
+    """The arguments every rivet task gets; its trigger rule is the builder's gate, whatever default_args says (D24)."""
+    if operator_kwargs and "trigger_rule" in operator_kwargs:
+        raise ValueError(
+            "operator_kwargs may not set `trigger_rule`: every rivet task runs only after its upstream succeeded "
+            "(load after its extract, compact after its load); the watcher fails the run on any failure"
+        )
+    return {
+        "config": config,
+        "state_dir": state_dir,
+        "max_active_tis_per_dag": 1,
+        **(operator_kwargs or {}),
+        "trigger_rule": GATE,
+    }
 
 
 def read_plan_layout(plan_file: str) -> list[dict[str, Any]]:
@@ -51,9 +89,9 @@ def _dag(dag_id: str, tags: Sequence[str], dag_kwargs: Mapping[str, Any]) -> DAG
         "catchup": False,
         "max_active_runs": 1,
         "tags": list(tags),
-        "default_args": dict(DEFAULT_ARGS),
     }
     settings.update(dag_kwargs)
+    settings["default_args"] = {**DEFAULT_ARGS, **(dag_kwargs.get("default_args") or {})}  # D25: merged, not replaced
     return DAG(dag_id=dag_id, **settings)
 
 
@@ -72,6 +110,8 @@ def build_batch_dag(
     **dag_kwargs: Any,
 ) -> DAG:
     """plan -> apply / load / compact groups, chained per export: apply.X >> load.X >> compact.X."""
+    exports = None if exports is None else _names("exports", exports)
+    compact_exports = _names("compact_exports", compact_exports)
     if (plan_file is None) == (exports is None):
         raise ValueError("give exactly one of `plan_file` (waves from rivet plan) or `exports` (one wave)")
     if exports is not None and not exports:
@@ -85,7 +125,7 @@ def build_batch_dag(
         raise ValueError(f"compact_exports names exports the plan does not have: {unknown}")
     if compact_exports and not load:
         raise ValueError("compact_exports needs load=True: a compaction merges what the load buffered")
-    common = {"config": config, "state_dir": state_dir, "max_active_tis_per_dag": 1, **(operator_kwargs or {})}
+    common = _common(config, state_dir, operator_kwargs)
     extract_cls = RivetApplyOperator if extract == "apply" else RivetRunOperator
 
     with _dag(dag_id, ("rivet", "batch"), dag_kwargs) as dag:
@@ -94,16 +134,19 @@ def build_batch_dag(
         with TaskGroup(group_id="apply"):
             wave_done: Any | None = None
             for index, wave in enumerate(waves):
-                heavy_done: Any | None = None
-                for name in wave["exports"]:
-                    task = extract_cls(task_id=name, export=name, **common)
+                # D26: rivet's `cost_gate_batches` order: each heavy export alone, one after another, then the cheap batch
+                heavy = [n for n in wave["exports"] if n in wave["heavy"]]
+                cheap = [n for n in wave["exports"] if n not in wave["heavy"]]
+                order_done: Any | None = None
+                for position, name in enumerate(heavy + cheap):
+                    task = extract_cls(task_id=task_name(name), export=name, **common)
                     apply_tasks[name] = task
-                    for gate in (plan, wave_done, heavy_done if name in wave["heavy"] else None):
+                    for gate in (plan, wave_done, order_done):
                         if gate is not None:
                             gate >> task
-                    if name in wave["heavy"] and name != wave["heavy"][-1]:
-                        heavy_done = RivetWaveBarrier(task_id=f"after_{name}", trigger_rule=ORDER_ONLY)
-                        task >> heavy_done
+                    if name in heavy and position < len(heavy + cheap) - 1:
+                        order_done = RivetWaveBarrier(task_id=f"after_{task_name(name)}", trigger_rule=ORDER_ONLY)
+                        task >> order_done
                 if index < len(waves) - 1:
                     wave_done = RivetWaveBarrier(task_id=f"wave_{wave['wave']}_done", trigger_rule=ORDER_ONLY)
                     for name in wave["exports"]:
@@ -112,13 +155,13 @@ def build_batch_dag(
         if load:
             with TaskGroup(group_id="load"):
                 for name in names:
-                    load_tasks[name] = RivetLoadOperator(task_id=name, export=name, **common)
+                    load_tasks[name] = RivetLoadOperator(task_id=task_name(name), export=name, **common)
                     apply_tasks[name] >> load_tasks[name]
         if compact_exports:
             with TaskGroup(group_id="compact"):
                 for name in names:
                     if name in compact_exports:
-                        load_tasks[name] >> RivetCompactOperator(task_id=name, export=name, **common)
+                        load_tasks[name] >> RivetCompactOperator(task_id=task_name(name), export=name, **common)
         _watch(dag)
     return dag
 
@@ -136,20 +179,21 @@ def build_cdc_dag(
     **dag_kwargs: Any,
 ) -> DAG:
     """One `run` task for the stream, then load.T >> compact.T per captured table."""
+    tables = _names("tables", tables)
     if not tables and load:
         raise ValueError("`tables` lists the captured tables the load and compact tasks are built for")
-    common = {"config": config, "state_dir": state_dir, "max_active_tis_per_dag": 1, **(operator_kwargs or {})}
+    common = _common(config, state_dir, operator_kwargs)
     with _dag(dag_id, ("rivet", "cdc"), dag_kwargs) as dag:
         run = RivetCdcRunOperator(task_id="run", export=export, **common)
         if load:
             loads = {}
             with TaskGroup(group_id="load"):
                 for table in tables:
-                    loads[table] = RivetLoadOperator(task_id=table, export=export, table=table, **common)
+                    loads[table] = RivetLoadOperator(task_id=task_name(table), export=export, table=table, **common)
                     run >> loads[table]
             if compact:
                 with TaskGroup(group_id="compact"):
                     for table in tables:
-                        loads[table] >> RivetCompactOperator(task_id=table, export=export, table=table, **common)
+                        loads[table] >> RivetCompactOperator(task_id=task_name(table), export=export, table=table, **common)
         _watch(dag)
     return dag

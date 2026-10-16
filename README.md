@@ -54,7 +54,7 @@ so the "rivet >=" column is the first release that carries that section.
 | `error_object` | `class`, `retryable`, `kind`, `action` on the `--json-errors` line | derives `class` and `retryable` from the printed line's integer `exit_class`; `kind` and `action` are null | D1/D2, rivet >= unreleased |
 | `per_unit_error` | `failures[]` and `per_export[].error` | when several units of one process failed, each carries the process-level object | D2/D3, rivet >= unreleased |
 | `stop_reason` | CDC `stop_reason` and `tables[]` | `stop_reason` is null: a `max_events` stop cannot be told from `caught_up` | D4, rivet >= unreleased |
-| `apply_summary` | `--summary-output` on `rivet apply` | reads run id and counts from `rivet metrics --json` after a successful apply | D3, rivet >= unreleased |
+| `apply_summary` | `--summary-output` on `rivet apply` | reads run id, counts, status and `skip_reason` (a `skip_empty` export that delivered nothing is `skipped`) from `rivet metrics --json` after a successful apply | D3, rivet >= unreleased |
 | `load_filter` | `--export` on `rivet load` / `rivet compact` | writes a single-export copy of the config and loads that: the other `- name:` items are cut out of the original text, so what stays (quoted `${VAR}`, comments, anchors) is byte-exact; a stream keeps the batch exports its `cdc.backfill` reads; a text that cannot be cut safely (an anchor a kept item reads, an item sharing a line) is refused before rivet starts (`RIVET_AIRFLOW_CONFIG_NARROW_UNSAFE`) | D3, rivet >= unreleased |
 | `load_table_filter` | `--table` on `rivet load` / `rivet compact` | the per-table task handles every table of its export; tasks of one export are serialised by a file lock in the state directory | D3, rivet >= unreleased |
 | `load_result` | `--summary-output` on `rivet load` / `rivet compact` | status is `loaded` / `compacted` on exit 0 and `failed` otherwise; `skipped`, `table` and row counts are unknown (null) | D3, rivet >= unreleased |
@@ -83,22 +83,24 @@ The list lives in one place in the code, `airflow_provider_rivet/capabilities.py
 
 ## Operators
 
-All of them take `config`, `export`, `state_dir`, `rivet_bin`, `env`, `env_from_connections`,
-`env_passthrough`, `cloud_credentials`, `deployment` (`auto` / `local` / `pod`), `extra_args`,
-`lock_wait` (default 600), `crashed_retries` (default 1), `stderr_dir`, `stream_stderr`, `log_keep`
-(default 10) and `cwd`. Templated: `config`, `export`, `table`, `state_dir`, `plan_file`,
+All of them take `config`, `export`, `table` (one table of the export, for `load` and `compact`),
+`state_dir`, `plan_file` (the layout file `RivetPlanOperator` rewrites), `rivet_bin`, `env`,
+`env_from_connections`, `env_passthrough`, `cloud_credentials`, `connections` (storage and
+warehouse Connections, see "Storage and warehouse connections"), `deployment` (`auto` / `local` /
+`pod`), `extra_args`, `lock_wait` (default 600), `crashed_retries` (default 1), `stderr_dir`,
+`stream_stderr`, `log_keep` (default 10) and `cwd`. Templated: `config`, `export`, `table`, `state_dir`, `plan_file`,
 `extra_args`, `stderr_dir`, `cwd`. **`env` and `env_from_connections` are not templated**, so their
 values are never stored as rendered fields. No operator builds argv: one module, `invocation.py`,
 builds it, runs the process, reads the outputs and classifies.
 
 | Operator | Runs | Notes |
 |---|---|---|
-| `RivetApplyOperator` | `rivet plan -e X --format json -o <artifact>` then `rivet apply <artifact>` | a retry replays the same sealed artifact while it is unexpired |
+| `RivetApplyOperator` | `rivet plan -e X --format json -o <artifact>` then `rivet apply <artifact>` | a retry replays the same sealed artifact while it is unexpired; a clear plans again |
 | `RivetRunOperator` | `rivet run [-e X] --summary-output <file>` | the fallback when sealed apply is not wanted; also runs a whole config |
 | `RivetCdcRunOperator` | `rivet run -e X --summary-output <file>` for a `mode: cdc` export | one bounded drain; succeeds on `max_events`, reports it, never loops |
 | `RivetLoadOperator` | `rivet load` | per export, per table where the binary can narrow |
-| `RivetCompactOperator` | `rivet compact` | a compaction rivet reports as `skipped` becomes an Airflow skip |
-| `RivetPlanOperator` | `rivet plan --format json` | rewrites the plan layout file atomically, only when the output is a layout `build_batch_dag` can read (waves with exports); the file keeps its mode |
+| `RivetCompactOperator` | `rivet compact` | with `load_result` degraded (rivet 0.31.0 and main) exit 0 is `compacted`, also when rivet merged nothing; a binary with compact's `--summary-output` reports `skipped`, which becomes an Airflow skip |
+| `RivetPlanOperator` | `rivet plan --format json` | rewrites the plan layout file atomically, only when the output is a layout `build_batch_dag` can read (waves with exports; one planned export, which rivet prints as a bare object with no campaign, is one wave from its `export_recommendation`); the file keeps its mode |
 
 ```python
 from airflow_provider_rivet.operators import RivetApplyOperator
@@ -155,10 +157,18 @@ plan ──> apply: [a] [b] ─> wave_2_done ─> [big] ─> after_big ─> [hug
 - Three TaskGroups, `apply`, `load`, `compact`. They are the picture; **dependencies run per
   table**: `apply.X >> load.X >> compact.X`, all `all_success`. A failed `apply.a` leaves
   `apply.b`, `load.b` and every later wave runnable; it blocks `load.a` and `compact.a`.
-- Waves come from the plan file, as in the recipe: cheap exports of a wave run in parallel,
-  the others one at a time, and wave N+1 starts after wave N. Ordering goes through tasks that
+- Waves come from the plan file, as in the recipe, and each wave is ordered the way `rivet apply`'s
+  cost gate orders it: every heavy export alone, one after another, then the cheap exports of the
+  wave together; wave N+1 starts after wave N. Ordering goes through tasks that
   do nothing, `apply.wave_<n>_done` and `apply.after_<export>`, with `trigger_rule="all_done"`:
   the next export waits for the earlier one to *finish*, not to succeed.
+- Every rivet task is `trigger_rule="all_success"` whatever `default_args` says; a `trigger_rule`
+  in `operator_kwargs` is refused. `default_args` you pass are merged over the builders'
+  (`retries=2`, `retry_delay` 5 minutes), so adding a callback keeps the retries.
+- `exports`, `compact_exports` and `tables` are lists; a bare string is refused. A name that is
+  not an ASCII task id (`daily orders`, `orders:v2`, `заказы`) gets a task id with each character
+  outside `[A-Za-z0-9_.-]` replaced by `_` and an 8-character hash of the name (`apply.daily_orders_<hash>`); rivet still
+  receives the real name.
 - `plan` is a direct upstream of every `apply` task: a failed plan refresh blocks the whole
   run (`upstream_failed`), because a run that could not plan has nothing it should extract.
 - **A run with a failed task is a failed run.** Airflow colours a run by its leaf tasks, and an
@@ -175,6 +185,8 @@ plan ──> apply: [a] [b] ─> wave_2_done ─> [big] ─> after_big ─> [hug
 | `compact.X` | | run | failed |
 | nothing | | | success (`watcher` skipped) |
 - `plan_file` is read at parse time (no database access); without one, pass `exports=[...]`.
+- With `plan_file`, a `plan` task rewrites that file from `rivet plan` at the start of every run;
+  `refresh_plan=False` drops the task and keeps the file as it is.
 - `extract="run"` uses `rivet run -e X` instead of plan + apply.
 - **Compact tasks are created only for the exports named in `compact_exports`.** Whether a table
   compacts depends on the load mode, `load.layout` and the warehouse, which only rivet resolves
@@ -208,6 +220,10 @@ dag = build_cdc_dag(
 - The same `watcher` task ends the DAG: a failed `run`, `load.T` or `compact.T` fails the run.
 - On `stop_reason: max_events` the run task succeeds, puts it in XCom and logs
   `rivet.cdc.max_events`. It does not loop.
+- `load=False` drops the load and compact tasks (the stream's files are the product);
+  `compact=False` keeps `load.T` and drops `compact.T`. Use `compact=False` on Snowflake and
+  ClickHouse, where there is nothing to compact (see "Storage and warehouse connections").
+- `operator_kwargs` go to every task, as in the batch builder.
 
 ## Retries
 
@@ -299,7 +315,7 @@ SQLite state in `state_dir`.
      `.rivet_airflow_query_files.json`, which records the config directory each one came from.
    - a relative `cdc.checkpoint`, which resolves beside the copied config, that is, here.
    - `airflow/<dag_id>/`: sealed plan artifacts
-     (`plans/<run_id>/<export>__<task_id>__<inputs>-<hash>.json`), the crashed ledger, scratch
+     (`plans/<run_id>/<export>__<task_id>__s<max_tries>__<inputs>-<hash>.json`), the crashed ledger, scratch
      files; `airflow/locks/<export>.lock`.
    - `logs/<dag_id>/<task_id>-<hash>/`: rivet's stdout and stderr, one file per step and try.
    - **How a name becomes a path.** A DAG id, task id, run id or export name that is one lower-case
@@ -312,11 +328,14 @@ SQLite state in `state_dir`.
      therefore never share a directory, a sealed plan, a log file or a ledger, also on a file
      system that ignores case. A task's log folder always carries the hash, also for a plain
      task id, so it is never a folder an older layout wrote to.
-   - **One sealed plan per task, config and export.** The artifact's name is made from the
-     export, the task id (with the map index) and `<inputs>`: a digest of the config's absolute
+   - **One sealed plan per task, try series, config and export.** The artifact's name is made from the
+     export, the task id (with the map index), the try series (`s<max_tries>`; Airflow moves
+     `max_tries` when a task is cleared) and `<inputs>`: a digest of the config's absolute
      path, the config's bytes and the export's `query_file`. Two tasks of one DAG run never
      share a plan, also when they run two configs that both have an export of one name; a
-     retry of the same task replays its own plan; a config or query file edited between two
+     retry of the same task replays its own plan; a clear starts a new series and plans again,
+     so a clear after a successful apply never replays a cursor snapshot that apply already
+     moved past (rivet would refuse it `RIVET_PLAN_ARTIFACT_STALE`); a config or query file edited between two
      tries is planned again under a new name.
    - A retry replays its own plan only while the resolved config path and the config's bytes
      are unchanged. A config reached through a symlink that is re-pointed between two tries
@@ -329,7 +348,8 @@ SQLite state in `state_dir`.
    - The artifact records the export and the config it was planned from (`export_name`,
      `config_path`). `apply` refuses a plan object in which either is missing or is not the
      task's own (`RIVET_AIRFLOW_PLAN_ARTIFACT_FOREIGN`), expired or not, and leaves the file as
-     it is, so the retry is refused for the same reason until a person deletes it. The config
+     it is, so the retry is refused for the same reason until a person deletes it (or, once it has
+     expired and is 24 h old, the pruning below removes it). The config
      is compared as a file, not as text: another case, Unicode form or symlink of the same
      file is the task's own, and a recorded path that no longer exists is not. A file at
      that path that is not a JSON object (empty, cut short) is planned over.
@@ -439,8 +459,11 @@ SQLite state in `state_dir`.
 - **Retention.** When a task ends, the files of its newest `log_keep` tries (default 10, counted
   per task across runs) are kept and the older ones are removed. `log_keep=None` keeps
   everything. Only the task's own folder is looked at; a file of an older layout is never
-  removed (see "Upgrading a state directory"). Sealed plan artifacts and crashed ledgers under `airflow/<dag_id>/` are small and
-  are not pruned.
+  removed (see "Upgrading a state directory"). Under `airflow/<dag_id>/`, a sealed plan artifact
+  that has expired and was last written over 24 h ago is removed (with the `plans/<run_id>/`
+  folder it leaves empty), and so is a crashed ledger untouched for 24 h (a crash of that series
+  more than 24 h after its last one starts a fresh budget). A ledger that is not the ledger's JSON
+  is left for a person to delete.
 - `stream_stderr=True` copies stderr into the task log when each step ends. It is the one way
   raw stderr reaches the task log, and it is for debugging: it puts possibly data-bearing text
   into a store with wider access than the worker.
@@ -466,7 +489,11 @@ The config keeps what is not a secret (bucket, project, dataset, database, schem
 Connection holds who may write there. The Snowflake loader runs the `snow` CLI, which must be on
 the worker (`pip install snowflake-cli` into its own environment). On BigQuery `rivet compact`
 merges the buffer into the base table; on Snowflake and ClickHouse the current state is a view
-over `<table>__changes`, and the compact task is skipped with the reason rivet gives.
+over `<table>__changes` and there is nothing to merge. rivet 0.31.0 (and main) says so only in a
+stderr line (`compact [<table>]: skipped — this warehouse keeps a change log behind a view and
+never compacts`) and exits 0; `rivet compact` has no `--summary-output` yet (`load_result`), so the
+task ends green as `compacted`, having done nothing. For these warehouses build the CDC DAG with
+`compact=False` and leave such exports out of `compact_exports`.
 
 ## Slack
 
@@ -510,7 +537,12 @@ started outside Airflow** (cron, a shell), nor against a second DAG over the sam
 - On rivet 0.31.0 the `rows` / `files` of a CDC `run` task leave out its `initial: snapshot`: the first
   run of a CDC DAG reports 0 rows while the snapshot files hold the whole table (the binary's
   `--summary-output` counts the stream only; found by the live gate).
-- `load` and `compact` against a warehouse were exercised only through the fake binary.
+- This package's tests run `load` and `compact` only through the fake binary, which replays
+  rivet's output and talks to no warehouse. A live run against BigQuery, Snowflake and ClickHouse
+  exists only as the warehouse leg of the gate (branch `gate/airflow-live-warehouses`), and that
+  leg does not yet read the warehouse back to grade the values.
+- On Snowflake and ClickHouse a compact task is green as `compacted` while rivet merged nothing
+  (see "Storage and warehouse connections").
 - Narrowing a load to one export today means rewriting the config through a YAML reader and
   writer: comments are dropped and YAML anchors are expanded in the copy.
 - With `load_table_filter` degraded, the per-table tasks of a multi-table CDC export each load

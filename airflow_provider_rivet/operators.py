@@ -209,6 +209,7 @@ class RivetBaseOperator(BaseOperator):
             stream_stderr=self.stream_stderr,
             log_keep=self.log_keep,
             label=(ti.dag_id, run_id, task_part, ti.try_number),
+            series=ti.max_tries,
             upstream_markers=self._upstream_markers(ti),
         )
         try:
