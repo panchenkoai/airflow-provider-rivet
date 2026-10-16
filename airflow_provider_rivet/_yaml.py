@@ -210,7 +210,7 @@ def _content_end(node: yaml.Node, low: int, high: int) -> int:
 
 def _block_cuts(text: str, seq: yaml.SequenceNode, drop: set[int]) -> list[tuple[int, int, str]]:
     """Whole lines from each dropped item's `-` to the end of its last content line."""
-    tokens = list(yaml.scan(_same_length_mask(text), Loader=ConfigLoader))
+    tokens = list(yaml.scan(_same_length_mask(text)))  # the scanner is SafeLoader's whatever the loader
     dashes = sorted(t.start_mark.index for t in tokens if isinstance(t, yaml.BlockEntryToken))
     # An alias composes to its anchor's node, whose marks are where the anchor is written (often above `exports:`), so
     # the node walk of `_content_end` cannot see `*name` as text of the item that writes it: read it from the tokens.
@@ -227,7 +227,9 @@ def _block_cuts(text: str, seq: yaml.SequenceNode, drop: set[int]) -> list[tuple
         line = text.rfind("\n", 0, dash) + 1
         if text[line:dash].strip():
             raise NarrowRefused(f"export #{i + 1} does not start its own line")
-        end = max([_content_end(items[i], start, high), *(e for s, e in aliases if start <= s < high)])
+        # no alias token starts at the item's own start (an alias item is refused above) or at the next `-`: the
+        # bounds' `<` / `<=` are equivalent, so they are not mutated
+        end = max([_content_end(items[i], start, high), *(e for s, e in aliases if start <= s < high)])  # pragma: no mutate
         if text[end - 1] == "\n":
             stop = end
         else:
