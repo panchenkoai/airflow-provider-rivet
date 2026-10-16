@@ -186,14 +186,25 @@ class _Step:
     broken: bool = False
 
 
+class Stopped(Exception):
+    """Airflow asked the task to stop while no rivet process was running: the next step is not started (D40)."""
+
+    def __init__(self, step: str) -> None:
+        super().__init__(f"the task was stopped before rivet {step} started; rivet {step} was not run")
+        self.step = step
+
+
 class _Session:
     """One task's invocation: its preflight result, working files and collected degradations."""
 
-    def __init__(self, request: Request, pf: Preflight, emit: Emit, on_process: Callable | None) -> None:
+    def __init__(
+        self, request: Request, pf: Preflight, emit: Emit, on_process: Callable | None, stopped: Callable[[], bool] | None = None
+    ) -> None:
         self.req = request
         self.pf = pf
         self.emit = emit
         self.on_process = on_process
+        self.stopped = stopped
         self.degraded: set[str] = set()
         self.argvs: list[list[str]] = []
         self.stderr_path: str | None = None
@@ -271,7 +282,12 @@ class _Session:
         return flags
 
     def step(self, name: str, argv: list[str], stdout_to: Path | None = None) -> _Step:
-        """Run one rivet process with stdout and stderr sent to private files, and read its error line."""
+        """Run one rivet process with stdout and stderr sent to private files, and read its error line.
+
+        A stop Airflow requested before this step raises `Stopped` instead of starting rivet: on Airflow 3 the SIGTERM
+        handler returns, so a stop that met no running process is seen only here (D40)."""
+        if self.stopped is not None and self.stopped():
+            raise Stopped(name)
         self.argvs.append(argv)
         stderr_path = self.logs / f"{self.log_name}.{name}.stderr.log"
         stdout_path = stdout_to or self.logs / f"{self.log_name}.{name}.stdout.log"
@@ -910,17 +926,21 @@ def _load(s: _Session) -> Outcome:
 _DISPATCH = {"run": _run, "cdc_run": _run, "apply": _apply, "plan": _plan, "load": _load, "compact": _load}
 
 
-def invoke(request: Request, emit: Emit, on_process: Callable | None = None) -> Outcome:
-    """Preflight, run and classify one rivet task; a probe of the binary that fails at any point is a refusal."""
+def invoke(
+    request: Request, emit: Emit, on_process: Callable | None = None, stopped: Callable[[], bool] | None = None
+) -> Outcome:
+    """Preflight, run and classify one rivet task; a probe of the binary that fails at any point is a refusal.
+
+    `stopped` answers whether Airflow asked the task to stop; once it does, no further rivet step starts (D40)."""
     if request.command not in _DISPATCH:
         raise ValueError(f"unknown rivet command {request.command!r}")
     try:
-        return _invoke(request, emit, on_process)
+        return _invoke(request, emit, on_process, stopped)
     except ProbeFailed as exc:
         raise binary_unanswering(exc) from exc
 
 
-def _invoke(request: Request, emit: Emit, on_process: Callable | None) -> Outcome:
+def _invoke(request: Request, emit: Emit, on_process: Callable | None, stopped: Callable[[], bool] | None) -> Outcome:
     """`invoke` with the probes' failures still raw: the binary's `<sub> --help` is read lazily while argv is built."""
     pf = run_preflight(
         rivet_bin=request.rivet_bin,
@@ -935,7 +955,7 @@ def _invoke(request: Request, emit: Emit, on_process: Callable | None) -> Outcom
     )
     for key, text in pf.warnings:
         emit({"event": "rivet.warning", "warning": key, "text": text})
-    session = _Session(request, pf, emit, on_process)
+    session = _Session(request, pf, emit, on_process, stopped)
     try:
         return _DISPATCH[request.command](session)
     finally:

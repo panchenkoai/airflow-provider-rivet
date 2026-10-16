@@ -24,6 +24,7 @@ from .invocation import (
     CLOUD_ENV,
     Outcome,
     Request,
+    Stopped,
     crashed_retry_allowed,
     invoke,
     path_name,
@@ -112,6 +113,7 @@ class RivetBaseOperator(BaseOperator):
         self.log_keep = log_keep
         self.cwd = cwd
         self._proc: Any = None
+        self._stop_requested = False
 
     def _environment(self, secrets: Path) -> dict[str, str]:
         """The subprocess environment (`connections.build_environment`), with every Connection looked up here; key
@@ -145,12 +147,17 @@ class RivetBaseOperator(BaseOperator):
             self.log.info("%s", line)
 
     def _hold(self, proc: Any) -> None:
-        """Remember the running process so `on_kill` can stop it."""
+        """Remember the running process so `on_kill` can stop it; one started after a stop is stopped at once (D40)."""
         self._proc = proc
+        if self._stop_requested:
+            proc.request_stop()
 
     def on_kill(self) -> None:
         """Ask rivet to stop when Airflow kills the task: a signal only, since this runs inside the SIGTERM handler;
-        the step that started the process reaps it and kills it after the grace (D02)."""
+        the step that started the process reaps it and kills it after the grace (D02). The stop is recorded first, so a
+        stop that meets no running process (between two steps, before the first) still keeps the next one from
+        starting: Airflow 3's handler returns instead of raising (D40)."""
+        self._stop_requested = True
         if self._proc is not None:
             self._proc.request_stop()
 
@@ -213,9 +220,13 @@ class RivetBaseOperator(BaseOperator):
             upstream_markers=self._upstream_markers(ti),
         )
         try:
-            outcome = invoke(request, self._emit, self._hold)
+            outcome = invoke(request, self._emit, self._hold, lambda: self._stop_requested)
         except PreflightRefusal as refusal:
             self._refuse(ti, refusal)
+        except Stopped as stop:
+            self._emit({"event": "rivet.stopped", "step": stop.step, "text": str(stop)})
+            payload = {"command": self.command, "decision": "retry", "stopped_before": stop.step, "units": []}
+            self._fail(ti, payload, str(stop), retry=True)
         finally:
             self._proc = None
         return self._settle(ti, run_id, task_part, outcome)
