@@ -74,6 +74,25 @@ def unit_of(sub, argv, doc):
     return export or "", value_of(argv, "--table") or ""
 
 
+def cursors(spec, update=None):
+    """The fake state store's cursor per export (`cursors.json` beside the fake, seeded from the scenario's `cursors`)."""
+    path = HERE / "cursors.json"
+    held = json.loads(path.read_text()) if path.exists() else dict(spec.get("cursors", {}))
+    if update is not None or not path.exists():
+        held.update(update or {})
+        path.write_text(json.dumps(held))
+    return held
+
+
+def stale_artifact(spec, argv, export):
+    """rivet main's PA4 check (src/pipeline/apply_cmd.rs): a sealed snapshot the state's cursor has moved past."""
+    try:
+        snapshot = json.loads(Path(argv[1]).read_text()).get("computed", {}).get("cursor_snapshot")
+    except (OSError, ValueError, AttributeError, IndexError):
+        return False
+    return snapshot is not None and "--force" not in argv and snapshot != cursors(spec).get(export)
+
+
 def canonical(path):
     """A path as rivet's `canonicalize()` records it: symlinks resolved, each component as its directory lists it."""
     out = os.sep
@@ -121,12 +140,18 @@ def main():
         expires = (datetime.now(UTC) + timedelta(hours=spec.get("plan_expires_hours", 24))).isoformat()
         if out:
             source = canonical(value_of(argv, "--config"))
-            Path(out).write_text(
-                json.dumps({"export_name": value_of(argv, "--export"), "expires_at": expires, "config_path": source})
-            )
+            snapshot = cursors(spec).get(value_of(argv, "--export"))
+            doc = {"export_name": value_of(argv, "--export"), "expires_at": expires, "config_path": source}
+            Path(out).write_text(json.dumps({**doc, "computed": {"cursor_snapshot": snapshot}}))
         else:
-            print(json.dumps(spec.get("plan_list", [])))
+            # rivet prints one plan as its bare object (no campaign) and several as an array (plan_cmd.rs emit_artifacts)
+            planned = spec.get("plan_list", [])
+            print(json.dumps(planned[0] if isinstance(planned, list) and len(planned) == 1 else planned))
         return 0
+    if sub == "apply" and stale_artifact(spec, argv, export):
+        line = {"error": f"plan '{export}': cursor has drifted since plan was generated", "exit_class": 5}
+        print(json.dumps({**line, "code": "RIVET_PLAN_ARTIFACT_STALE"}), file=sys.stderr)
+        return 5
     if sub == "metrics":
         print(json.dumps(play.get("rows", [])))
         return play.get("exit", 0)
@@ -144,6 +169,8 @@ def main():
     sys.stderr.flush()
     if play.get("signal"):
         os.kill(os.getpid(), getattr(signal, play["signal"]))
+    if sub == "apply" and not play.get("exit"):
+        cursors(spec, {export: str(int(cursors(spec).get(export) or 0) + 1)})
     return play.get("exit", 0)
 
 
