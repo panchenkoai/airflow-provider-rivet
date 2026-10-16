@@ -17,7 +17,13 @@ First release, against rivet 0.31.0 and the contract of ADR-0039; Python 3.12+, 
 - Preflight: binary present and at least 0.31.0, state location by deployment (a pod needs
   PostgreSQL state and refuses CDC), state directory checks, a warning for `notifications:`.
 - Secrecy: XCom and the task log never carry the error message; raw stderr goes to a file.
-- `slack_failure_callback` for the Slack provider's webhook hook.
+- `slack_failure_callback` for the Slack provider: a one-line title per failed task,
+  `dag.task — <rivet code> (final|retryable)` (else the exception's class), with the run id and
+  the task-log link; with a bot token and `channel=` the error text (rivet's error line for the
+  failed step, else the exception's message; through Airflow's secrets masker, capped) is a code
+  block in its thread; with an incoming webhook, title and error text are one message. The task
+  log says what was sent and what Slack answered. Setup guide `docs/slack.md`, test DAGs
+  `examples/rivet_slack_alerts.py`.
 - `connections=[conn_id, ...]` on every operator: storage and warehouse credentials from Airflow
   Connections of kind gcp, aws, azure, snowflake and clickhouse (the connection type, or the
   extra `rivet_kind`); key files are written `0600` into a private folder removed when the task
@@ -28,6 +34,11 @@ First release, against rivet 0.31.0 and the contract of ADR-0039; Python 3.12+, 
 
 Changed before the first release, after review (see the README sections named):
 
+- The task log is readable: one headline per task with the outcome first (`OK`, `SKIPPED`,
+  `REFUSED`, `FAILED`, `CRASHED`, `STOPPED`, `BUSY`), counts, duration and run id; one line per
+  rivet step; `note` lines for degradations and single-host SQLite. A successful task's lines
+  were raw JSON and red in the Airflow UI (argv held `--json-errors`); argv and the JSON records
+  are now at DEBUG. ("Reading the task log")
 - A retry after the task process died past a successful `rivet apply` no longer applies the plan
   again: a `mode: full` export was extracted twice and an incremental one was refused
   `RIVET_PLAN_ARTIFACT_STALE` (a failed task, its load skipped). The task records the apply it
@@ -137,6 +148,8 @@ is now the one place rivet's environment is assembled; README "Storage and wareh
   is bracketed, with its zone encoded as `%25` (D23).
 - A ClickHouse Connection without a host is refused (`RIVET_AIRFLOW_CONNECTION_INCOMPLETE`)
   instead of becoming `http://None`. (D22)
+- A database Connection without a host is refused (`RIVET_AIRFLOW_CONNECTION_INCOMPLETE`) like a ClickHouse one;
+  it became `postgresql://u:p@/d` and the driver dialled its default socket or host. One check, in `url_host`.
 - README: an Azure config reads `account_name: ${AZURE_STORAGE_ACCOUNT}`. (D32)
 - A Connection id no backend defines (`env_from_connections`, `connections`) is refused,
   `RIVET_AIRFLOW_CONNECTION_MISSING`, with the refusal in XCom; it was retried with no XCom.

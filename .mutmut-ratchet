@@ -1,0 +1,12 @@
+# The most mutants of airflow_provider_rivet/ that may survive the full mutation run (dev/mutants_gate.py; README,
+# "Mutation testing"). Lower it whenever tests kill survivors; raising it needs a dated line here saying which
+# mutants are accepted and why.
+# 2026-10-16: baseline of the first full run (GitHub Actions run 38889642607, Linux, mutmut 3.8.0): 1078 of 5254
+# mutants not killed (1070 survived, 2 no tests, 6 segfault).
+# 2026-10-16: 1059 after the harness fixes (child Pythons run the mutant, and their tests are selected; run
+# 38898919160): 26 more killed, 7 false kills (child and parent disagreed on a lock path) now survive. 1053 survived,
+# 6 segfault (workers crashing in step / _tail / _parent_death_signal; see the baseline), 0 timeout.
+# 2026-10-16: 1126 after merging main ca8e63b (#20 tasklog.py, #22 Slack alerts): 6317 mutants, sum(tested) == 6317
+# (run 38922051373). tasklog.py adds 84 survivors, callbacks.py 75 -> 99, invocation.py 399 -> 369, operators.py
+# 119 -> 108; 1120 survived, 6 segfault. The names are in .mutmut-survivors.
+1126

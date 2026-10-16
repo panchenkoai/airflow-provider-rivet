@@ -208,6 +208,9 @@ def main():
             source = canonical(value_of(argv, "--config"))
             snapshot = cursors(spec).get(value_of(argv, "--export"))
             doc = {"export_name": value_of(argv, "--export"), "expires_at": expires, "config_path": source}
+            # rivet's `PlanArtifact.strategy` (src/plan/artifact.rs): the export's mode label
+            modes = {e.get("name"): e.get("mode") for e in (read_config(argv)[0].get("exports") or [])}
+            doc["strategy"] = modes.get(doc["export_name"])
             Path(out).write_text(json.dumps({**doc, "computed": {"cursor_snapshot": snapshot}}))
         else:
             # rivet prints one plan as its bare object (no campaign) and several as an array (plan_cmd.rs emit_artifacts)

@@ -141,6 +141,17 @@ class Request:
     upstream_markers: Sequence[str] = ()
 
 
+def decision_of(error: ErrorObject | None) -> str:
+    """The retry table: `success`, `retry` (transient budget), `retry_crashed` (its own budget) or `fail`.
+
+    A plain function, not the property body, so mutation testing reaches it (mutmut skips decorated functions)."""
+    if error is None:
+        return "success"
+    if error.class_ == "crashed":
+        return "retry_crashed"
+    return "retry" if error.retryable else "fail"
+
+
 @dataclass
 class Outcome:
     """What a task reports: its units, the representative error and what the binary could not do."""
@@ -160,11 +171,7 @@ class Outcome:
     @property
     def decision(self) -> str:
         """`success`, `retry` (transient budget), `retry_crashed` (its own budget) or `fail`."""
-        if self.error is None:
-            return "success"
-        if self.error.class_ == "crashed":
-            return "retry_crashed"
-        return "retry" if self.error.retryable else "fail"
+        return decision_of(self.error)
 
     def to_xcom(self) -> dict[str, Any]:
         """The XCom payload: units without `message`, never an environment value."""
@@ -342,6 +349,14 @@ class _Session:
                 running.request_stop()
                 running.wait()
                 raise
+        self.emit(
+            {
+                "event": "rivet.step",
+                "step": name,
+                "exit_status": None if code < 0 else code,
+                "signal": -code if code < 0 else None,
+            }
+        )
         if name != "metrics":
             self.stderr_path = str(stderr_path)
         lines = _lines(_tail(stderr_path))
@@ -698,29 +713,40 @@ def _export_lock(s: _Session) -> Iterator[None]:
     path, unit = found
     fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
     try:
-        deadline = time.monotonic() + max(0, s.req.lock_wait)
-        waiting = False
-        while True:
-            try:
-                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                break
-            except BlockingIOError:
-                if s.stopped is not None and s.stopped():
-                    raise Stopped(s.req.command) from None
-                if not waiting:
-                    waiting = True
-                    s.emit({"event": "rivet.lock.wait", "lock": str(path), "unit": unit, "lock_wait": s.req.lock_wait})
-                if time.monotonic() >= deadline:
-                    raise Busy(path, unit, s.req.lock_wait) from None
-                time.sleep(LOCK_POLL)
+        _wait_for_lock(s, fd, path, unit)
         s.lock_fd = fd
         try:
             yield
         finally:
-            s.lock_fd = None
-            fcntl.flock(fd, fcntl.LOCK_UN)
+            _release_lock(s, fd)
     finally:
         os.close(fd)
+
+
+def _wait_for_lock(s: _Session, fd: int, path: Path, unit: str) -> None:
+    """Take the exclusive lock on `fd`, polling every `LOCK_POLL` seconds for up to `lock_wait`; raise `Busy` after
+    it and `Stopped` when the task is stopped while waiting. Outside `_export_lock` so mutation testing reaches it."""
+    deadline = time.monotonic() + max(0, s.req.lock_wait)
+    waiting = False
+    while True:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            return
+        except BlockingIOError:
+            if s.stopped is not None and s.stopped():
+                raise Stopped(s.req.command) from None
+            if not waiting:
+                waiting = True
+                s.emit({"event": "rivet.lock.wait", "lock": str(path), "unit": unit, "lock_wait": s.req.lock_wait})
+            if time.monotonic() >= deadline:
+                raise Busy(path, unit, s.req.lock_wait) from None
+            time.sleep(LOCK_POLL)
+
+
+def _release_lock(s: _Session, fd: int) -> None:
+    """Release by an explicit unlock, never by close alone: a copy of the descriptor elsewhere keeps a closed lock."""
+    s.lock_fd = None
+    fcntl.flock(fd, fcntl.LOCK_UN)
 
 
 class Running:
@@ -937,6 +963,14 @@ def _apply(s: _Session) -> Outcome:
             return s.outcome(planned, [UnitResult(export, status="failed", error=error)], error)
         _refuse_foreign_artifact(artifact, export, cfg)
         _tighten(artifact)
+        sealed = _read_json(artifact)
+        s.emit(
+            {
+                "event": "rivet.plan.sealed",
+                "export": export,
+                "strategy": sealed.get("strategy") if isinstance(sealed, dict) else None,
+            }
+        )
     has_summary = s.pf.caps.has_flag("apply", "--summary-output")
     summary = s.work / f"{s.name}.summary.json"
     argv = [s.pf.binary, "apply", str(artifact)]
