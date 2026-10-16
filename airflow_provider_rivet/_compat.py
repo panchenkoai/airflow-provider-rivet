@@ -10,7 +10,10 @@ except ImportError:  # Airflow 2.10+
     from airflow.models.dag import DAG
     from airflow.utils.task_group import TaskGroup
 
-from airflow.exceptions import AirflowException, AirflowFailException, AirflowNotFoundException, AirflowSkipException
+try:  # Airflow 3.x: `airflow.exceptions` is a deprecated shim for these (D27)
+    from airflow.sdk.exceptions import AirflowException, AirflowFailException, AirflowNotFoundException, AirflowSkipException
+except ImportError:  # Airflow 2.10+
+    from airflow.exceptions import AirflowException, AirflowFailException, AirflowNotFoundException, AirflowSkipException
 
 __all__ = [
     "DAG",

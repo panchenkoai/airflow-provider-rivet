@@ -214,3 +214,124 @@ def test_the_slack_text_has_code_class_action_and_no_error_message() -> None:
     refused = format_failure({"preflight_refusal": "RIVET_AIRFLOW_CDC_ON_POD", "units": []}, dag_id="d", task_id="t", run_id="r")
     assert "RIVET_AIRFLOW_CDC_ON_POD" in refused
     assert "no rivet result" in format_failure(None, dag_id="d", task_id="t", run_id="r")
+
+
+GATED = ("all_success",)
+
+
+def rivet_tasks(dag: object) -> list:
+    """The tasks that run rivet: everything but the ordering barriers and the watcher."""
+    return [t for t in dag.tasks if not isinstance(t, RivetWaveBarrier | RivetRunWatcher)]
+
+
+def test_d24_a_trigger_rule_in_default_args_does_not_replace_the_all_success_gates(plan_file: str) -> None:
+    """D24: `default_args={"trigger_rule": "all_done"}` made load and compact run after a refused extract or drain."""
+    args = {"trigger_rule": "all_done"}
+    batch = build_batch_dag("b", config="c", plan_file=plan_file, compact_exports=["big"], default_args=args)
+    cdc = build_cdc_dag("c", config="c", export="e", tables=["t"], default_args=args)
+    for dag in (batch, cdc):
+        gated = {t.task_id: t.trigger_rule for t in rivet_tasks(dag)}
+        assert set(gated.values()) == {"all_success"}, gated
+        assert dag.get_task("watcher").trigger_rule == "one_failed"
+    assert batch.get_task("apply.after_big").trigger_rule == "all_done"
+
+
+def test_d24_a_trigger_rule_in_operator_kwargs_is_refused() -> None:
+    """D24: `operator_kwargs={"trigger_rule": ...}` names the rivet tasks only, whose gate the builder owns."""
+    with pytest.raises(ValueError, match="trigger_rule"):
+        build_batch_dag("b", config="c", exports=["a"], operator_kwargs={"trigger_rule": "all_done"})
+    with pytest.raises(ValueError, match="trigger_rule"):
+        build_cdc_dag("c", config="c", export="e", tables=["t"], operator_kwargs={"trigger_rule": "all_done"})
+
+
+def test_d25_user_default_args_are_merged_over_the_builders_retries() -> None:
+    """D25: passing `default_args` with only a callback replaced the builders' `retries=2` with Airflow's 0."""
+    args = {"on_failure_callback": alert}
+    for dag in (
+        build_batch_dag("b", config="c", exports=["a"], default_args=args),
+        build_cdc_dag("c", config="c", export="e", tables=["t"], default_args=args),
+    ):
+        task = next(iter(rivet_tasks(dag)))
+        assert task.retries == 2, (task.task_id, task.retries)
+        assert task.retry_delay.total_seconds() == 300
+    assert build_batch_dag("b", config="c", exports=["a"], default_args={"retries": 0}).get_task("apply.a").retries == 0
+
+
+def test_d26_a_waves_heavy_exports_run_alone_before_its_cheap_batch(tmp_path: Path) -> None:
+    """D26: like rivet's `cost_gate_batches`, each heavy export runs alone, then the cheap ones together."""
+    campaign = {
+        "waves": [{"wave": 1, "exports": ["a", "big", "b", "huge"]}],
+        "ordered_exports": [{"export_name": n, "cost_class": "low" if n in "ab" else "high"} for n in ("a", "big", "b", "huge")],
+    }
+    path = tmp_path / "pg.plan.json"
+    path.write_text(json.dumps([{"export_name": "a", "prioritization": {"campaign": campaign}}]))
+    dag = build_batch_dag("b", config="c", plan_file=str(path), load=False)
+    for cheap in ("apply.a", "apply.b"):
+        before = upstream_closure(dag, cheap)
+        assert {"apply.big", "apply.huge"} <= before, f"{cheap} starts while a heavy export of its wave still runs: {before}"
+        assert not {"apply.a", "apply.b"} & before, "the cheap exports of a wave run together"
+    assert "apply.big" in upstream_closure(dag, "apply.huge"), "heavy exports run one after another"
+    for barrier in (t for t in dag.tasks if isinstance(t, RivetWaveBarrier)):
+        assert barrier.trigger_rule == "all_done", barrier.task_id
+
+
+@pytest.mark.parametrize("field", ["exports", "compact_exports", "tables"])
+def test_d28_a_bare_string_for_a_list_of_names_is_refused(field: str) -> None:
+    """D28: `exports="abc"` built apply.a / apply.b / apply.c; `"orders"` failed with DuplicateTaskIdFound."""
+    with pytest.raises(ValueError, match=f"`{field}` is a list of names"):
+        if field == "tables":
+            build_cdc_dag("c", config="c", export="e", tables="orders")
+        else:
+            kwargs = {"exports": "abc"} if field == "exports" else {"exports": ["a"], "compact_exports": "a"}
+            build_batch_dag("b", config="c", **kwargs)
+
+
+TASK_ID = re.compile(r"^[\w.-]+$")
+
+
+def test_d29_an_export_or_table_name_that_is_no_task_id_gets_a_sanitised_id_and_keeps_its_name() -> None:
+    """D29: `daily orders` and `orders:v2` are rivet names but no Airflow task ids; the DAG failed to import."""
+    names = ["daily orders", "orders:v2", "daily_orders", "plain"]
+    dag = build_batch_dag("b", config="c", exports=names, compact_exports=["orders:v2"])
+    by_export: dict[str, set[str]] = {}
+    for task in rivet_tasks(dag):
+        assert TASK_ID.match(task.task_id.split(".", 1)[1]), task.task_id
+        by_export.setdefault(task.export, set()).add(task.task_id.split(".", 1)[1])
+    assert set(by_export) == set(names)
+    assert all(len(ids) == 1 for ids in by_export.values()), by_export
+    ids = [next(iter(by_export[n])) for n in names]
+    assert len(set(ids)) == len(ids), f"two exports share a task id: {ids}"
+    assert ids[2:] == ["daily_orders", "plain"], "a name that is already a task id is kept as it is"
+    assert ids[0].startswith("daily_orders_") and ids[1].startswith("orders_v2_")
+    assert dag.get_task(f"compact.{ids[1]}").export == "orders:v2"
+    cdc = build_cdc_dag("c", config="c", export="e", tables=["sales orders", "public.users"])
+    tables = {t.task_id: t.table for t in rivet_tasks(cdc) if t.task_id != "run"}
+    assert set(tables.values()) == {"sales orders", "public.users"} and all(TASK_ID.match(t) for t in tables)
+    assert "load.public.users" in tables, "a dotted table name is still a valid task id"
+
+
+def test_d27_the_compat_layer_imports_no_deprecated_airflow_name() -> None:
+    """D27: on Airflow 3 `_compat` imported the exceptions from `airflow.exceptions`, a deprecated shim."""
+    import subprocess
+    import sys
+
+    probe = (
+        "import airflow, json, warnings\n"
+        "with warnings.catch_warnings(record=True) as seen:\n"
+        "    warnings.simplefilter('always')\n"
+        "    import airflow_provider_rivet._compat as compat\n"
+        "names = [f'{w.category.__name__}: {w.message}' for w in seen if 'deprecat' in str(w.message).lower()\n"
+        "         or 'Deprecat' in w.category.__name__]\n"
+        "origin = compat.AirflowSkipException.__module__\n"
+        "print(json.dumps([names, int(airflow.__version__.split('.')[0]), origin]))\n"
+    )
+    out = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, check=True).stdout
+    warned, major, origin = json.loads(out.strip().splitlines()[-1])
+    assert warned == [], warned
+    if major >= 3:
+        from airflow.sdk.exceptions import AirflowFailException, AirflowSkipException
+
+        from airflow_provider_rivet import _compat
+
+        assert (_compat.AirflowSkipException, _compat.AirflowFailException) == (AirflowSkipException, AirflowFailException)
+        assert origin.startswith("airflow.sdk"), origin

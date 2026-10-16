@@ -49,7 +49,8 @@ def slack_failure_callback(slack_webhook_conn_id: str = "slack_default", **hook_
 
         ti = context["ti"]
         try:
-            payload = ti.xcom_pull(task_ids=ti.task_id, key=XCOM_KEY)
+            # this index's own payload: without `map_indexes` a mapped task's pull returns every index's (D11)
+            payload = ti.xcom_pull(task_ids=ti.task_id, key=XCOM_KEY, map_indexes=getattr(ti, "map_index", -1))
         except Exception:
             payload = None
         text = format_failure(
