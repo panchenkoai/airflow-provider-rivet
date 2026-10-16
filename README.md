@@ -163,8 +163,8 @@ plan ──> apply: [a] [b] ─> wave_2_done ─> [big] ─> after_big ─> [hug
   in `operator_kwargs` is refused. `default_args` you pass are merged over the builders'
   (`retries=2`, `retry_delay` 5 minutes), so adding a callback keeps the retries.
 - `exports`, `compact_exports` and `tables` are lists; a bare string is refused. A name that is
-  not a valid task id (`daily orders`, `orders:v2`) gets a task id with each other character
-  replaced by `_` and an 8-character hash of the name (`apply.daily_orders_<hash>`); rivet still
+  not an ASCII task id (`daily orders`, `orders:v2`, `заказы`) gets a task id with each character
+  outside `[A-Za-z0-9_.-]` replaced by `_` and an 8-character hash of the name (`apply.daily_orders_<hash>`); rivet still
   receives the real name.
 - `plan` is a direct upstream of every `apply` task: a failed plan refresh blocks the whole
   run (`upstream_failed`), because a run that could not plan has nothing it should extract.

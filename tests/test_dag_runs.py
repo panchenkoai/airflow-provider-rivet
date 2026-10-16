@@ -6,11 +6,8 @@ import json
 import logging
 from pathlib import Path
 
-import airflow
 import pytest
 from conftest import NEW_FLAGS, SECRET, DagRig
-
-AIRFLOW_MAJOR = int(airflow.__version__.split(".")[0])
 
 REFUSED = {"exit": 5, "line": {"error": "refused: row 4111-1111", "exit_class": 5, "code": "RIVET_SOURCE_CDC_LOG_GAP"}}
 BATCH_CONFIG = """\
@@ -187,7 +184,6 @@ def test_a_failure_callback_from_default_args_fires_for_the_failed_task_and_not_
 NON_ASCII = ("\u0437\u0430\u043a\u0430\u0437\u044b", "\u043a\u043b\u0438\u0435\u043d\u0442\u044b")
 
 
-@pytest.mark.skipif(AIRFLOW_MAJOR >= 3, reason="Airflow 3 dag.test() cannot run a non-ASCII task id (latin-1 in its API client)")
 def test_two_non_ascii_exports_of_one_dag_are_each_planned_and_extracted(dag_rig: DagRig) -> None:
     exports = "".join(f"  - {{name: {json.dumps(n)}, query: SELECT 1, mode: full}}\n" for n in NON_ASCII)
     dag_rig.config.write_text(f"source:\n  type: postgres\n  url_env: RIVET_PG_URL\nexports:\n{exports}")
@@ -308,3 +304,15 @@ def test_d29_exports_whose_names_are_no_task_ids_run_and_load_under_their_real_n
     state, tasks = dag_rig.run_dag("build_batch_dag", "odd_names", exports=list(DAY_NAMES), extract="run")
     assert state == OK and tasks.pop("watcher") == SKIPPED and set(tasks.values()) == {OK} and len(tasks) == 4, tasks
     assert sorted(dag_rig.ran()) == sorted((step, n) for n in DAY_NAMES for step in ("run", "load")), dag_rig.ran()
+
+
+def test_d29_a_cyrillic_export_gets_an_ascii_task_id_and_runs_under_its_real_name(dag_rig: DagRig) -> None:
+    """D29: a non-ASCII export name was its own task id, which Airflow 3's `dag.test()` cannot run; the id is now ASCII."""
+    name = "заказы"
+    dag_rig.config.write_text(
+        f"source:\n  type: postgres\n  url_env: RIVET_PG_URL\nexports:\n  - {{name: {name}, query: SELECT 1, mode: full}}\n"
+    )
+    state, tasks = dag_rig.run_dag("build_batch_dag", "cyrillic_export", exports=[name], extract="run")
+    assert all(t.isascii() for t in tasks), tasks
+    assert state == OK and tasks.pop("watcher") == SKIPPED and set(tasks.values()) == {OK} and len(tasks) == 2, tasks
+    assert sorted(dag_rig.ran()) == [("load", name), ("run", name)], dag_rig.ran()

@@ -27,11 +27,11 @@ ORDER_ONLY = "all_done"
 WATCHER_ID = "watcher"
 GATE = "all_success"
 DEFAULT_ARGS = {"retries": 2, "retry_delay": timedelta(minutes=5)}
-NOT_IN_TASK_ID = re.compile(r"[^\w.-]")
+NOT_IN_TASK_ID = re.compile(r"[^A-Za-z0-9_.-]")  # ASCII only: Airflow 3 cannot run a non-ASCII task id
 
 
 def task_name(name: str) -> str:
-    """The task id part for an export or table name: itself when Airflow accepts it, else sanitised plus a hash (D29).
+    """The task id part for an export or table name: itself when it is ASCII `[A-Za-z0-9_.-]`, else sanitised plus a hash (D29).
 
     The hash is of the real name, so `daily orders` and `daily_orders` never share an id; the real name stays in `export=`.
     """
