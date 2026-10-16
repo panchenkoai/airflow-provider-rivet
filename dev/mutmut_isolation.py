@@ -32,6 +32,8 @@ from pathlib import Path
 import pytest
 
 _OWNED: list[Path] = []
+_MUTATED_ROOT: list[str] = []
+_BASE_PYTHONPATH = os.environ.get("PYTHONPATH", "")
 
 
 @pytest.hookimpl(tryfirst=True)
@@ -54,8 +56,7 @@ def pytest_collection_finish(session: pytest.Session) -> None:
     # tested. The child inherits MUTANT_UNDER_TEST; with the mutated tree first on its path it runs the mutant too.
     import airflow_provider_rivet
 
-    root = str(Path(airflow_provider_rivet.__file__).resolve().parents[1])
-    os.environ["PYTHONPATH"] = os.pathsep.join([root, *filter(None, [os.environ.get("PYTHONPATH")])])
+    _MUTATED_ROOT.append(str(Path(airflow_provider_rivet.__file__).resolve().parents[1]))
     if not os.environ.get("AIRFLOW_HOME"):
         return  # the suite's conftest sets it before Airflow is imported; nothing to isolate without it
     db = Path(tempfile.gettempdir()) / f"apr-mutmut-{os.getpid()}.db"
@@ -82,6 +83,13 @@ def pytest_collection_finish(session: pytest.Session) -> None:
 # Stopped and Busy arms, `Running.wait`, `Stopped`). In the stats run, a test of these modules counts as calling
 # every function of the package; that over-selects (a few seconds per surviving mutant), never under-selects.
 CHILD_PYTHON_TESTS = ("test_retry.py::", "test_process_io.py::")
+
+
+def pytest_runtest_setup(item: pytest.Item) -> None:
+    """A child Python of a mutant's test imports the mutated tree; one of the stats run does not: there the trampoline
+    would record its calls through mutmut's config, which it cannot find from the child's working directory."""
+    parts = [*(_MUTATED_ROOT if os.environ.get("MUTANT_UNDER_TEST") != "stats" else []), _BASE_PYTHONPATH]
+    os.environ["PYTHONPATH"] = os.pathsep.join(p for p in parts if p)
 
 
 @pytest.hookimpl(hookwrapper=True)
