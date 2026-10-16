@@ -568,13 +568,72 @@ never compacts`) and exits 0; `rivet compact` has no `--summary-output` yet (`lo
 task ends green as `compacted`, having done nothing. For these warehouses build the CDC DAG with
 `compact=False` and leave such exports out of `compact_exports`.
 
-## Slack
+## Slack alerts
 
-Mutual exclusion: under Airflow, rivet's own notifications are off and alerting is Airflow's.
-The operators pass `--no-notify` to a binary that has it. Until then **do not configure
-`notifications:` in a rivet config run under Airflow**: every failure would be sent twice. The
-operator warns (a WARNING `note` line; record `rivet.warning`, `notifications_block`) when it sees
-the block.
+A failed rivet task posts one message to a Slack channel: a one-line title, `dag_id.task_id —
+<error type>`, with the run id and a link to the task log under it. The full trace (the failed
+units, the Airflow traceback, rivet's stderr of the failed step) goes into that message's thread
+as a code snippet, so the channel stays a list of titles. It is Airflow's `on_failure_callback`
+sending through the Slack provider; rivet itself sends nothing (see "Not twice" below). Five
+steps, end to end.
+
+**1. Install the Slack provider** on every worker (and wherever the scheduler parses DAGs):
+`pip install "airflow-provider-rivet[slack]"`, or `apache-airflow-providers-slack` with
+Airflow's constraints file. The official Airflow images already ship it.
+
+**2. Create the Slack app and its token.** Threads need a bot token: an incoming webhook returns
+no message id to reply under (it still works, see "Webhook only" below).
+
+1. <https://api.slack.com/apps> → *Create New App* (or open yours) → *OAuth & Permissions* →
+   *Bot Token Scopes*: add `chat:write` and `files:write` (`files:write` lets a trace too long for
+   a message go into the thread as a file).
+2. *Install to Workspace* (or *Reinstall* after adding scopes) → copy the *Bot User OAuth Token*,
+   `xoxb-…`.
+3. In the channel: `/invite @<your app>`. A bot posts only where it is a member.
+4. The channel id: channel name → *About* → at the bottom, `C…`.
+
+**The token is the credential**: whoever has it posts as the bot in every channel it is in. It is
+stored like a password, never in a DAG file, a repository, a ticket or a command line (argv is
+visible to every user of the host in `ps`, and lands in shell history).
+
+**3. Store it as an Airflow Connection**, type `slack` ("Slack API"), the token in the password
+field. Where it lives decides who else can read it; the reasoning, and the same choice for the
+database and warehouse Connections, is in "Connections and secrets: recommended setup" (added by
+#21).
+
+- **Recommended: a secrets backend** (Google Secret Manager, AWS Secrets Manager, Vault). With
+  the Secret Manager backend configured as described there (`connections_prefix:
+  airflow-connections`, `sep: -`), the conn_id `slack_rivet` is the secret
+  `airflow-connections-slack_rivet`. Make it from stdin; `read -s` and `printf` keep the token out
+  of argv and history:
+
+  ```bash
+  read -rs TOKEN    # paste the xoxb- token, then Enter
+  printf %s "$TOKEN" | jq -Rs '{conn_type: "slack", password: .}' |
+    gcloud secrets create airflow-connections-slack_rivet --data-file=-
+  unset TOKEN
+  ```
+
+- **Acceptable: the metadata database, with a Fernet key set** (`[core] fernet_key`; check with
+  `airflow config get-value core fernet_key | wc -c`, more than 1). Without a key Airflow stores
+  the token in clear. Either the UI (*Admin* → *Connections* → *+*, type *Slack API*, token in
+  *Slack API Token*), or a file only you can read:
+
+  ```bash
+  umask 077; read -rs TOKEN
+  printf '{"slack_rivet": {"conn_type": "slack", "password": "%s"}}' "$TOKEN" > slack_rivet.json
+  airflow connections import slack_rivet.json && rm slack_rivet.json; unset TOKEN
+  ```
+
+  Not `airflow connections add --conn-password <token>`: that puts the token in argv.
+- **Never in production: `AIRFLOW_CONN_SLACK_RIVET`** in the environment. It is readable through
+  `docker inspect`, `/proc/<pid>/environ` of every Airflow process, compose files and
+  deployment manifests.
+
+A task resolves the Connection on the worker, where the task failed (on Airflow 3 through the
+API server, which reads the backend), so the backend must be configured for the workers.
+
+**4. Wire the callback** into `default_args`; the builders merge it over their `retries=2`:
 
 ```python
 from airflow_provider_rivet.callbacks import slack_failure_callback
@@ -584,19 +643,102 @@ dag = build_batch_dag(
     config=...,
     state_dir=...,
     exports=[...],
-    default_args={"retries": 2, "on_failure_callback": slack_failure_callback("slack_webhook")},
+    default_args={"retries": 2, "on_failure_callback": slack_failure_callback("slack_rivet", channel="C0123ABCDEF")},
 )
 ```
 
+`slack_failure_callback(conn_id, channel=None, **hook_kwargs)` passes `hook_kwargs` to the hook
+(`timeout`, `proxy`, ...). On an operator you build yourself, pass `on_failure_callback=` to it.
 The `watcher` task carries no failure callback: the builders set its `on_failure_callback` to
 none, so a failed run sends one message per failed task and nothing for the watcher (which has no
 rivet result to show).
 
-It needs `apache-airflow-providers-slack` (the `slack` extra) and a Slack incoming-webhook
-connection. The message shows task, run, and per failed unit the export, `[code]`, class,
-whether it is retryable, the registry action, the stderr file path and a link to the task log;
-never rivet's error text. `format_failure(payload, ...)` is the pure formatter if you send
-through another channel.
+**What arrives.** Airflow calls `on_failure_callback` only when a task has failed for good: its
+last try failed, or it failed in a way Airflow does not retry. A try that Airflow will retry
+sends nothing. So every message is about a task that is now failed; the title says what to do.
+
+The title's error type is the rivet code and `final` or `retryable`; when there are several
+failed exports, the first one's code and `+N more`; when the task died without a rivet result,
+the exception's class (`AirflowTaskTimeout`, ...). `final` (a refusal, or a stop before rivet
+started): running it again changes nothing, fix what the code names. For example an export the
+config does not have:
+
+> :x: **rivet_slack_test.apply.no_such_export — RIVET_AIRFLOW_EXPORT_UNKNOWN (final)**
+> run `manual__2026-10-16T10:57:40+00:00` · task log
+
+with, in its thread:
+
+```text
+refused before rivet started: RIVET_AIRFLOW_EXPORT_UNKNOWN
+```
+
+followed by the Airflow traceback. `retryable`: the cause may go away by itself (here the source
+did not answer) and the retries ran out; once it is fixed, clearing the task is the remedy:
+
+> :x: **rivet_slack_test.apply.users — RIVET_PLAN_SOURCE_UNREADABLE (retryable)**
+> run `manual__2026-10-16T10:57:40+00:00` · task log
+
+```text
+users: RIVET_PLAN_SOURCE_UNREADABLE (retryable)
+```
+
+followed by `--- Airflow traceback ---` and `--- rivet stderr: <path> ---` with the end of
+rivet's stderr file for the failed step (where rivet wrote why). A unit's `action:` line follows
+its code when rivet's registry has one.
+
+**What the thread can hold.** Unlike XCom and the task log (see "Secrets"), the thread carries
+rivet's error text, which can hold source values (a cell that failed to convert). The callback
+passes the whole trace through Airflow's secrets masker (every Connection password and masked
+value the task saw becomes `***`; rivet already redacts credentials in its stderr), but a value
+from the data is not a secret Airflow knows. Send alerts to a channel whose members may read the
+source data. A trace up to 3,500 characters is a code block; a longer one is a file
+(`<dag>.<task>.trace.txt`, at most 200,000 characters, each part keeping its end); without
+`files:write` it is cut to a code block. Whatever is cut ends with `… truncated, full log:
+<task log link>`. The link uses Airflow's base URL (`[webserver] base_url` on Airflow 2,
+`[api] base_url` on Airflow 3): unset, it points at `http://localhost:8080`.
+
+**Webhook only.** Without `channel`, `conn_id` is an incoming-webhook Connection (type
+`slackwebhook`, the whole `https://hooks.slack.com/services/…` URL in the password field, stored
+as above), and title, link and the trace capped to 3,000 characters go out as one message.
+
+**5. Test it with a DAG that fails on purpose.** `examples/rivet_slack_alerts.py` defines two DAGs
+with no schedule, no database and no output: `rivet_slack_test_refused` (an export the config
+does not have) and `rivet_slack_test_transient` (a source on a port nobody listens on). Copy it
+and `examples/configs/` into the DAGs folder, set `RIVET_EXAMPLE_STATE_DIR` (an existing
+directory), `RIVET_SLACK_CHANNEL` (the channel id) and `RIVET_SLACK_CONN_ID` if your conn_id is
+not `slack_rivet`, then:
+
+```bash
+airflow dags unpause rivet_slack_test_refused && airflow dags trigger rivet_slack_test_refused
+airflow dags unpause rivet_slack_test_transient && airflow dags trigger rivet_slack_test_transient
+```
+
+Each run fails within seconds and posts one title with its trace in the thread. The failed
+task's log says what was sent, after the failure:
+
+```text
+Slack alert for rivet_slack_test_refused.apply.no_such_export posted to channel C0123ABCDEF (ts 1760612345.000100) through connection `slack_rivet`; its trace is a message in the thread
+```
+
+(through a webhook: `... sent through connection `slack_rivet`: HTTP 200 ok`). Slack's refusal
+raises instead, and Airflow logs it (Airflow 2: `Error in callback at index 0: notify`; Airflow 3:
+`Failed to run task callback`) with the cause: `not_in_channel` (invite the bot),
+`channel_not_found` (a channel name instead of its id, or a private channel the bot is not in),
+`invalid_auth` / `token_revoked`, `missing_scope`, a conn_id no backend defines (`The conn_id ...
+isn't defined`); for a webhook `404 no_service` (the webhook was removed). Neither line in the log
+means the callback never ran: check that `on_failure_callback` reached the task (`default_args`
+of that DAG). Pause or delete the two test DAGs when done.
+
+**Not twice.** Under Airflow, rivet's own notifications are off and alerting is Airflow's. The
+operators pass `--no-notify` to a binary that has it. Until then **do not configure
+`notifications:` in a rivet config run under Airflow**: every failure would be sent twice. The
+operator warns (a WARNING `note` line; record `rivet.warning`, `notifications_block`) when it sees
+the block.
+
+Tested: `tests/test_slack_alerts.py` checks the title of each outcome class, the thread (code
+block, a planted secret masked, truncation, the file and its fallback) and the `thread_ts` wiring
+through a fake Slack client, and runs both example DAGs through `dag.test()` on Airflow 2.10 and
+3.x. Live: see the PR that added this section.
 
 ## Overlap
 
@@ -644,7 +786,8 @@ a non-checkpointed run, so on 0.31.0 a pod's zombie try and its retry can both r
   the whole export; the first does the work, the others find the ledger up to date.
 - `rivet apply` prints no result today, so a successful apply task reads its counts from
   `rivet metrics`; a failed one has no counts.
-- A failure callback runs where Airflow runs callbacks; on Airflow 3 that was not exercised.
+- A failure callback runs where Airflow runs task callbacks, in the task's process on the worker;
+  exercised live on Airflow 2.10.5 and 3.3.2 by hand ("Slack alerts"), not by the live gate.
 
 ## Development
 

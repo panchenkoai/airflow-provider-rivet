@@ -279,10 +279,11 @@ def test_d11_the_slack_alert_of_a_mapped_rivet_task_names_the_code_of_its_own_in
     assert len(texts) == 2, texts
     for text in texts:
         assert "no rivet result was published" not in text, text
-        assert text.count("•") == 1, text
-    assert "*a*: `RIVET_CONFIG_CURSOR_COLUMN_CASE`" in "".join(texts) and "*b*: `RIVET_SOURCE_CDC_LOG_GAP`" in "".join(texts), (
-        texts
-    )
+    titles = sorted(t.split("\n")[0] for t in texts)
+    assert titles == [
+        ":x: *mapped_alert.run[0] — RIVET_CONFIG_CURSOR_COLUMN_CASE (final)*",
+        ":x: *mapped_alert.run[1] — RIVET_SOURCE_CDC_LOG_GAP (final)*",
+    ], titles
 
 
 def test_d24_a_refused_cdc_drain_blocks_load_and_compact_under_a_default_args_trigger_rule(cdc: DagRig) -> None:
