@@ -55,7 +55,7 @@ so the "rivet >=" column is the first release that carries that section.
 | `per_unit_error` | `failures[]` and `per_export[].error` | when several units of one process failed, each carries the process-level object | D2/D3, rivet >= unreleased |
 | `stop_reason` | CDC `stop_reason` and `tables[]` | `stop_reason` is null: a `max_events` stop cannot be told from `caught_up` | D4, rivet >= unreleased |
 | `apply_summary` | `--summary-output` on `rivet apply` | reads run id and counts from `rivet metrics --json` after a successful apply | D3, rivet >= unreleased |
-| `load_filter` | `--export` on `rivet load` / `rivet compact` | writes a single-export copy of the config and loads that | D3, rivet >= unreleased |
+| `load_filter` | `--export` on `rivet load` / `rivet compact` | writes a single-export copy of the config and loads that: the other `- name:` items are cut out of the original text, so what stays (quoted `${VAR}`, comments, anchors) is byte-exact; a stream keeps the batch exports its `cdc.backfill` reads; a text that cannot be cut safely (an anchor a kept item reads, an item sharing a line) is refused before rivet starts (`RIVET_AIRFLOW_CONFIG_NARROW_UNSAFE`) | D3, rivet >= unreleased |
 | `load_table_filter` | `--table` on `rivet load` / `rivet compact` | the per-table task handles every table of its export; tasks of one export are serialised by a file lock in the state directory | D3, rivet >= unreleased |
 | `load_result` | `--summary-output` on `rivet load` / `rivet compact` | status is `loaded` / `compacted` on exit 0 and `failed` otherwise; `skipped`, `table` and row counts are unknown (null) | D3, rivet >= unreleased |
 
@@ -366,6 +366,12 @@ SQLite state in `state_dir`.
    | `query_file` | the config's directory; an absolute path, `..` and a symlink out of it are refused by rivet | stays as written; the file is copied to the same relative path in the state directory before every task. Refused before rivet starts (`RIVET_AIRFLOW_QUERY_FILE`) when it is absolute, has `..`, leaves the directory through a symlink, is missing for the task's export, or when a config from ANOTHER directory already put a file at that relative path in this state directory |
    | `cdc.checkpoint` | the config's directory | resolves in the state directory; a file left beside the original is refused, see 3 |
    | `destination.path` (and the other paths rivet opens as written, such as `tls.ca_file`) | the process's working directory | unchanged: the working directory defaults to the directory of your ORIGINAL config; set `cwd` to change it |
+   The preflight reads the config as rivet does: every `${name}` is taken from a `-p` /
+   `--param` in `extra_args`, then from the task's environment, and spliced into the text before
+   the YAML is parsed, with YAML 1.2 scalars (`017` and `name: 2024` stay the text written). A
+   `mode` no variable resolves is treated as `cdc` by the guards; an export name or a
+   `cdc.checkpoint` no variable resolves is refused (`RIVET_AIRFLOW_CONFIG_UNRESOLVED`), as rivet
+   refuses the config.
 6. **Single host.** SQLite state and the lock files are visible to one host only. Two workers
    on two hosts need PostgreSQL state.
 7. **Moving to PostgreSQL state.** Stop the DAGs; create a database; set `RIVET_STATE_URL` to

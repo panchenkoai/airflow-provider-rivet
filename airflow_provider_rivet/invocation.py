@@ -221,9 +221,7 @@ class _Session:
             _copy_query_files(self.pf.config, source, folder, self.req.export)
         if only_export is None:
             return _write_atomic(folder / copy_name(source), source.read_bytes())
-        doc = dict(self.pf.config)
-        doc["exports"] = narrowed_exports(doc.get("exports") or [], only_export)
-        return _write_atomic(folder / copy_name(source, only_export), _yaml.dump(doc).encode())
+        return _write_atomic(folder / copy_name(source, only_export), narrowed_config(self.pf, str(source), only_export).encode())
 
     def malformed(self, value: Any, kind: type) -> Any:
         """A value of a result file when it has the type the contract gives it, else `None`, recorded."""
@@ -427,20 +425,49 @@ def _tail(path: Path) -> str:
         return handle.read().decode(errors="replace")
 
 
-def narrowed_exports(exports: list[Any], only_export: str) -> list[dict[str, Any]]:
-    """The export, and the batch exports its `cdc.backfill` reads its baseline through: rivet refuses a stream whose
-    recipes are missing (`backfill: auto` pairs by `table:`, a list names them)."""
-    exports = [e for e in exports if isinstance(e, dict)]
-    chosen = [e for e in exports if e.get("name") == only_export]
-    backfill = (chosen[0].get("cdc") or {}).get("backfill") if chosen and isinstance(chosen[0].get("cdc"), dict) else None
-    if backfill == "auto":
-        tables = set(chosen[0].get("tables") or [])
-        recipes = {e.get("name") for e in exports if e.get("mode") != "cdc" and e.get("table") in tables}
+def narrowed_exports(exports: list[Any], only_export: str) -> set[int]:
+    """The positions of the export and of the batch exports its `cdc.backfill` reads its baseline through: rivet refuses
+    a stream whose recipes are missing (`backfill: auto` pairs by `table:`, a list names them). Names compare as the
+    text rivet reads (D07: `name: 2024` is `"2024"`)."""
+    text = _yaml.text_of
+    entries = {i: e for i, e in enumerate(exports) if isinstance(e, dict)}
+    chosen = [e for e in entries.values() if text(e.get("name")) == only_export]
+    cdc = chosen[0].get("cdc") if chosen else None
+    backfill = cdc.get("backfill") if isinstance(cdc, dict) else None
+    if text(backfill) == "auto":
+        tables = {text(t) for t in chosen[0].get("tables") or []}
+        recipes = {
+            text(e.get("name")) for e in entries.values() if text(e.get("mode")) != "cdc" and text(e.get("table")) in tables
+        }
     elif isinstance(backfill, list):
-        recipes = set(backfill)
+        recipes = {text(b) for b in backfill}
     else:
         recipes = set()
-    return [e for e in exports if e.get("name") == only_export or e.get("name") in recipes]
+    return {i for i, e in entries.items() if text(e.get("name")) == only_export or text(e.get("name")) in recipes}
+
+
+def narrowed_config(pf: Preflight, source: str, only_export: str) -> str:
+    """The config text narrowed to one export (and its backfill recipes) by cutting the other items out of the original
+    text (D09): rivet splices `${...}` into the raw text before parsing, so a re-serialised copy changes what a quoted
+    value reads as. A cut that does not read back as the intended document is refused, never guessed."""
+    exports = pf.config.get("exports") or []
+    keep = narrowed_exports(exports, only_export)
+    expected = {**pf.config, "exports": [exports[i] for i in sorted(keep)]}
+
+    def check(cut: str) -> None:
+        doc, _ = _yaml.resolve_and_load(cut, pf.value_of)
+        if doc != expected:
+            raise ValueError("the narrowed document differs from the chosen exports of the original")
+
+    try:
+        return _yaml.narrow_text(pf.config_text, keep, len(exports), check)
+    except _yaml.NarrowRefused as exc:
+        raise PreflightRefusal(
+            "RIVET_AIRFLOW_CONFIG_NARROW_UNSAFE",
+            f"this rivet has no `--export` on load/compact, so the task loads from a copy of {source} cut down to "
+            f"`{only_export}`, and the text cannot be cut safely: {exc}. Write `exports:` as a plain list whose items "
+            f"each start their own `- name:` line, with no anchor another item uses",
+        ) from exc
 
 
 def copy_name(source: Path, only_export: str | None = None) -> str:
@@ -459,7 +486,7 @@ def _copy_query_files(config: Mapping[str, Any], source: Path, folder: Path, tou
         ref = entry.get("query_file") if isinstance(entry, dict) else None
         if not ref:
             continue
-        name, ref, origin = entry.get("name"), str(ref), source.parent / str(ref)
+        name, ref, origin = _yaml.text_of(entry.get("name")), str(ref), source.parent / str(ref)
 
         def refuse(why: str, name: str = name, ref: str = ref) -> None:
             raise PreflightRefusal("RIVET_AIRFLOW_QUERY_FILE", f"export `{name}` of {source}: query_file `{ref}` {why}")
@@ -535,7 +562,7 @@ def _plan_inputs(s: _Session, export: str) -> str:
     source = Path(s.req.config).resolve()
     parts = [str(source).encode(), source.read_bytes()]
     for entry in s.pf.config.get("exports") or []:
-        if isinstance(entry, dict) and entry.get("name") == export and entry.get("query_file"):
+        if isinstance(entry, dict) and _yaml.text_of(entry.get("name")) == export and entry.get("query_file"):
             try:
                 parts.append((source.parent / str(entry["query_file"])).read_bytes())
             except OSError:
@@ -771,6 +798,7 @@ def invoke(request: Request, emit: Emit, on_process: Callable | None = None) -> 
         export=request.export,
         cdc=request.command == "cdc_run",
         upstream_markers=tuple(request.upstream_markers),
+        extra_args=tuple(request.extra_args),
     )
     for key, text in pf.warnings:
         emit({"event": "rivet.warning", "warning": key, "text": text})
