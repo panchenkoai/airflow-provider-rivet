@@ -398,6 +398,7 @@ SQLite state in `state_dir`.
      (`RIVET_AIRFLOW_CONNECTION_SCHEME`). A password without a login is kept, an IPv6 host is
      bracketed, an Oracle connection's extra `service_name` is used as the path, and the extra
      `rivet_params` adds a query string.
+  4. `connections=[conn_id, ...]`: storage and warehouse Connections, see below.
 
   argv carries the config path, export names and flags.
 - XCom carries code, class, exit_code, retryable, action, kind, counts, `stop_reason`, the
@@ -421,6 +422,29 @@ SQLite state in `state_dir`.
 - `stream_stderr=True` copies stderr into the task log when each step ends. It is the one way
   raw stderr reaches the task log, and it is for debugging: it puts possibly data-bearing text
   into a store with wider access than the worker.
+
+## Storage and warehouse connections
+
+`connections=["gcp_rivet", "sf_rivet"]` (on every operator, or in a builder's `operator_kwargs`)
+turns each Airflow Connection into what rivet reads, inside `execute`: variables, and key files
+written mode `0600` into a private folder that is removed when the task ends, whatever its
+outcome. The kind comes from the connection type, or from the extra `rivet_kind`; one task
+takes at most one Connection of each kind (`RIVET_AIRFLOW_CONNECTION_KIND_TWICE`), and a type
+that is none of them is refused before rivet starts (`RIVET_AIRFLOW_CONNECTION_KIND`).
+
+| Kind (connection type) | Read from the Connection | rivet gets | The config names it |
+|---|---|---|---|
+| `gcp` (`google_cloud_platform`) | extra `keyfile_dict` (written to a file) or `key_path`; `project` | `GOOGLE_APPLICATION_CREDENTIALS`, `GOOGLE_CLOUD_PROJECT` | nothing: GCS and BigQuery read it |
+| `aws` (`aws`) | login, password; extras `aws_session_token`, `region_name`, `endpoint_url` | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_SESSION_TOKEN`, `AWS_REGION`, `AWS_ENDPOINT_URL` | `access_key_env: AWS_ACCESS_KEY_ID`, `secret_key_env: AWS_SECRET_ACCESS_KEY` (+ `session_token_env`) |
+| `azure` (`wasb`) | login (account), password (key); extra `sas_token` | `AZURE_STORAGE_ACCOUNT`, `AZURE_STORAGE_KEY`, `AZURE_STORAGE_SAS_TOKEN` | `account_key_env: AZURE_STORAGE_KEY` or `sas_token_env: AZURE_STORAGE_SAS_TOKEN` |
+| `snowflake` (`snowflake`) | extras `account`, `role`, `warehouse`, `database`, `private_key_content` (written to a file) or `private_key_file`; else the password | a `snow` connection named as `load.connection` in a private `SNOWFLAKE_HOME`; `RIVET_SNOWFLAKE_KEY` | `load.connection` |
+| `clickhouse` (`clickhouse`, or any type with `rivet_kind: clickhouse`) | host, port, login, password; extra `secure` or `protocol` | `RIVET_CLICKHOUSE_URL`, `RIVET_CLICKHOUSE_USER`, `RIVET_CLICKHOUSE_PASSWORD`, and the password also under the config's own `password_env` (`rivet init` writes `CLICKHOUSE_PASSWORD`) | `url: ${RIVET_CLICKHOUSE_URL}`, `user: ${RIVET_CLICKHOUSE_USER}`, `password_env: RIVET_CLICKHOUSE_PASSWORD` (or any name) |
+
+The config keeps what is not a secret (bucket, project, dataset, database, schema); the
+Connection holds who may write there. The Snowflake loader runs the `snow` CLI, which must be on
+the worker (`pip install snowflake-cli` into its own environment). On BigQuery `rivet compact`
+merges the buffer into the base table; on Snowflake and ClickHouse the current state is a view
+over `<table>__changes`, and the compact task is skipped with the reason rivet gives.
 
 ## Slack
 
