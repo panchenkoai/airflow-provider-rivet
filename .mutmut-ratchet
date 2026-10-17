@@ -9,4 +9,7 @@
 # 2026-10-16: 1126 after merging main ca8e63b (#20 tasklog.py, #22 Slack alerts): 6317 mutants, sum(tested) == 6317
 # (run 38922051373). tasklog.py adds 84 survivors, callbacks.py 75 -> 99, invocation.py 399 -> 369, operators.py
 # 119 -> 108; 1120 survived, 6 segfault. The names are in .mutmut-survivors.
-1126
+# 2026-10-17: 951 after #31-#38 (main 6ddc6d9; run 39020026835): 6361 mutants, sum(tested) == 6361, 951 survived,
+# 0 segfault. invocation.py 369 -> 217 (#38: the critical functions' survivors, 18 left, all equivalent), result.py
+# 16 -> 4, _yaml.py 132 -> 125, connections.py 171 -> 169. The names are in .mutmut-survivors.
+951
