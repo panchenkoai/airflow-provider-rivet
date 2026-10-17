@@ -29,7 +29,7 @@ def _failed_units(payload: Mapping[str, Any]) -> list[Mapping[str, Any]]:
     """The units that carry an error; the process-level error when no unit does."""
     failed = [u for u in payload.get("units") or [] if u.get("error")]
     if not failed and payload.get("error"):
-        failed = [{"export": None, "table": None, "error": payload["error"]}]
+        failed = [{"error": payload["error"]}]  # its name is read with `.get`: `(process)`, no table
     return failed
 
 
@@ -113,22 +113,22 @@ def _rivet_errors(payload: Mapping[str, Any]) -> list[str]:
     try:
         with open(path, "rb") as f:
             f.seek(max(f.seek(0, 2) - STDERR_TAIL, 0))
-            lines = f.read().decode("utf-8", errors="replace").splitlines()
+            lines = f.read().decode(errors="replace").splitlines()  # UTF-8, the default
     except OSError:
         return []
     found, plain = [], []
     for line in lines:
         try:
             obj = json.loads(line)
-        except ValueError:
-            obj = None
+        except ValueError:  # no JSON value starts with `e`, so an `Error:` line is never one
+            if line.lstrip().lower().startswith("error:"):
+                plain.append(line.strip())
+            continue
         if isinstance(obj, dict):
             text = obj.get("error") if isinstance(obj.get("error"), str) else obj.get("message")
             if isinstance(text, str) and text:
                 code = obj.get("code")
                 found.append(f"[{code}] {text}" if isinstance(code, str) and code and code not in text else text)
-        elif line.lstrip().lower().startswith("error:"):
-            plain.append(line.strip())
     return found or plain  # the human `Error:` line repeats the object when both are printed
 
 
@@ -198,12 +198,13 @@ def slack_failure_callback(
             # this index's own payload: without `map_indexes` a mapped task's pull returns every index's (D11)
             payload = ti.xcom_pull(task_ids=ti.task_id, key=XCOM_KEY, map_indexes=map_index)
         except Exception:
-            payload = None
+            payload = None  # pragma: no mutate - any non-dict here is dropped two lines below, `""` alike
+        log_url = getattr(ti, "log_url", "") or ""  # pragma: no mutate - a `None` default is caught by `or ""`
         alert = _Alert(
             dag_id=ti.dag_id,
             task=ti.task_id + (f"[{map_index}]" if isinstance(map_index, int) and map_index >= 0 else ""),
             run_id=str(context.get("run_id") or getattr(ti, "run_id", "")),
-            log_url=getattr(ti, "log_url", "") or "",
+            log_url=log_url,
             payload=payload if isinstance(payload, dict) else None,
             exception=context.get("exception"),
         )
