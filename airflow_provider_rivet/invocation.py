@@ -163,7 +163,6 @@ class Outcome:
     signal: int | None = None
     degraded: list[str] = field(default_factory=list)
     stderr_path: str | None = None
-    argv: list[list[str]] = field(default_factory=list)
     marker: str | None = None
     rivet_version: str | None = None
     skip_reason: str | None = None
@@ -197,7 +196,6 @@ class _Step:
     exit_status: int | None
     signal: int | None
     line: dict[str, Any] | None
-    stdout_path: Path
     broken: bool = False
 
 
@@ -234,7 +232,6 @@ class _Session:
         self.on_process = on_process
         self.stopped = stopped
         self.degraded: set[str] = set()
-        self.argvs: list[list[str]] = []
         self.stderr_path: str | None = None
         self.tmp: Path | None = None
         self.lock_fd: int | None = None
@@ -322,7 +319,6 @@ class _Session:
         task process dies first; on Linux it gets SIGTERM when the task process dies (G2). `on_start` gets its pid."""
         if self.stopped is not None and self.stopped():
             raise Stopped(name)
-        self.argvs.append(argv)  # pragma: no mutate - `Outcome.argv` is never read
         stderr_path = self.logs / f"{self.log_name}.{name}.stderr.log"
         stdout_path = stdout_to or self.logs / f"{self.log_name}.{name}.stdout.log"
         self.emit({"event": "rivet.start", "step": name, "argv": argv, "stderr_path": str(stderr_path)})
@@ -364,7 +360,7 @@ class _Session:
             for raw in lines:
                 self.emit({"event": "rivet.stderr", "step": name, "line": raw})
         signal = -code if code < 0 else None
-        return _Step(None if signal else code, signal, _error_line(lines), stdout_path, _has_broken_object(lines))
+        return _Step(None if signal else code, signal, _error_line(lines), _has_broken_object(lines))
 
     def classify(self, step: _Step) -> ErrorObject | None:
         """The process-level error object: read when rivet printed a well-formed one, built from the exit when not."""
@@ -429,7 +425,6 @@ class _Session:
             signal=step.signal,
             degraded=sorted(self.degraded),
             stderr_path=self.stderr_path,
-            argv=self.argvs,
             marker=self.pf.marker,
             rivet_version=self.pf.caps.version_text,
         )
