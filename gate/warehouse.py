@@ -20,7 +20,7 @@ from pathlib import Path
 from typing import Any
 
 from . import oracle
-from .stand import CH_PASSWORD, sh
+from .stand import sh
 
 WAREHOUSES = ("bigquery", "snowflake", "clickhouse")
 SWEEP_AGE_HOURS = 24
@@ -28,6 +28,9 @@ SWEEP_AGE_HOURS = 24
 TAG_SHAPE = re.compile(r"\d{8}[0-9a-f]{4}")
 SCHEMA_SHAPE = re.compile(r"AFGATE_\d{8}[0-9A-F]{4}_\d+")
 DATASET_SHAPE = re.compile(r"rivet_tmp_afgate_\d{8}[0-9a-f]{4}_\d+")
+#: A Secret Manager secret holding one gate Connection: `<connections_prefix>_<conn_id>`.
+SECRET_SHAPE = re.compile(r"airflow-connections-afgate_\d{8}[0-9a-f]{4}_\d+_[a-z0-9_]+")
+SECRETS_BACKEND = "airflow.providers.google.cloud.secrets.secret_manager.CloudSecretManagerBackend"
 #: The one DAG whose compaction must run: its base_buffer layout keeps the current state in the base only after it.
 MUST_COMPACT = "gate_wh_bigquery_batch"
 
@@ -45,6 +48,13 @@ class Cloud:
     sf_database: str
     sf_integration: str
     tag: str
+    #: `key`: the gate_gcp Connection carries the credential (`keyfile_dict`); `adc`: it holds only `project` and
+    #: rivet runs as the identity the containers were given (the credential file mounted read-only).
+    gcp_auth: str = "key"
+    #: `env`: AIRFLOW_CONN_* variables; `gsm`: Google Secret Manager as Airflow's secrets backend.
+    connections_from: str = "env"
+    #: The service account the secrets backend reads as (impersonated from the mounted credential); empty: as itself.
+    gsm_reader: str = ""
 
     def dataset(self, stack: str) -> str:
         """The BigQuery dataset of one stack (the stand's tmp prefix, swept by age)."""
@@ -61,6 +71,28 @@ class Cloud:
     def prefix(self, stack: str, wh: str) -> str:
         """The GCS prefix one warehouse's exports land under."""
         return f"{self.root(stack)}{wh}/"
+
+    def connections_prefix(self, stack: str) -> str:
+        """The secrets backend's `connections_prefix` for one stack; with `sep` `_` a conn_id is the rest of the name."""
+        return f"airflow-connections-afgate_{self.tag}_{stack.replace('.', '')}"
+
+    def secret(self, stack: str, conn_id: str) -> str:
+        """The Secret Manager secret that holds one Connection of one stack (what the backend asks for)."""
+        return f"{self.connections_prefix(stack)}_{conn_id}"
+
+    def secrets_backend(self, stack: str) -> dict[str, str]:
+        """The `[secrets]` settings of a stack whose Connections live in Secret Manager. Variables and config are
+        not looked up there (prefix null), so the backend only ever asks for the gate's own Connection secrets."""
+        kwargs: dict[str, Any] = {
+            "connections_prefix": self.connections_prefix(stack),
+            "sep": "_",
+            "variables_prefix": None,
+            "config_prefix": None,
+            "project_id": self.project,
+        }
+        if self.gsm_reader:
+            kwargs["impersonation_chain"] = self.gsm_reader
+        return {"AIRFLOW__SECRETS__BACKEND": SECRETS_BACKEND, "AIRFLOW__SECRETS__BACKEND_KWARGS": json.dumps(kwargs)}
 
 
 def snow_login(name: str) -> dict[str, str]:
@@ -81,16 +113,16 @@ def snow_login(name: str) -> dict[str, str]:
     )
 
 
-def connections(cloud: Cloud) -> dict[str, str]:
-    """AIRFLOW_CONN_* values for the stack: GCP (GCS + BigQuery), Snowflake, ClickHouse."""
+def connections(cloud: Cloud, clickhouse_password: str) -> dict[str, dict[str, Any]]:
+    """The warehouse leg's Connections by conn_id: GCP (GCS + BigQuery), Snowflake, ClickHouse."""
     sf = snow_login(cloud.sf_connection)
     key = Path(sf["private_key_file"]).expanduser().read_text()
-    conns = {
-        "AIRFLOW_CONN_GATE_GCP": {
-            "conn_type": "google_cloud_platform",
-            "extra": {"keyfile_dict": cloud.keyfile.read_text(), "project": cloud.project},
-        },
-        "AIRFLOW_CONN_GATE_SNOWFLAKE": {
+    gcp: dict[str, Any] = {"project": cloud.project}
+    if cloud.gcp_auth == "key":
+        gcp["keyfile_dict"] = cloud.keyfile.read_text()
+    return {
+        "gate_gcp": {"conn_type": "google_cloud_platform", "extra": gcp},
+        "gate_snowflake": {
             "conn_type": "snowflake",
             "login": sf["user"],
             "extra": {
@@ -101,15 +133,14 @@ def connections(cloud: Cloud) -> dict[str, str]:
                 "private_key_content": key,
             },
         },
-        "AIRFLOW_CONN_GATE_CLICKHOUSE": {
+        "gate_clickhouse": {
             "conn_type": "clickhouse",
             "host": "gate-clickhouse",
             "port": 8123,
             "login": "loader",
-            "password": CH_PASSWORD,
+            "password": clickhouse_password,
         },
     }
-    return {name: json.dumps(value) for name, value in conns.items()}
 
 
 LOADS = {
@@ -238,6 +269,52 @@ def cleanup(cloud: Cloud, stack: str, warehouses: Sequence[str] = WAREHOUSES) ->
         raise RuntimeError(f"cloud cleanup left behind {left}")
 
 
+def _secrets(cloud: Cloud) -> list[dict[str, Any]]:
+    """Every Secret Manager secret of the gate's shape in the project: `id`, `created`; a listing that fails raises."""
+    out = sh(
+        ["gcloud", "secrets", "list", f"--project={cloud.project}", "--format=json(name,createTime)"],
+        timeout=300,
+        check=True,
+    ).stdout
+    found = [{"id": str(r.get("name", "")).rsplit("/", 1)[-1], "created": r.get("createTime")} for r in json.loads(out or "[]")]
+    return [r for r in found if SECRET_SHAPE.fullmatch(r["id"])]
+
+
+def publish_connections(cloud: Cloud, stack: str, conns: Mapping[str, Mapping[str, Any]]) -> list[str]:
+    """One secret per Connection (Airflow's JSON form) under the stack's prefix; the secret ids. The value goes in
+    on stdin, never on a command line."""
+    made = []
+    for conn_id, conn in conns.items():
+        name = cloud.secret(stack, conn_id)
+        if not SECRET_SHAPE.fullmatch(name):
+            raise ValueError(f"{name} is not of the shape the sweep recognises")
+        sh(
+            [
+                "gcloud", "secrets", "create", name, f"--project={cloud.project}", "--replication-policy=automatic",
+                f"--labels=afgate-tag={cloud.tag}", "--data-file=-",
+            ],
+            input=json.dumps(conn),
+            timeout=300,
+        )  # fmt: skip
+        made.append(name)
+    return made
+
+
+def secret_leftovers(cloud: Cloud, stack: str) -> list[str]:
+    """The stack's Connection secrets still in Secret Manager."""
+    mine = cloud.connections_prefix(stack) + "_"
+    return [f"gsm:{r['id']}" for r in _secrets(cloud) if r["id"].startswith(mine)]
+
+
+def delete_connections(cloud: Cloud, stack: str) -> None:
+    """Delete the stack's Connection secrets, then list again: anything left raises."""
+    for left in secret_leftovers(cloud, stack):
+        sh(["gcloud", "secrets", "delete", left.removeprefix("gsm:"), f"--project={cloud.project}", "--quiet"], check=False)
+    left = secret_leftovers(cloud, stack)
+    if left:
+        raise RuntimeError(f"secret cleanup left behind {left}")
+
+
 def sweep(cloud: Cloud) -> list[str]:
     """Remove leftovers of earlier gate runs older than a day, by age only (one bucket and project serve several machines)."""
     removed = []
@@ -267,6 +344,15 @@ def sweep(cloud: Cloud) -> list[str]:
     if old:
         sh(["gcloud", "storage", "rm", "--quiet", *old], timeout=600, check=False)
         removed.append(f"gcs:{len(old)} object(s)")
+    try:
+        stale = [r["id"] for r in _secrets(cloud) if _age_hours(r["created"]) > SWEEP_AGE_HOURS]
+    except RuntimeError as exc:
+        stale = []
+        if "SERVICE_DISABLED" not in str(exc) and "has not been used" not in str(exc):
+            removed.append(f"gsm:listing failed, nothing swept: {exc}")  # a disabled API holds nothing of the gate's
+    for name in stale:
+        sh(["gcloud", "secrets", "delete", name, f"--project={cloud.project}", "--quiet"], check=False)
+        removed.append(f"gsm:{name}")
     return removed
 
 
@@ -455,7 +541,7 @@ def _sf_connect(cloud: Cloud) -> Any:
     )
 
 
-def _ch(port: int, sql: str) -> list[dict[str, Any]]:
+def _ch(port: int, password: str, sql: str) -> list[dict[str, Any]]:
     """Rows of a ClickHouse query over HTTP as JSON: ISO instants, unquoted 64-bit integers and decimals."""
     params = {
         "query": sql + " FORMAT JSONEachRow",
@@ -465,7 +551,7 @@ def _ch(port: int, sql: str) -> list[dict[str, Any]]:
     }
     req = urllib.request.Request(
         f"http://127.0.0.1:{port}/?{urllib.parse.urlencode(params)}",
-        headers={"Authorization": "Basic " + base64.b64encode(f"loader:{CH_PASSWORD}".encode()).decode()},
+        headers={"Authorization": "Basic " + base64.b64encode(f"loader:{password}".encode()).decode()},
     )
     try:
         with urllib.request.urlopen(req, timeout=120) as r:
@@ -523,7 +609,12 @@ class Leg:
                 return {row[at].lower() for row in cur.fetchall()}
             finally:
                 cur.close()
-        return {r["name"].lower() for r in _ch(stand.clickhouse_port, "SELECT name FROM system.tables WHERE database = 'gate'")}
+        return {
+            r["name"].lower()
+            for r in _ch(
+                stand.clickhouse_port, stand.secrets.clickhouse, "SELECT name FROM system.tables WHERE database = 'gate'"
+            )
+        }
 
     def read(self, stand: Any, wh: str, obj: str) -> list[dict[str, Any]]:
         """Every row of one table or view, read by the warehouse's own client (not the one the loader uses)."""
@@ -543,7 +634,7 @@ class Leg:
                 return [dict(zip(names, row, strict=True)) for row in cur.fetchall()]
             finally:
                 cur.close()
-        return _ch(stand.clickhouse_port, f"SELECT * FROM gate.`{obj}`")
+        return _ch(stand.clickhouse_port, stand.secrets.clickhouse, f"SELECT * FROM gate.`{obj}`")
 
     def sabotage(self) -> str:
         """Break one value in a warehouse on purpose (one cent on one BigQuery batch row): the oracle must go red."""

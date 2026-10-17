@@ -568,6 +568,95 @@ never compacts`) and exits 0; `rivet compact` has no `--summary-output` yet (`lo
 task ends green as `compacted`, having done nothing. For these warehouses build the CDC DAG with
 `compact=False` and leave such exports out of `compact_exports`.
 
+## Connections and secrets: recommended setup
+
+Where the Connections of a rivet DAG live decides who else can read them. Safest first:
+
+1. **Keyless GCP: the worker's own identity.** On GKE the worker pod runs as a Kubernetes service
+   account bound to a Google service account (Workload Identity); on Cloud Composer it is the
+   environment's service account. No key file exists anywhere. The GCP Connection holds only
+   `project`; a Connection that supplies no credential leaves the worker's identity in place, and
+   rivet finds it through Google's default chain (GCS: an ADC file, else the metadata server).
+   rivet's BigQuery loader has no metadata-server path of its own: with no ADC
+   file it runs `gcloud auth application-default print-access-token`, so a Workload Identity
+   worker that loads BigQuery needs the `gcloud` CLI on its `PATH`. The live gate proves this
+   leg with a credential file mounted read-only where the default chain looks; it has no
+   Workload Identity to test.
+2. **Google Secret Manager as Airflow's secrets backend** for what has to be a secret: the
+   Snowflake key, the ClickHouse password, source database passwords. Airflow reads a Connection
+   from Secret Manager when a task asks for it; it is never in the metadata database, a compose
+   file or the container's environment. The worker's identity is granted access to the
+   connection secrets only, not to the project's other secrets.
+3. **Connections in the metadata database, with a Fernet key set** (`[core] fernet_key`).
+   Without one Airflow stores every password in clear and logs `empty cryptography key`.
+4. **`AIRFLOW_CONN_*` environment variables: the worst place.** They are readable through
+   `docker inspect`, `/proc/<pid>/environ` of every Airflow process, compose files and
+   deployment manifests. Use them for a throwaway stand only (the live gate's default leg).
+
+**GCP, keyless.** The Connection (it holds no secret, so it may live anywhere):
+
+```bash
+airflow connections add gcp_rivet --conn-json '{"conn_type": "google_cloud_platform", "extra": {"project": "my-project"}}'
+```
+
+The grants, for a worker running as `rivet-worker@my-project.iam.gserviceaccount.com` (these are the
+usual roles; the gate runs as a project owner and does not measure the minimum):
+
+```bash
+GSA=rivet-worker@my-project.iam.gserviceaccount.com
+gcloud iam service-accounts add-iam-policy-binding "$GSA" --role roles/iam.workloadIdentityUser \
+  --member "serviceAccount:my-project.svc.id.goog[airflow/airflow-worker]"     # GKE: namespace/KSA
+gcloud storage buckets add-iam-policy-binding gs://my-bucket --member "serviceAccount:$GSA" --role roles/storage.objectAdmin
+gcloud projects add-iam-policy-binding my-project --member "serviceAccount:$GSA" --role roles/bigquery.jobUser
+bq add-iam-policy-binding --member "serviceAccount:$GSA" --role roles/bigquery.dataEditor my-project:raw
+```
+
+**Secrets, from Google Secret Manager.** Airflow's configuration (`airflow.cfg`, or the same as
+`AIRFLOW__SECRETS__BACKEND` / `AIRFLOW__SECRETS__BACKEND_KWARGS`, which hold no secret):
+
+```ini
+[secrets]
+backend = airflow.providers.google.cloud.secrets.secret_manager.CloudSecretManagerBackend
+backend_kwargs = {"connections_prefix": "airflow-connections", "sep": "-", "variables_prefix": null, "config_prefix": null, "project_id": "my-project"}
+```
+
+A conn_id `sf_rivet` is then the secret `airflow-connections-sf_rivet`, holding the Connection in
+Airflow's JSON form. Make each secret from a file or stdin, never from a command-line argument:
+
+```bash
+# Snowflake: the key file goes in whole (private_key_content), the login is the key's user
+jq -n --rawfile key rsa_key.p8 '{conn_type: "snowflake", login: "RIVET_LOADER",
+  extra: {account: "xy12345", role: "LOADER", warehouse: "LOAD_WH", database: "RAW", private_key_content: $key}}' |
+  gcloud secrets create airflow-connections-sf_rivet --data-file=-
+# ClickHouse and a source database: the password is read from the terminal, not typed into argv
+read -rs PW
+jq -n --rawfile pw /dev/stdin '{conn_type: "clickhouse", host: "ch.internal", port: 8443, login: "loader",
+  password: $pw, extra: {secure: true}}' < <(printf %s "$PW") | gcloud secrets create airflow-connections-ch_rivet --data-file=-
+jq -n --rawfile pw /dev/stdin '{conn_type: "postgres", host: "db.internal", port: 5432, login: "rivet_reader",
+  password: $pw, schema: "app", extra: {sslmode: "verify-full"}}' < <(printf %s "$PW") |
+  gcloud secrets create airflow-connections-pg_app --data-file=-
+```
+
+(`printf %s` is a shell builtin: the password is in no process's argv, and it gets no trailing newline.) The worker's identity reads these secrets only, through an IAM
+condition on the secret name (it needs the project NUMBER):
+
+```bash
+gcloud projects add-iam-policy-binding my-project --member "serviceAccount:$GSA" \
+  --role roles/secretmanager.secretAccessor \
+  --condition='title=airflow-connections,expression=resource.name.startsWith("projects/123456789012/secrets/airflow-connections-")'
+```
+
+The DAG names the same conn_ids whatever backend serves them:
+`connections=["gcp_rivet", "sf_rivet"]`, `env_from_connections={"PG_URL": "pg_app"}`.
+
+**What the operator does with a secret.** Inside `execute`, each try makes a private folder
+(`tempfile.mkdtemp`, mode `0700`, in the worker's temp directory); a key a Connection carries
+(`keyfile_dict`, `private_key_content`) and the Snowflake `config.toml` are written into it with
+mode `0600`, and the folder is removed in a `finally` when the try ends, whatever its outcome. A
+worker killed with SIGKILL runs no `finally`, and the folder stays in its temp directory. A
+password (ClickHouse, a database URL) is passed in the environment of the rivet process only, not
+of the worker: the same user and root can read it in `/proc/<pid>/environ` while rivet runs.
+
 ## Slack alerts
 
 **Setup guide: [docs/slack.md](docs/slack.md)** (the Slack app and its token, storing it,
@@ -763,6 +852,35 @@ cycle deleted left over (an incremental extract cannot see a delete); the CDC cu
 that DAG may not skip. `--sabotage warehouse-value` adds a cent to one BigQuery row after the delta load and must turn
 it red. The cleanup lists the dataset, schema and GCS prefix again and fails on anything left; the sweep of runs older
 than a day drops only names of the gate's own shape.
+
+**Connection legs.** Each stack runs with passwords made for it (32 random hex digits for the source, state,
+ClickHouse and metastore databases and the admin user) and a generated Fernet key, so no task log masks a word it
+carries: the cells `hygiene/no-masked-words` (no `***` in any task log) and `hygiene/fernet-key-set` (no
+`empty cryptography key` in the task or service logs) hold every stack to it. With the warehouse leg,
+`--connections env` (the default) passes the Connections as `AIRFLOW_CONN_*` variables in a `0600` env file, the
+worst place (see "Connections and secrets"); `--connections gsm` puts each one in Google Secret Manager as
+`airflow-connections-afgate_<tag>_<stack>_<conn_id>` and points the stack's `[secrets] backend` at it, with no
+`AIRFLOW_CONN_*` variable left. The backend runs as the service account `--gsm-reader` (default
+`afgate-secrets-reader@<project>.iam.gserviceaccount.com`, which holds `secretmanager.secretAccessor` only on
+names starting `airflow-connections-afgate_`), impersonated from the credential file `--gcp-keyfile` mounted
+read-only; the cells `connections/<conn_id>/from-secret-manager` require the variable absent from every Airflow
+container (`docker inspect`), no metastore row, the secret listed, and `airflow connections get` in the worker
+resolving the published fields. `--gcp-auth adc` leaves `gate_gcp` with only `project` and mounts the same
+file read-only at the containers' ADC path, so rivet runs as that identity (`connections/gate_gcp/keyless`).
+Local only: that file is the operator's own gcloud login, wider than a worker's identity; on GKE or Composer it is
+Workload Identity and no file exists. The cleanup deletes the stack's secrets and lists again; the sweep drops
+gate-shaped secrets older than a day. One-time setup of the project for `gsm`:
+
+```bash
+gcloud services enable secretmanager.googleapis.com iamcredentials.googleapis.com --project rivet-data-tool
+gcloud iam service-accounts create afgate-secrets-reader --project rivet-data-tool
+gcloud projects add-iam-policy-binding rivet-data-tool \
+  --member serviceAccount:afgate-secrets-reader@rivet-data-tool.iam.gserviceaccount.com \
+  --role roles/secretmanager.secretAccessor \
+  --condition='title=afgate-connections-only,expression=resource.name.startsWith("projects/1034205769011/secrets/airflow-connections-afgate_")'
+gcloud iam service-accounts add-iam-policy-binding afgate-secrets-reader@rivet-data-tool.iam.gserviceaccount.com \
+  --member user:<you> --role roles/iam.serviceAccountTokenCreator
+```
 
 rivet's own release gate does not run this gate: rivet has no hook for it. The `Live gate` workflow here runs it
 against a released binary, on demand and on an `airflow-v*` tag.

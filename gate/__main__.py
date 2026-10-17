@@ -1,5 +1,8 @@
 """python -m gate --rivet-bin <linux rivet> [--airflow 2.10.5,3.3.2] [--verdicts out.jsonl] [--keep] [--sabotage drop-delta-file|warehouse-value]
 
+With --warehouses: [--connections env|gsm] [--gcp-auth key|adc] choose where the stack's Connections live and how
+rivet authenticates to GCP; see "Connections and secrets" in the README.
+
 Exit 0 only when every cell ran and passed; each stack is torn down (volumes too) before and after it runs.
 """
 
@@ -14,9 +17,10 @@ import tempfile
 import time
 from pathlib import Path
 
+from . import conns as proofs
 from .scenario import TABLES, Verdicts, play
 from .stand import FLAVORS, Stand
-from .warehouse import TAG_SHAPE, WAREHOUSES, Cloud, Leg, connections, sweep
+from .warehouse import TAG_SHAPE, WAREHOUSES, Cloud, Leg, connections, delete_connections, publish_connections, sweep
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -38,6 +42,26 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--sf-database", default="RIVET_LOAD_TEST")
     ap.add_argument("--sf-integration", default="RIVET_GCS")
     ap.add_argument(
+        "--connections",
+        choices=["env", "gsm"],
+        default="env",
+        help="where the stack's Connections live: AIRFLOW_CONN_* variables, or Google Secret Manager as the secrets "
+        "backend (secrets airflow-connections-afgate_<tag>_<stack>_<conn_id>, deleted after the stack)",
+    )
+    ap.add_argument(
+        "--gcp-auth",
+        choices=["key", "adc"],
+        default="key",
+        help="key: gate_gcp carries the credential; adc: gate_gcp holds only `project`, and rivet runs as the "
+        "containers' identity (--gcp-keyfile mounted read-only where Google's default chain looks)",
+    )
+    ap.add_argument(
+        "--gsm-reader",
+        default="afgate-secrets-reader@{project}.iam.gserviceaccount.com",
+        help="service account the secrets backend impersonates (secretAccessor on airflow-connections-afgate_* only); "
+        "empty: the mounted credential reads the secrets itself",
+    )
+    ap.add_argument(
         "--sabotage",
         choices=["drop-delta-file", "warehouse-value"],
         help="break one output on purpose (a delta file; one BigQuery value after the load): the gate must go red",
@@ -58,6 +82,8 @@ def main(argv: list[str] | None = None) -> int:
     tag = args.tag or time.strftime("%m%d%H%M") + secrets.token_hex(2)
     if not TAG_SHAPE.fullmatch(tag):
         ap.error(f"--tag {tag!r} is not 8 digits and 4 lower-case hex digits (the shape the cloud sweep recognises)")
+    if not warehouses and (args.connections != "env" or args.gcp_auth != "key"):
+        ap.error("--connections gsm and --gcp-auth adc are legs of the warehouse leg: pass --warehouses")
     cloud = None
     if warehouses:
         keyfile = args.gcp_keyfile or Path.home() / ".config/gcloud/application_default_credentials.json"
@@ -71,25 +97,49 @@ def main(argv: list[str] | None = None) -> int:
             args.sf_database,
             args.sf_integration,
             tag,
+            gcp_auth=args.gcp_auth,
+            connections_from=args.connections,
+            gsm_reader=args.gsm_reader.format(project=args.bq_project),
         )
-        print(f"warehouse leg {list(warehouses)}, tag {tag}; swept: {sweep(cloud)}", flush=True)
+        print(
+            f"warehouse leg {list(warehouses)}, tag {tag}, connections {args.connections}, gcp auth {args.gcp_auth}; "
+            f"swept: {sweep(cloud)}",
+            flush=True,
+        )
     work = args.work or Path(tempfile.mkdtemp(prefix="rivet-airflow-gate-"))
     work.mkdir(parents=True, exist_ok=True)
     rows: list[dict[str, str]] = []
     for version in versions:
-        conns = connections(cloud) if cloud else {}
-        stand = Stand(version, args.rivet_bin.resolve(), work.resolve(), warehouses, conns, tag=tag)
+        gsm = cloud is not None and cloud.connections_from == "gsm"
+        stand = Stand(
+            version,
+            args.rivet_bin.resolve(),
+            work.resolve(),
+            warehouses,
+            tag=tag,
+            secrets_backend=cloud.secrets_backend(version) if gsm else None,
+            # The secrets backend and a keyless gate_gcp both run as the containers' identity: this file, read-only.
+            adc=cloud.keyfile.resolve() if cloud and (gsm or cloud.gcp_auth == "adc") else None,
+        )
         leg = Leg(cloud, version, TABLES, warehouses) if cloud else None
         verdicts = Verdicts(version)
         try:
-            verdicts.guard("stand-up", stand.up)
+            if cloud:
+                stand.extra_connections = verdicts.guard("connections", connections, cloud, stand.secrets.clickhouse) or {}
+            if gsm:
+                verdicts.guard("gsm-publish", publish_connections, cloud, version, stand.connections())
+            if not verdicts.rows:
+                verdicts.guard("stand-up", stand.up)
             if not verdicts.rows:
                 verdicts.guard("scenario", play, stand, verdicts, args.sabotage, leg)
+                verdicts.guard("proofs", proofs.prove, stand, verdicts, cloud)
         finally:
             if not args.keep:
                 verdicts.guard("teardown", stand.down)
                 if leg:
                     verdicts.guard("cloud-cleanup", leg.cleanup)
+                if gsm:
+                    verdicts.guard("gsm-cleanup", delete_connections, cloud, version)
         rows += verdicts.rows
     if not args.keep and args.work is None:
         shutil.rmtree(work, ignore_errors=True)
