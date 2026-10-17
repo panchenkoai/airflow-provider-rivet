@@ -10,6 +10,8 @@ GCS and BigQuery tasks that succeed ran as the identity the containers were give
 from __future__ import annotations
 
 import json
+import re
+import sys
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -88,13 +90,15 @@ def log_hygiene(texts: Mapping[str, str], word: str) -> list[str]:
 
 def parse_connection(stdout: str) -> dict[str, Any] | None:
     """The one Connection `airflow connections get <id> -o json` printed (lines before the JSON are skipped)."""
-    at = stdout.find("[")
-    if at < 0:
-        return None
-    try:
-        rows = json.loads(stdout[at:])
-    except json.JSONDecodeError:
-        return None
+    # A log line before the JSON may hold a `[` itself (Airflow 3: `... [info     ] Getting connection ...`), so the JSON
+    # is the first line that starts with one and decodes.
+    rows = None
+    for at in (m.start(1) for m in re.finditer(r"^\s*(\[)", stdout, re.M)):
+        try:
+            rows = json.JSONDecoder().raw_decode(stdout, at)[0]
+            break
+        except json.JSONDecodeError:
+            continue
     return rows[0] if isinstance(rows, list) and len(rows) == 1 and isinstance(rows[0], dict) else None
 
 
@@ -120,7 +124,10 @@ def container_envs(stand: Any) -> dict[str, list[str] | None]:
 def resolve(stand: Any, conn_id: str) -> dict[str, Any] | None:
     """The Connection as the worker's Airflow resolves it (secrets backend, variables, metastore, in that order)."""
     done = stand.compose("exec", "-T", "airflow-worker", "airflow", "connections", "get", conn_id, "-o", "json", check=False)
-    return parse_connection(done.stdout) if done.returncode == 0 else None
+    found = parse_connection(done.stdout) if done.returncode == 0 else None
+    if found is None:  # the cell says only "resolved nothing": the cause goes to the gate log (stderr only, no values)
+        print(f"connections get {conn_id}: exit {done.returncode}: {done.stderr.strip()[-2000:]}", file=sys.stderr)
+    return found
 
 
 def metastore_rows(stand: Any, conn_id: str) -> int:

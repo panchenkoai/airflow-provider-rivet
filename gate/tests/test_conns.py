@@ -231,3 +231,12 @@ def test_parse_connection_reads_the_cli_json_after_warnings() -> None:
     assert conns.parse_connection(out) == {"conn_id": "c", "host": "h", "extra_dejson": {}}
     assert conns.parse_connection("") is None
     assert conns.parse_connection("[]") is None
+
+
+def test_parse_connection_skips_a_log_line_that_holds_a_bracket() -> None:
+    """Airflow 3.3.2 logs a structlog line before the JSON; its `[info ]` was read as the JSON's start, so every
+    connection resolved from Secret Manager read as "resolved nothing" on the live gate."""
+    log = "2026-10-17 07:45:07 [info     ] Getting connection using `google.auth.default()` since no explicit credentials\n"
+    row = {"conn_id": "c", "host": "h"}
+    assert conns.parse_connection(log + json.dumps([row]) + "\n") == row
+    assert conns.parse_connection(log + json.dumps([row], indent=4) + "\n") == row
