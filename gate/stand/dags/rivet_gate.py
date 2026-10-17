@@ -87,8 +87,11 @@ for engine in filter(None, os.environ.get("GATE_SOURCES", "").split(",")):
     with open(shape_file) as handle:
         shape = json.load(handle)
     kwargs = {
-        "env_from_connections": {f"RIVET_GATE_{engine.upper()}_URL": f"rivet_gate_{engine}"},
-        "env": {"RIVET_STATE_URL": ""},
+        # The stack's PostgreSQL state: the one `rivet init` recorded the source's primary keys in.
+        "env_from_connections": {
+            f"RIVET_GATE_{engine.upper()}_URL": f"rivet_gate_{engine}",
+            "RIVET_STATE_URL": "rivet_gate_state",
+        },
         "connections": ["gate_gcp"],
     }
     batch = shape["batch"]["exports"]

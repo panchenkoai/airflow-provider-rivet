@@ -90,3 +90,38 @@ def test_sources_need_bigquery(capsys) -> None:
 
 def test_every_engine_is_known_by_name() -> None:
     assert sources.engines(["mysql"]) == (MYSQL,)
+
+
+def test_init_and_the_dags_of_a_source_leg_share_the_stacks_postgresql_state(tmp_path: Path) -> None:
+    stand = laid_out(tmp_path, sources=(MYSQL,))
+    conn = stand.connections()["rivet_gate_state"]
+    url = stand.state_url()
+    assert url.startswith("postgresql://") and "sslmode=require" in url
+    assert f"rivet:{conn['password']}@{conn['host']}:{conn['port']}/{conn['schema']}?" in url
+    dag = (Path(sources.__file__).parent / "stand" / "dags" / "rivet_gate.py").read_text()
+    block = dag[dag.index("for engine in") :]
+    assert '"RIVET_STATE_URL": "rivet_gate_state"' in block and '"RIVET_STATE_URL": ""' not in block
+
+
+def test_init_leaving_a_state_beside_the_config_fails_the_leg(tmp_path: Path, monkeypatch) -> None:
+    stand = laid_out(tmp_path, sources=(MYSQL,))
+    leg = SourceLeg(CLOUD, "2.10.5", MYSQL)
+    calls = []
+
+    def compose(*args, extra_env=None, **kw):
+        calls.append((args, extra_env))
+        if "airflow-worker" in args:
+            out = Path(str(stand.rivet_dir) + args[-1].removeprefix("/opt/rivet")).parent
+            (out / "rivet.yaml").write_text((FIXTURES / "init_mysql_batch_0.31.0.yaml").read_text())
+            (out / ".rivet_state.db").write_text("")
+
+    monkeypatch.setattr(stand, "compose", compose)
+    monkeypatch.setattr(SourceLeg, "wait_ready", lambda self, stand: None)
+    monkeypatch.setattr(SourceLeg, "sql", lambda self, stand, text: "")
+    monkeypatch.setattr(sources, "sh", lambda *a, **k: None)
+    monkeypatch.setattr(sources.warehouse, "_bq", lambda *a, **k: None)
+    with pytest.raises(RuntimeError, match=r"init left \['.rivet_state.db'\]"):
+        leg.prepare(stand)
+    [(args, env)] = [c for c in calls if "airflow-worker" in c[0]]
+    assert args[args.index("RIVET_STATE_URL") - 1] == "-e" and env["RIVET_STATE_URL"] == stand.state_url()
+    assert not [a for a in args if "://" in a], "no URL on the exec command line"
