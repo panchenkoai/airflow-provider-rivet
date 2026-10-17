@@ -199,11 +199,12 @@ def slack_failure_callback(
             payload = ti.xcom_pull(task_ids=ti.task_id, key=XCOM_KEY, map_indexes=map_index)
         except Exception:
             payload = None  # pragma: no mutate - any non-dict here is dropped two lines below, `""` alike
+        log_url = getattr(ti, "log_url", "") or ""  # pragma: no mutate - a `None` default is caught by `or ""`
         alert = _Alert(
             dag_id=ti.dag_id,
             task=ti.task_id + (f"[{map_index}]" if isinstance(map_index, int) and map_index >= 0 else ""),
             run_id=str(context.get("run_id") or getattr(ti, "run_id", "")),
-            log_url=getattr(ti, "log_url", "") or "",  # pragma: no mutate - a `None` default is caught by `or ""`
+            log_url=log_url,
             payload=payload if isinstance(payload, dict) else None,
             exception=context.get("exception"),
         )
