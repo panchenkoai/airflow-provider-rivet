@@ -104,6 +104,8 @@ class TaskLog:
         tries = f"try {try_number} of {max_tries + 1}"
         will_retry = try_number <= max_tries
         retry_text = f"Airflow retries it ({tries})" if will_retry else f"no try left ({tries})"
+        # A failure Airflow will not try again is the task's end: ERROR, also when rivet called it retryable.
+        retry_level = logging.WARNING if will_retry else logging.ERROR
         units = [u for u in payload.get("units") or [] if isinstance(u, dict)]
         error = payload.get("error") or {}
         lines: list[tuple[int, str]] = []
@@ -118,7 +120,7 @@ class TaskLog:
             wait = self._first("rivet.lock.wait") or {}
             lines.append(
                 (
-                    logging.WARNING,
+                    retry_level,
                     f"{head} BUSY [{payload['busy']}]: the lock of {wait.get('unit')} stayed held for "
                     f"{wait.get('lock_wait')} s; rivet was not started, {retry_text}",
                 )
@@ -126,7 +128,7 @@ class TaskLog:
         elif payload.get("decision") == "success":
             lines.append((logging.INFO, self._success(head, units, payload, seconds)))
         else:
-            lines.append(self._failure(head, error, payload, units, retry_text, stop_requested))
+            lines.append(self._failure(head, error, payload, units, retry_text, retry_level, stop_requested))
         lines += self._step_lines()
         if len(units) > 1 or (payload.get("decision") != "success" and units and units[0].get("status") == "failed"):
             lines += self._unit_lines(units)
@@ -161,6 +163,7 @@ class TaskLog:
         payload: dict[str, Any],
         units: list[dict[str, Any]],
         retry_text: str,
+        retry_level: int,
         stop_requested: bool,
     ) -> tuple[int, str]:
         """`REFUSED [CODE], final, action: ...`; a retried failure says it is retried."""
@@ -170,7 +173,7 @@ class TaskLog:
             if stop_requested:
                 return logging.WARNING, f"{head} STOPPED by Airflow: rivet ended by {how}"
             if payload.get("crashed_retry"):
-                return logging.WARNING, f"{head} CRASHED: rivet ended by {how}; {retry_text} under the crash budget"
+                return retry_level, f"{head} CRASHED: rivet ended by {how}; {retry_text} under the crash budget"
             return logging.ERROR, f"{head} CRASHED: rivet ended by {how}, final: the crash budget is used up"
         word = STOP_WORD.get(class_, "FAILED")
         parts = [word + (f" [{error['code']}]" if error.get("code") else "")]
@@ -183,7 +186,7 @@ class TaskLog:
         failed = [u for u in units if u.get("status") == "failed"]
         runs = [u["run_id"] for u in failed if isinstance(u.get("run_id"), str)]
         run = f" (run {runs[0]})" if len(runs) == 1 else ""
-        return (logging.WARNING if retried else logging.ERROR), f"{head} {', '.join(parts)}{run}"
+        return (retry_level if retried else logging.ERROR), f"{head} {', '.join(parts)}{run}"
 
     def _step_lines(self) -> list[tuple[int, str]]:
         """One line per rivet process the task started, and one for a sealed plan an earlier try made."""
