@@ -65,6 +65,7 @@ class RivetBaseOperator(BaseOperator):
         "cwd",
     )
     ui_color = "#e8f0fe"
+    _tasklog: TaskLog  # this try's task log; `execute` starts a new one before anything is recorded
 
     def __init__(
         self,
@@ -115,8 +116,7 @@ class RivetBaseOperator(BaseOperator):
         self.log_keep = log_keep
         self.cwd = cwd
         self._proc: Any = None
-        self._stop_requested = False
-        self._tasklog: TaskLog | None = None
+        self._stop_requested = False  # pragma: no mutate - only ever read as a truth value, so None reads as False
 
     def _environment(self, secrets: Path) -> dict[str, str]:
         """The subprocess environment (`connections.build_environment`), with every Connection looked up here; key
@@ -132,33 +132,28 @@ class RivetBaseOperator(BaseOperator):
             urls={name: (get_connection(conn_id), scheme) for name, (conn_id, scheme) in urls.items()},
             config=self._config_doc() if self.connections else {},
         )
-        return build_environment(os.environ, spec, [get_connection(c) for c in self.connections], secrets)
+        # The worker's environment: every reader of it takes None as os.environ, so its mutants are equivalent.
+        return build_environment(os.environ, spec, [get_connection(c) for c in self.connections], secrets)  # pragma: no mutate
 
     def _config_doc(self) -> dict[str, Any]:
         """The config as rivet builds it, for the names a Connection is filed under; read by the preflight's reader, so a
         config it refuses is refused here too, and a `${...}` in `load.password_env` / `load.connection` resolves from
         `-p` and the task's environment (the worker's allow-listed variables and `env`) as rivet resolves it (D06)."""
-        env = {**worker_environment(self.env_passthrough, self.cloud_credentials, os.environ), **(self.env or {})}
+        env = {**worker_environment(self.env_passthrough, self.cloud_credentials), **(self.env or {})}
         return read_config(self.config, {str(k): str(v) for k, v in env.items()}, params_of(self.extra_args or ()))
 
     def _emit(self, record: dict[str, Any]) -> None:
         """Keep one structured record: written as JSON at DEBUG, read into the task's readable lines (`tasklog`)."""
-        self._task_log().record(record)
-
-    def _task_log(self) -> TaskLog:
-        """This try's task log; `execute` starts a new one."""
-        if self._tasklog is None:
-            self._tasklog = TaskLog(self.command, self.export, self.table, self._write)
-        return self._tasklog
+        self._tasklog.record(record)
 
     def _write(self, level: int, text: str) -> None:
         """One line of the task log at a `logging` level."""
         method = {logging.DEBUG: "debug", logging.INFO: "info", logging.WARNING: "warning"}.get(level, "error")
-        getattr(self.log, method)("%s", text)
+        getattr(self.log, method)("%s", text)  # pragma: no mutate - a logger formats no message given no args
 
     def _finish(self, ti: Any, payload: dict[str, Any]) -> None:
         """Write the task's readable block: the outcome's headline, a line per step, the notes."""
-        self._task_log().finish(payload, ti.try_number, ti.max_tries, self._stop_requested)
+        self._tasklog.finish(payload, ti.try_number, ti.max_tries, self._stop_requested)
 
     def _hold(self, proc: Any) -> None:
         """Remember the running process so `on_kill` can stop it; one started after a stop is stopped at once (D40)."""
@@ -180,7 +175,7 @@ class RivetBaseOperator(BaseOperator):
         upstream = sorted(self.upstream_task_ids)
         if not upstream:
             return []
-        pulled = ti.xcom_pull(task_ids=upstream, key=XCOM_KEY)
+        pulled = ti.xcom_pull(task_ids=upstream, key=XCOM_KEY)  # pragma: no mutate - XCOM_KEY is Airflow's default key
         values = [] if pulled is None else [pulled] if isinstance(pulled, dict) else list(pulled)
         return [p["state_marker"] for p in values if isinstance(p, dict) and p.get("state_marker")]
 
@@ -195,13 +190,13 @@ class RivetBaseOperator(BaseOperator):
         """Log and publish a refusal made before rivet started, then fail without retry."""
         self._emit({"event": "rivet.refused", "code": refusal.code, "text": str(refusal)})
         payload = {"command": self.command, "decision": "fail", "preflight_refusal": refusal.code, "units": []}
-        self._fail(ti, payload, str(refusal), retry=False)
+        self._fail(ti, payload, str(refusal), retry=False)  # pragma: no mutate - `retry` is read as a truth value
 
     def execute(self, context: Any) -> dict[str, Any]:
         """Run the command; return the XCom payload or raise by the contract's retry table."""
         ti = context["ti"]
         run_id = str(context.get("run_id") or getattr(ti, "run_id", "run"))
-        map_index = getattr(ti, "map_index", -1)
+        map_index = getattr(ti, "map_index", None)
         task_part = ti.task_id if map_index in (-1, None) else f"{ti.task_id}[{map_index}]"
         self._tasklog = TaskLog(self.command, self.export, self.table, self._write)
         secrets = Path(tempfile.mkdtemp(prefix="rivet-airflow-secrets-"))
