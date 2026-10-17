@@ -361,7 +361,7 @@ def run_fetch(tmp_path: Path, assets: list[str], given: str = "") -> list[str]:
         f.chmod(0o755)
     script = fetch_script().replace("${{ inputs.rivet }}", given)
     env = {**os.environ, "PATH": f"{bin_dir}:{os.environ['PATH']}", "GH_TOKEN": "x"}
-    subprocess.run(["bash", "-euo", "pipefail", "-c", script], cwd=tmp_path, env=env, check=True, capture_output=True)
+    subprocess.run(["bash", "-euo", "pipefail", "-c", script], cwd=tmp_path, env=env, check=True, capture_output=True, text=True)
     assert (tmp_path / "rivet-bin").exists()
     return log.read_text().splitlines()
 
@@ -380,9 +380,11 @@ def test_d17_the_glibc228_asset_is_downloaded_when_the_release_has_one(tmp_path:
 
 
 @pytest.mark.skipif(shutil.which("bash") is None, reason="needs bash")
-def test_d17_a_release_without_the_glibc228_asset_takes_the_binary_from_the_ghcr_image(tmp_path: Path) -> None:
-    """D17: 0.31.0 has no glibc 2.28 asset; its ghcr.io image (Debian bookworm) carries a binary that starts there."""
-    calls = run_fetch(tmp_path, ["rivet-v0.31.0-x86_64-unknown-linux-gnu.tar.gz"], given="0.31.0")
-    assert not any(c.startswith("gh release download") for c in calls), calls
-    assert any(c.startswith("docker create") and "ghcr.io/panchenkoai/rivet:v0.31.0" in c for c in calls), calls
-    assert any(c.startswith("docker cp") and ":/usr/local/bin/rivet" in c for c in calls), calls
+@pytest.mark.parametrize("given", ["0.31.0", "v0.4.0", ""])  # "": the latest release, v0.31.0 in the fake
+def test_a_release_older_than_0_32_is_refused_before_anything_is_downloaded(tmp_path: Path, given: str) -> None:
+    """The provider reads `apply --summary-output` and `already_applied` (rivet 0.32): an older binary is refused."""
+    with pytest.raises(subprocess.CalledProcessError) as refused:
+        run_fetch(tmp_path, ["rivet-v0.31.0-x86_64-unknown-linux-gnu.tar.gz"], given=given)
+    assert "is older than the minimum v0.32.0" in refused.value.stdout
+    calls = (tmp_path / "calls").read_text().splitlines() if (tmp_path / "calls").exists() else []
+    assert not any(c.startswith(("gh release download", "docker")) for c in calls), calls
