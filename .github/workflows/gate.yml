@@ -34,6 +34,11 @@ jobs:
           tag="${{ inputs.rivet }}"
           [ -n "$tag" ] || tag=$(gh release view -R panchenkoai/rivet --json tagName -q .tagName)
           case "$tag" in v*) ;; *) tag="v$tag" ;; esac
+          # The provider's contract needs rivet 0.32 (`apply --summary-output`, `already_applied`): an older binary is refused.
+          min=v0.32.0
+          if [ "$(printf '%s\n' "$min" "$tag" | sort -V | head -1)" != "$min" ]; then
+            echo "::error::rivet $tag is older than the minimum $min the gate runs against"; exit 1
+          fi
           asset="rivet-$tag-x86_64-unknown-linux-gnu-glibc2.28.tar.gz"
           if gh release view "$tag" -R panchenkoai/rivet --json assets -q '.assets[].name' | grep -qxF "$asset"; then
             gh release download "$tag" -R panchenkoai/rivet -p "$asset" -D rivet-dl
