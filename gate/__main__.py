@@ -1,4 +1,4 @@
-"""python -m gate --rivet-bin <linux rivet> [--airflow 2.10.5,3.3.2] [--verdicts out.jsonl] [--keep] [--sabotage drop-delta-file|warehouse-value]
+"""python -m gate --rivet-bin <linux rivet> [--airflow 2.10.5,3.3.2] [--sources mysql] [--verdicts out.jsonl] [--keep] [--sabotage drop-delta-file|warehouse-value]
 
 With --warehouses: [--connections env|gsm] [--gcp-auth key|adc] choose where the stack's Connections live and how
 rivet authenticates to GCP; see "Connections and secrets" in the README.
@@ -18,6 +18,7 @@ import time
 from pathlib import Path
 
 from . import conns as proofs
+from . import sources
 from .scenario import TABLES, Verdicts, play
 from .stand import FLAVORS, Stand
 from .warehouse import TAG_SHAPE, WAREHOUSES, Cloud, Leg, connections, delete_connections, publish_connections, sweep
@@ -31,6 +32,12 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--verdicts", type=Path, help="write one JSON line per graded cell")
     ap.add_argument("--keep", action="store_true", help="leave the stacks up and the working directory in place")
     ap.add_argument("--warehouses", default="", help="comma-separated: bigquery,snowflake,clickhouse (the warehouse leg)")
+    ap.add_argument(
+        "--sources",
+        default="",
+        help=f"comma-separated source legs beside postgres ({','.join(sources.ENGINES)}): each to GCS and BigQuery on the "
+        "configs `rivet init` writes; needs --warehouses",
+    )
     ap.add_argument("--gcp-keyfile", type=Path, help="GCP credential JSON for the gate_gcp Connection (service account or ADC)")
     ap.add_argument("--gcs-bucket", default="rivet_data_test")
     ap.add_argument("--bq-project", default="rivet-data-tool")
@@ -79,6 +86,11 @@ def main(argv: list[str] | None = None) -> int:
     warehouses = tuple(w for w in args.warehouses.split(",") if w)
     if set(warehouses) - set(WAREHOUSES):
         ap.error(f"unknown warehouse(s) {sorted(set(warehouses) - set(WAREHOUSES))}; known: {list(WAREHOUSES)}")
+    engines = tuple(e for e in args.sources.split(",") if e)
+    if set(engines) - set(sources.ENGINES):
+        ap.error(f"unknown source(s) {sorted(set(engines) - set(sources.ENGINES))}; known: {list(sources.ENGINES)}")
+    if engines and "bigquery" not in warehouses:
+        ap.error("--sources loads into BigQuery: pass --warehouses with bigquery")
     tag = args.tag or time.strftime("%m%d%H%M") + secrets.token_hex(2)
     if not TAG_SHAPE.fullmatch(tag):
         ap.error(f"--tag {tag!r} is not 8 digits and 4 lower-case hex digits (the shape the cloud sweep recognises)")
@@ -103,7 +115,7 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(
             f"warehouse leg {list(warehouses)}, tag {tag}, connections {args.connections}, gcp auth {args.gcp_auth}; "
-            f"swept: {sweep(cloud)}",
+            f"swept: {sweep(cloud) + sources.sweep(cloud)}",
             flush=True,
         )
     work = args.work or Path(tempfile.mkdtemp(prefix="rivet-airflow-gate-"))
@@ -120,8 +132,10 @@ def main(argv: list[str] | None = None) -> int:
             secrets_backend=cloud.secrets_backend(version) if gsm else None,
             # The secrets backend and a keyless gate_gcp both run as the containers' identity: this file, read-only.
             adc=cloud.keyfile.resolve() if cloud and (gsm or cloud.gcp_auth == "adc") else None,
+            sources=sources.engines(engines),
         )
         leg = Leg(cloud, version, TABLES, warehouses) if cloud else None
+        src_legs = sources.legs(cloud, version, engines)
         verdicts = Verdicts(version)
         try:
             if cloud:
@@ -131,13 +145,15 @@ def main(argv: list[str] | None = None) -> int:
             if not verdicts.rows:
                 verdicts.guard("stand-up", stand.up)
             if not verdicts.rows:
-                verdicts.guard("scenario", play, stand, verdicts, args.sabotage, leg)
+                verdicts.guard("scenario", play, stand, verdicts, args.sabotage, leg, src_legs)
                 verdicts.guard("proofs", proofs.prove, stand, verdicts, cloud)
         finally:
             if not args.keep:
                 verdicts.guard("teardown", stand.down)
                 if leg:
                     verdicts.guard("cloud-cleanup", leg.cleanup)
+                for src in src_legs:
+                    verdicts.guard(f"cloud-cleanup/{src.engine.name}", src.cleanup)
                 if gsm:
                     verdicts.guard("gsm-cleanup", delete_connections, cloud, version)
         rows += verdicts.rows
