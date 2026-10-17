@@ -322,7 +322,7 @@ class _Session:
         task process dies first; on Linux it gets SIGTERM when the task process dies (G2). `on_start` gets its pid."""
         if self.stopped is not None and self.stopped():
             raise Stopped(name)
-        self.argvs.append(argv)
+        self.argvs.append(argv)  # pragma: no mutate - `Outcome.argv` is never read
         stderr_path = self.logs / f"{self.log_name}.{name}.stderr.log"
         stdout_path = stdout_to or self.logs / f"{self.log_name}.{name}.stdout.log"
         self.emit({"event": "rivet.start", "step": name, "argv": argv, "stderr_path": str(stderr_path)})
@@ -902,7 +902,7 @@ def _run_units(s: _Session, step: _Step, summary: Any, error: ErrorObject | None
     units = []
     for entry in entries:
         name, status = s.malformed(entry.get("export_name"), str), s.status(entry.get("status"))
-        unit_error = None
+        unit_error = None  # pragma: no mutate - a unit not failed is read by its status, its error by truthiness
         if status == "failed":
             shared = error or error_from_exit(step.exit_status, step.signal)
             unit_error = s.unit_error(step, entry.get("error"), name, None, shared)
@@ -1006,7 +1006,7 @@ def _metrics_rows(s: _Session, cfg: str, export: str, last: int) -> tuple[_Step,
     out = s.work / f"{s.name}.metrics.json"
     step = s.step("metrics", argv, stdout_to=out)
     rows = _read_json(out)
-    out.unlink(missing_ok=True)
+    out.unlink(missing_ok=True)  # pragma: no mutate - `step` opened this file before rivet started: it exists
     if step.exit_status != 0 or not isinstance(rows, list):
         return step, []
     return step, [row for row in rows if isinstance(row, dict)]
@@ -1131,7 +1131,7 @@ def _load(s: _Session) -> Outcome:
         if table and row.get("table") != table:
             continue
         name, of, status = s.malformed(row.get("export"), str), s.malformed(row.get("table"), str), s.status(row.get("status"))
-        unit_error = None
+        unit_error = None  # pragma: no mutate - a unit not failed is read by its status, its error by truthiness
         if status == "failed":
             shared = error or error_from_exit(step.exit_status, step.signal)
             unit_error = s.unit_error(step, row.get("error"), name, of, shared)
@@ -1201,7 +1201,7 @@ def crashed_retry_allowed(ledger: Path | None, try_number: int, max_tries: int, 
     except (OSError, PreflightRefusal) as exc:
         return False, f"crashed ledger {ledger} cannot be written ({type(exc).__name__}): no crash retry is granted"
     except ValueError:
-        seen = None
+        seen = None  # pragma: no mutate - "" fails the list check below exactly as None does
     pairs = isinstance(seen, list) and all(isinstance(e, list) and len(e) == 2 and all(type(n) is int for n in e) for e in seen)
     if not pairs:
         return False, f"crashed ledger {ledger} is unreadable: no crash retry is granted until it is deleted"
