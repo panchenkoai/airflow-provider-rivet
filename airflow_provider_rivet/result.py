@@ -15,7 +15,9 @@ CLASS_BY_EXIT = {
 }
 CLASSES = frozenset(CLASS_BY_EXIT.values()) | {"crashed"}
 STOP_RANK = ("crashed", "generic", "retryable", "schema_drift", "refusal", "internal", "data_integrity")
-STATUSES = frozenset({"success", "failed", "skipped", "loaded", "compacted"})
+# `already_applied` (rivet >= 0.32, ADR-0039 D3): an apply that replayed a point-in-time plan rivet had already applied
+# answers with the run that applied it (`run_id` == `answered_by_run`) and extracts nothing.
+STATUSES = frozenset({"success", "failed", "skipped", "loaded", "compacted", "already_applied"})
 # rivet's refusals of a second holder of one lease (exit 5, refusal): their remedy is "wait for the holder to end, then
 # repeat", which is what an Airflow retry does, so they are retried whatever the printed `retryable` says (G2).
 BUSY_CODES = frozenset({"RIVET_STATE_RUN_IN_PROGRESS", "RIVET_LOAD_TABLE_BUSY"})

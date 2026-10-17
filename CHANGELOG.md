@@ -44,6 +44,10 @@ Changed before the first release, after review (see the README sections named):
   `RIVET_PLAN_ARTIFACT_STALE` (a failed task, its load skipped). The task records the apply it
   starts beside the sealed plan and, on a retry, takes the run rivet's state shows for that
   process as its result (`rivet.apply.already_applied`). ("Retries")
+- rivet 0.32's own answer to a replay of an applied point-in-time plan (`per_export[].status:
+  already_applied`, the answering run's `run_id` and counts) is a success with that run's unit,
+  logged like the provider's own find; the word read as `failed` before. The contract test now
+  requires every status word of rivet's `run_entry_*.json` fixtures to be known.
 - Two tries of one export no longer run rivet at once: every task but `plan` holds a per-export
   (per-table for a load with `--table`) lock file whose descriptor rivet inherits, so a rivet that
   outlives its task keeps it; a task that finds it held for `lock_wait` seconds starts no rivet and

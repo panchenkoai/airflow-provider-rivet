@@ -9,7 +9,7 @@ import pytest
 from conftest import FIXTURES, PACKAGE_ROOT, fixture
 
 from airflow_provider_rivet.capabilities import DEGRADATIONS
-from airflow_provider_rivet.result import CLASSES, ErrorObject, UnitResult, error_from_exit, error_from_line
+from airflow_provider_rivet.result import CLASSES, STATUSES, ErrorObject, UnitResult, error_from_exit, error_from_line
 
 
 def full(error: ErrorObject) -> dict:
@@ -21,6 +21,15 @@ def test_the_fixture_directory_is_the_repo_contract() -> None:
     assert (FIXTURES / "xcom_unit.json").is_file(), (
         f"contract fixtures not found at {FIXTURES}: set RIVET_SRC to a rivet checkout"
     )
+
+
+def test_every_status_word_of_rivets_run_entries_is_known() -> None:
+    """A word outside STATUSES reads as `failed`: `already_applied` (rivet 0.32, #623) would have failed a task whose
+    plan rivet had applied. Each `run_entry_*.json` of the pinned contract must carry a word the provider knows."""
+    words = {fixture(p.name)["status"] for p in FIXTURES.glob("run_entry*.json")}
+    assert "already_applied" in words and words <= STATUSES, words - STATUSES
+    answered = fixture("run_entry_already_applied.json")
+    assert answered["answered_by_run"] == answered["run_id"]
 
 
 def test_a_failed_run_entry_becomes_the_pinned_xcom_unit() -> None:
