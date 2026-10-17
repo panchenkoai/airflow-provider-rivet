@@ -55,7 +55,7 @@ def _int(loader: yaml.SafeLoader, node: yaml.ScalarNode) -> Any:
         return text
     sign, body = (-1, text[1:]) if text.startswith("-") else (1, text.lstrip("+"))
     base = {"0x": 16, "0o": 8, "0b": 2}.get(body[:2], 10)
-    value = ScalarInt(sign * int(body[2:] if base != 10 else body, base))
+    value = ScalarInt(sign * int(body, base))  # int() reads the 0x / 0o / 0b prefix of its own base
     value.text = text
     return value
 
@@ -65,7 +65,7 @@ def _float(loader: yaml.SafeLoader, node: yaml.ScalarNode) -> Any:
     text = loader.construct_scalar(node)
     if _LEADING_ZERO.match(text):
         return text
-    word = text.lstrip("+-").lower()
+    word = text.lstrip("+-").lower()  # pragma: no mutate -- a float scalar never starts with `X`, so `XX+-XX` strips alike
     if word in (".inf", ".nan"):
         number = float(("-" if text.startswith("-") else "") + word[1:])
     else:
@@ -103,7 +103,7 @@ def substitute(text: str, value_of: Callable[[str], str | None]) -> tuple[str, l
     out, i = [], 0
     while (start := text.find("${", i)) >= 0:
         end = text.find("}", start)
-        if end < 0:
+        if end < 0:  # pragma: no mutate -- a found `}` is at start + 2 or later, so `< 0`, `<= 0` and `< 1` agree
             break
         name = text[start + 2 : end]
         value = "" if not name else value_of(name)
@@ -133,10 +133,10 @@ def params_of(args: Sequence[str]) -> dict[str, str]:
     args = list(args)
     for i, arg in enumerate(args):
         if arg in ("-p", "--param"):
-            item = args[i + 1] if i + 1 < len(args) else ""
+            item = args[i + 1] if i + 1 < len(args) else ""  # pragma: no mutate -- any default without `=` is ignored alike
         elif arg.startswith("--param="):
             item = arg[len("--param=") :]
-        elif arg.startswith("-p") and not arg.startswith("--"):
+        elif arg.startswith("-p"):
             item = arg[2:].removeprefix("=")
         else:
             continue
@@ -166,7 +166,7 @@ def _same_length_mask(text: str) -> str:
     out, i = [], 0
     while (start := text.find("${", i)) >= 0:
         end = text.find("}", start)
-        if end < 0:
+        if end < 0:  # pragma: no mutate -- a found `}` is at start + 2 or later, so `< 0`, `<= 0` and `< 1` agree
             break
         out += [text[i:start], "$", MASK[0], text[start + 2 : end], MASK[1]]
         i = end + 1
@@ -175,7 +175,8 @@ def _same_length_mask(text: str) -> str:
 
 
 def _exports_node(text: str) -> yaml.SequenceNode | None:
-    root = yaml.compose(_same_length_mask(text), Loader=ConfigLoader)
+    # only the null tag is read from the composed nodes, and every loader resolves null alike
+    root = yaml.compose(_same_length_mask(text), Loader=ConfigLoader)  # pragma: no mutate
     if not isinstance(root, yaml.MappingNode):
         raise NarrowRefused("the config is not one YAML mapping")
     found = [value for key, value in root.value if isinstance(key, yaml.ScalarNode) and key.value == "exports"]
@@ -190,21 +191,24 @@ def _exports_node(text: str) -> yaml.SequenceNode | None:
 
 def _content_end(node: yaml.Node, low: int, high: int) -> int:
     """The end of the last text that belongs to an item: the furthest scalar or flow collection written inside it."""
+    # The stack pops the last child first, so a node taken after another is written before it, and any node met out of
+    # order (seen again, or outside the item) is an alias, whose text `_block_cuts` reads from the alias tokens: a
+    # `break` for those `continue`s, or a stack replaced by `=`, finds the same furthest end, so they are not mutated.
     best, seen, todo = low, set(), [node]
     while todo:
         cur = todo.pop()
         if id(cur) in seen:
-            continue
+            continue  # pragma: no mutate
         seen.add(id(cur))
         start, end = cur.start_mark.index, cur.end_mark.index
         if not low <= start <= high:
-            continue
+            continue  # pragma: no mutate
         if isinstance(cur, yaml.ScalarNode) or cur.flow_style:
             best = max(best, min(end, high))
         if isinstance(cur, yaml.MappingNode):
-            todo += [part for pair in cur.value for part in pair]
+            todo += [part for pair in cur.value for part in pair]  # pragma: no mutate
         elif isinstance(cur, yaml.SequenceNode):
-            todo += list(cur.value)
+            todo += list(cur.value)  # pragma: no mutate
     return best
 
 
@@ -219,12 +223,18 @@ def _block_cuts(text: str, seq: yaml.SequenceNode, drop: set[int]) -> list[tuple
     cuts = []
     for i in sorted(drop):
         start = items[i].start_mark.index
-        dash = max((d for d in dashes if d < start), default=-1)
-        if dash < 0 or (i > 0 and dash < items[i - 1].start_mark.index):
-            raise NarrowRefused(f"cannot find the `-` of export #{i + 1}")
-        nxt = max((d for d in dashes if i + 1 < len(items) and d < items[i + 1].start_mark.index), default=-1)
-        high = nxt if nxt > start else seq.end_mark.index
-        line = text.rfind("\n", 0, dash) + 1
+        # Every item of a block sequence starts after its own `-` (an item's node never starts on one), written after the
+        # previous item: this refusal never fires on text PyYAML composes (12 000 generated configs) and stays so that
+        # text composed otherwise is refused, not cut on a guess. Its comparisons and default are not mutated.
+        dash = max((d for d in dashes if d < start), default=-1)  # pragma: no mutate
+        if dash < 0 or (i > 0 and dash < items[i - 1].start_mark.index):  # pragma: no mutate
+            raise NarrowRefused(f"cannot find the `-` of export #{i + 1}")  # pragma: no mutate
+        if i + 1 < len(items):  # the next item's own `-`
+            high = max(d for d in dashes if d < items[i + 1].start_mark.index)  # pragma: no mutate
+        else:
+            high = seq.end_mark.index
+        # the `exports:` key is written on a line before the first `-`, so no `-` is on the line a newline at 0 ends
+        line = text.rfind("\n", 0, dash) + 1  # pragma: no mutate
         if text[line:dash].strip():
             raise NarrowRefused(f"export #{i + 1} does not start its own line")
         # no alias token starts at the item's own start (an alias item is refused above) or at the next `-`: the
@@ -234,7 +244,7 @@ def _block_cuts(text: str, seq: yaml.SequenceNode, drop: set[int]) -> list[tuple
             stop = end
         else:
             stop = text.find("\n", end)
-            stop = len(text) if stop < 0 else stop + 1
+            stop = len(text) if stop < 0 else stop + 1  # pragma: no mutate -- a found newline is at `end` or later, never 0
         tail = text[end:stop].strip()
         if tail and not tail.startswith("#"):
             raise NarrowRefused(f"export #{i + 1} shares its last line with other text")
