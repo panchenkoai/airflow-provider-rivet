@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -268,3 +269,25 @@ def test_without_connections_the_binary_is_checked_before_the_config_is_read(rig
     exc, ti = rig.run(rig.operator(RivetRunOperator, export="orders", config=str(rig.tmp / "missing.yaml")))
     assert isinstance(exc, AirflowFailException)
     assert ti.store[("task", "return_value")]["preflight_refusal"] == "RIVET_AIRFLOW_BINARY_TOO_OLD"
+
+
+@pytest.mark.parametrize(
+    ("variable", "kwargs"),
+    [("CH_PW_VAR", {"env_passthrough": ["CH_PW_VAR"]}), ("AWS_CH_PW_VAR", {"cloud_credentials": ["aws"]})],
+    ids=["env_passthrough", "cloud_credentials"],
+)
+def test_a_load_name_resolves_from_the_workers_variables_the_task_passes(
+    rig: Rig, monkeypatch: pytest.MonkeyPatch, variable: str, kwargs: dict
+) -> None:
+    """_config_doc 4, 5: `load.password_env: ${VAR}` resolves from a worker variable the task passes to rivet, by
+    `env_passthrough` or by a cloud's variables, as rivet resolves it; the Connection's password goes where it names."""
+    ch = SimpleNamespace(
+        conn_id="ch", conn_type="clickhouse", login="loader", password="pw", host="ch", port=None, schema=None, extra_dejson={}
+    )
+    monkeypatch.setattr(operators.BaseHook, "get_connection", lambda conn_id: ch)
+    monkeypatch.setenv(variable, "CH_PASSWORD")
+    rig.config.write_text(rig.config.read_text() + f"load:\n  target: clickhouse\n  password_env: ${{{variable}}}\n")
+    rig.scenario(record_env=["CH_PASSWORD"], leak_env=[])
+    payload, _ = rig.run(rig.operator(RivetRunOperator, export="orders", connections=["ch"], **kwargs))
+    assert isinstance(payload, dict), payload
+    assert rig.calls()[-1]["env"]["CH_PASSWORD"] == "pw"
