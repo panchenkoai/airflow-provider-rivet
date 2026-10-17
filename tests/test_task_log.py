@@ -275,7 +275,7 @@ def test_golden_transient_failure_says_it_is_retried(rig: Rig, log: Recorder) ->
     ]
     log.lines.clear()
     rig.run(rig.operator(RivetRunOperator, export="orders"), FakeTI(try_number=3, max_tries=2))
-    assert log.shown()[0] == "WARNING rivet run orders → FAILED [RIVET_SOURCE_CONNECT], retryable, no try left (try 3 of 3)"
+    assert log.shown()[0] == "ERROR rivet run orders → FAILED [RIVET_SOURCE_CONNECT], retryable, no try left (try 3 of 3)"
 
 
 def test_golden_crashed_by_a_signal(rig: Rig, log: Recorder) -> None:

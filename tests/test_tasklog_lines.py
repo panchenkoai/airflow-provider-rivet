@@ -67,7 +67,26 @@ def test_a_retried_failure_on_the_last_try_before_the_final_one_says_airflow_ret
     lines = render(log, {"decision": "retry", "error": error, "units": []}, try_number=2, max_tries=2)
     assert lines[0] == (WARNING, "rivet apply orders → FAILED [RIVET_NET], retryable, Airflow retries it (try 2 of 3)")
     lines = render(log, {"decision": "retry", "error": error, "units": []}, try_number=3, max_tries=2)
-    assert lines[0] == (WARNING, "rivet apply orders → FAILED [RIVET_NET], retryable, no try left (try 3 of 3)")
+    assert lines[0] == (ERROR, "rivet apply orders → FAILED [RIVET_NET], retryable, no try left (try 3 of 3)")
+
+
+@pytest.mark.parametrize(
+    ("payload", "headline"),
+    [
+        (
+            {"decision": "retry_crashed", "crashed_retry": True, "signal": 9, "units": []},
+            "rivet apply orders → CRASHED: rivet ended by signal 9; no try left (try 3 of 3) under the crash budget",
+        ),
+        ({"busy": "RIVET_AIRFLOW_EXPORT_BUSY", "units": []}, "rivet apply orders → BUSY [RIVET_AIRFLOW_EXPORT_BUSY]"),
+    ],
+    ids=["crashed", "busy"],
+)
+def test_a_failure_with_no_try_left_is_an_error_whatever_rivet_called_it(payload: dict, headline: str) -> None:
+    """Owner, 2026-10-17: a failure Airflow will not try again ends the task, so its headline is ERROR."""
+    log, _ = make()
+    last, before = render(log, payload, try_number=3, max_tries=2)[0], render(log, payload, try_number=2, max_tries=2)[0]
+    assert last[0] == ERROR and last[1].startswith(headline) and "no try left (try 3 of 3)" in last[1]
+    assert before[0] == WARNING and "Airflow retries it (try 2 of 3)" in before[1]
 
 
 def test_a_crash_without_a_signal_names_its_exit_status() -> None:
