@@ -204,13 +204,10 @@ def test_golden_rivet_answers_a_replay_of_an_applied_plan(rig: Rig, log: Recorde
     payload, _ = rig.run(rig.operator(RivetApplyOperator, export="orders"))
     unit = payload["units"][0]
     assert payload["decision"] == "success" and payload["degraded"] == ["state_url_sqlite"]
-    assert (unit["status"], unit["run_id"], unit["rows"], unit["files"], unit["error"]) == (
-        "already_applied",
-        run_id,
-        30,
-        1,
-        None,
-    )
+    assert (unit["status"], unit["run_id"], unit["rows"], unit["files"]) == ("already_applied", run_id, 30, 1)
+    assert unit["error"] is None
+    [done] = rig.events("rivet.apply.already_applied")
+    assert (done["export"], done["run_id"], done["artifact"]) == ("orders", run_id, rig.argv("apply")[1])
     assert log.shown()[0] == (
         f"INFO rivet apply orders → SKIPPED: an earlier try already applied this plan: 30 rows, 1 file; not applied again (run {run_id})"
     )

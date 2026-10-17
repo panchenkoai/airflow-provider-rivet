@@ -949,7 +949,7 @@ def _apply(s: _Session) -> Outcome:
     if done is not None:
         step, unit = done
         s.stderr_path = str(s.logs / f"{s.log_name}.metrics.stderr.log")
-        s.emit({"event": "rivet.apply.already_applied", "export": export, "run_id": unit.run_id, "artifact": str(artifact)})
+        _emit_already_applied(s, export, unit, artifact)
         return s.outcome(step, [unit], None)
     if not _unexpired(artifact):
         plan_argv = [s.pf.binary, "plan", "--config", cfg, "--export", export, "--format", "json"]
@@ -994,8 +994,13 @@ def _apply(s: _Session) -> Outcome:
         units = [_unit_from_metrics(s, cfg, export, pids[-1], now)]
     for unit in units:
         if unit.status == "already_applied":  # rivet found the run that applied this plan (an earlier try's record lost)
-            s.emit({"event": "rivet.apply.already_applied", "export": export, "run_id": unit.run_id, "artifact": str(artifact)})
+            _emit_already_applied(s, export, unit, artifact)
     return s.outcome(step, units, error)
+
+
+def _emit_already_applied(s: _Session, export: str, unit: UnitResult, artifact: Path) -> None:
+    """The record that an earlier try applied the sealed plan, found by the task (G1b) or answered by rivet (0.32)."""
+    s.emit({"event": "rivet.apply.already_applied", "export": export, "run_id": unit.run_id, "artifact": str(artifact)})
 
 
 def _metrics_rows(s: _Session, cfg: str, export: str, last: int) -> tuple[_Step, list[dict[str, Any]]]:
