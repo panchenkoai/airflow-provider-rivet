@@ -232,3 +232,38 @@ def test_d06_a_templated_load_password_env_resolves_for_the_connection(
     payload, _ = rig.run(rig.operator(RivetRunOperator, export="orders", connections=["ch"], env=env, **extra))
     assert isinstance(payload, dict), payload
     assert rig.calls()[-1]["env"]["CH_PASSWORD"] == "pw", "the password must reach the variable the config names"
+
+
+ALIASED_LAST = """\
+source: {type: postgres, url_env: RIVET_PG_URL}
+x-dest: &s3
+  type: local
+  path: ./out/
+x-tables: &tables [orders]
+exports:
+  - name: orders
+    mode: full
+    destination: *s3
+  - name: users
+    mode: full
+    destination: *s3   # shared
+  - name: stream
+    mode: cdc
+    tables:
+      - *tables
+"""
+
+
+@pytest.mark.parametrize("kept", [0, 1, 2])
+def test_an_export_ending_in_an_alias_of_a_top_level_anchor_is_cut_not_refused(kept: int) -> None:
+    """`destination: *s3` as an item's last line was refused (`RIVET_AIRFLOW_CONFIG_NARROW_UNSAFE`, "shares its last
+    line with other text"): the alias composes to its anchor's node, written above `exports:`, so ` *s3` read as
+    foreign text. The cut is the original with the other items' whole lines removed."""
+    original = _yaml.load(ALIASED_LAST)
+
+    def check(cut: str) -> None:  # the operator's read-back (invocation.narrowed_config)
+        assert _yaml.load(cut) == {**original, "exports": [original["exports"][kept]]}
+
+    head, body = ALIASED_LAST.split("exports:\n")
+    items = ["  - name" + item for item in body.split("  - name")[1:]]
+    assert _yaml.narrow_text(ALIASED_LAST, {kept}, 3, check) == head + "exports:\n" + items[kept]

@@ -10,13 +10,14 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 BASE_FLAGS = {
-    "run": ["--config", "--export", "--summary-output", "--json", "--json-errors"],
+    "run": ["--config", "--export", "--summary-output", "--json", "--reconcile", "--json-errors"],
     "plan": ["--config", "--export", "--format", "--output", "--json-errors"],
     "apply": ["--resume", "--force", "--json-errors"],
     "load": ["--config", "--run-id", "--pool", "--json-errors"],
     "compact": ["--config", "--run-id", "--pool", "--json-errors"],
     "metrics": ["--config", "--export", "--last", "--json", "--json-errors"],
 }
+SWITCHES = {"--json", "--json-errors", "--resume", "--force", "--reconcile", "--no-notify"}  # flags that take no value
 QUERY_FILE_RULES = (
     "query_file must be a relative path",
     "query_file path must not contain '..'",
@@ -192,6 +193,21 @@ def main():
     call["config"] = doc if spec.get("record_config") and not unreadable else None
     with open(HERE / "calls.jsonl", "a") as log:
         log.write(json.dumps(call) + "\n")
+    if sub not in BASE_FLAGS:
+        print(f"error: unrecognized subcommand '{sub}'", file=sys.stderr)
+        return 2
+    # clap refuses a flag the subcommand does not have: so does the fake (`-p` / `--param` are global in rivet)
+    known = {*BASE_FLAGS[sub], *spec.get("flags", {}).get(sub, []), *spec.get("flags", {}).get("*", []), "--param"}
+    args = iter(argv[1:])
+    for arg in args:
+        name = "--param" if arg.startswith("-p") and not arg.startswith("--") else arg.split("=", 1)[0]
+        if not arg.startswith("-"):
+            continue
+        if name not in known:
+            print(f"error: unexpected argument '{name}' found", file=sys.stderr)
+            return 2
+        if name not in SWITCHES and "=" not in arg and arg in ("-p", "--param", name):
+            next(args, None)  # the flag's value
     if refusal:
         text = refusal if unreadable else f"config file '{value_of(argv, '--config')}': {refusal}"
         print(json.dumps({"error": text, "exit_class": 1}), file=sys.stderr)
@@ -226,7 +242,8 @@ def main():
             print(json.dumps(play["rows"]))
         else:
             held = json.loads((HERE / "metrics.json").read_text()) if (HERE / "metrics.json").exists() else []
-            held = [r for r in reversed(held) if export in ("", r["export_name"])]
+            # opt-in `newer`: rows another process (another config, a run outside Airflow) recorded after this one's
+            held = [*play.get("newer", []), *(r for r in reversed(held) if export in ("", r["export_name"]))]
             print(json.dumps(held[: int(value_of(argv, "--last") or len(held))]))
         return play.get("exit", 0)
     metric = None
@@ -274,7 +291,8 @@ def main():
     if sub == "apply" and not play.get("exit"):
         cursors(spec, {export: str(int(cursors(spec).get(export) or 0) + 1)})
     if metric is not None:
-        record_metric({**metric, "status": "failed" if play.get("exit") else "success"})
+        # opt-in `metric`: what the terminal row records beside the status (a `skip_empty` run's `skipped`, its reason)
+        record_metric({**metric, "status": "failed" if play.get("exit") else "success", **play.get("metric", {})})
     return play.get("exit", 0)
 
 

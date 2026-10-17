@@ -751,7 +751,9 @@ uv run pytest -q
 ```
 
 The tests read rivet's scheduler contract fixtures (`tests/fixtures/scheduler/`) and
-`src/config/export.rs` from a rivet checkout: `../rivet` by default, or the path in `RIVET_SRC`.
+`src/config/export.rs` and `src/cli/args.rs` (every flag the fake rivet of `tests/fake_rivet.py` accepts is one
+rivet defines; any other is refused with exit 2, as clap refuses it) from a rivet checkout: `../rivet` by default, or
+the path in `RIVET_SRC`.
 CI checks rivet out at the commit in `RIVET_CONTRACT_REF` and runs the suite on Airflow 2.10 and
 3.x under Airflow's constraints files.
 
