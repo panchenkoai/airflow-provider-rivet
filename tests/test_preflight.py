@@ -27,8 +27,8 @@ def refused(rig: Rig, op: object, ti: FakeTI | None = None) -> str:
 
 
 def test_kubernetes_is_detected_from_the_service_host_and_can_be_overridden() -> None:
-    assert detect_deployment({"KUBERNETES_SERVICE_HOST": "10.0.0.1"}) == "pod"
-    assert detect_deployment({}) == "local"
+    assert detect_deployment({"KUBERNETES_SERVICE_HOST": "10.0.0.1"}, "auto") == "pod"
+    assert detect_deployment({}, "auto") == "local"
     assert detect_deployment({"KUBERNETES_SERVICE_HOST": "10.0.0.1"}, "local") == "local"
 
 
