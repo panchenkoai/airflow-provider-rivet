@@ -207,17 +207,14 @@ class SourceLeg:
             out = f"/opt/rivet/configs/{self.engine.name}_{kind}/rivet.yaml"
             argv = init_argv(kind, self.engine, self.bucket, self.cloud.project, ds, out)
             stand.compose(
-                "exec", "-T", "-e", self.engine.url_env, "airflow-worker", *argv,
-                extra_env={self.engine.url_env: self.engine.url(stand.secrets)},
+                "exec", "-T", "-e", self.engine.url_env, "-e", "RIVET_STATE_URL", "airflow-worker", *argv,
+                extra_env={self.engine.url_env: self.engine.url(stand.secrets), "RIVET_STATE_URL": stand.state_url()},
             )  # fmt: skip
-            # init records the source's primary keys (`pk: auto` reads them for a `query:` export) in a state beside
-            # the config; the DAG keeps state in state_dir, and the provider refuses a state left beside the config
-            # (RIVET_AIRFLOW_STATE_BESIDE_CONFIG). The gate does what that refusal says: it moves the file there.
-            state = stand.rivet_dir / "state" / f"{self.engine.name}_{kind}"
-            for suffix in ("", "-wal", "-shm"):
-                beside = host / f".rivet_state.db{suffix}"
-                if beside.exists():
-                    beside.rename(state / beside.name)
+            # init records the source's primary keys (`pk: auto` reads them for a `query:` export) in the state it opens:
+            # the stack's PostgreSQL state, the one the DAG's runs read, so nothing is left beside the config.
+            left = sorted(p.name for p in host.glob(".rivet_state.db*"))
+            if left:
+                raise RuntimeError(f"init left {left} beside {host} although RIVET_STATE_URL named the PostgreSQL state")
             text = (host / "rivet.yaml").read_text()
             print(f"INIT {self.engine.name} {kind} config:\n{text}", flush=True)
             self.shape[kind] = read_config(text)

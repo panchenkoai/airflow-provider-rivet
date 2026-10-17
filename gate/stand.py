@@ -327,6 +327,10 @@ class Stand:
         """The host port docker published for a service's container port."""
         return int(self.compose("port", service, str(port)).stdout.strip().rsplit(":", 1)[1])
 
+    def state_url(self) -> str:
+        """The stack's PostgreSQL state as `rivet init` reads it inside the stack's network (the `rivet_gate_state` Connection)."""
+        return f"postgresql://rivet:{self.secrets.state}@gate-state:5432/rivet_state?sslmode=require"
+
     def psql(self, service: str, db: str, sql: str) -> str:
         """Run SQL through psql inside a database container; the unaligned result."""
         return self.compose(
