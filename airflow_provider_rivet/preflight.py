@@ -33,7 +33,6 @@ class Preflight:
 
     binary: str
     caps: Capabilities
-    deployment: str
     state_kind: str
     state_dir: Path | None
     config: dict[str, Any]
@@ -54,10 +53,11 @@ class Preflight:
 
 def state_kind(env: Mapping[str, str]) -> str:
     """`postgres` when rivet would open the state `RIVET_STATE_URL` names (its own rule: the value starts with `postgres`), else `sqlite`."""
-    return "postgres" if env.get(STATE_URL_ENV, "").startswith("postgres") else "sqlite"
+    url = env.get(STATE_URL_ENV, "")  # pragma: no mutate - any default not starting `postgres` reads as sqlite alike
+    return "postgres" if url.startswith("postgres") else "sqlite"
 
 
-def detect_deployment(env: Mapping[str, str], declared: str = "auto") -> str:
+def detect_deployment(env: Mapping[str, str], declared: str) -> str:
     """`pod` for an ephemeral Kubernetes worker, `local` for a host that keeps its disk."""
     if declared in ("local", "pod"):
         return declared
@@ -89,7 +89,7 @@ def read_config_source(
     """
     value_of = _yaml.resolver(env or {}, params or {})
     try:
-        text = Path(config_path).read_bytes().decode("utf-8")
+        text = Path(config_path).read_bytes().decode("utf-8")  # pragma: no mutate - codec names are case-insensitive
         doc, _ = _yaml.resolve_and_load(text, value_of)
     except (OSError, ValueError, RecursionError, _yaml.yaml.YAMLError) as exc:
         raise PreflightRefusal(
@@ -174,14 +174,13 @@ def check_nothing_left_beside_config(
             f"-shm files) into {state_dir}; or delete it if that state is not this pipeline's; see {SETUP_GUIDE}",
         )
     for entry in config.get("exports") or []:
-        cdc = entry.get("cdc") if isinstance(entry, dict) else None
+        cdc = entry.get("cdc")  # every entry is a mapping: `read_config_source` refuses any other
         ref = cdc.get("checkpoint") if isinstance(cdc, dict) else None
         if not ref or export not in (None, _yaml.text_of(entry.get("name"))):
             continue
         if "${" in str(ref):
             refuse_unresolved(config_path, "cdc.checkpoint", str(ref))
-        if os.path.isabs(str(ref)):
-            continue
+        # An absolute checkpoint is one path from both directories, so it never reads as left behind.
         if (origin / str(ref)).exists() and not (state_dir / str(ref)).exists():
             raise PreflightRefusal(
                 "RIVET_AIRFLOW_CHECKPOINT_BESIDE_CONFIG",
@@ -198,9 +197,9 @@ def run_preflight(
     config_path: str,
     env: Mapping[str, str],
     state_dir: str | None,
-    deployment: str = "auto",
+    deployment: str,
     export: str | None = None,
-    cdc: bool = False,
+    cdc: bool,
     upstream_markers: tuple[str, ...] = (),
     extra_args: Sequence[str] = (),
 ) -> Preflight:
@@ -219,14 +218,14 @@ def run_preflight(
     config, text, value_of = read_config_source(config_path, env, _yaml.params_of(extra_args))
     where = detect_deployment(env, deployment)
     kind = state_kind(env)
-    result = Preflight(binary, caps, where, kind, None, config, config_text=text, value_of=value_of)
+    result = Preflight(binary, caps, kind, None, config, config_text=text, value_of=value_of)
     modes = result.export_modes()
     if export is not None and modes and export not in modes:
         for name in modes:
             if "${" in name:
                 refuse_unresolved(config_path, "export name", name)
         raise PreflightRefusal("RIVET_AIRFLOW_EXPORT_UNKNOWN", f"config {config_path} has no export `{export}`")
-    touched = [modes.get(export, "")] if export is not None else list(modes.values())
+    touched = [mode for name, mode in modes.items() if export in (None, name)]
     # D06: a mode no variable resolves may be `cdc`; the guards treat it as one (fail closed).
     is_cdc = cdc or any(mode == "cdc" or "${" in mode for mode in touched)
 
