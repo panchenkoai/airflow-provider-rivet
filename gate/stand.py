@@ -34,11 +34,13 @@ class StandSecrets:
     metastore: str
     admin: str
     jwt: str
+    mysql: str
+    mysql_root: str
     fernet: str
 
     @classmethod
     def generate(cls) -> StandSecrets:
-        return cls(*(secrets.token_hex(16) for _ in range(6)), fernet=base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())
+        return cls(*(secrets.token_hex(16) for _ in range(8)), fernet=base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())
 
 
 def write_private(path: Path, text: str) -> None:
@@ -103,6 +105,7 @@ x-rivet: &rivet
     AIRFLOW__CELERY__RESULT_BACKEND: {result_backend}://airflow:{metastore}@postgres/airflow
     AIRFLOW__API_AUTH__JWT_SECRET: '{jwt}'
     GATE_WAREHOUSES: '{warehouses}'
+    GATE_SOURCES: '{sources}'
 {backend}  env_file: [gate-connections.env]
   volumes:
     - {rivet_dir}:/opt/rivet
@@ -128,7 +131,7 @@ x-rivet: &rivet
     environment: {{ CLICKHOUSE_USER: loader, CLICKHOUSE_PASSWORD: {clickhouse}, CLICKHOUSE_DB: gate, CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1" }}
     ulimits: {{ nofile: {{ soft: 262144, hard: 262144 }} }}
     ports: ["127.0.0.1::8123"]
-"""
+{source_services}"""
 
 
 def sh(
@@ -153,6 +156,7 @@ class Stand:
         tag: str | None = None,
         secrets_backend: dict[str, str] | None = None,
         adc: Path | None = None,
+        sources: tuple[Any, ...] = (),
     ) -> None:
         self.flavor = FLAVORS[version]
         # The run tag keeps two gate runs of one Airflow version apart: each `down -v` and image build is its own.
@@ -172,6 +176,8 @@ class Stand:
         # AIRFLOW_CONN_* variables; the credential file the containers read as their own identity (read-only).
         self.secrets_backend = secrets_backend
         self.adc = adc
+        #: Source engines beside the postgres source (gate.sources.Engine): their containers and Connections.
+        self.sources = sources
         self._token: str | None = None
 
     def connections(self) -> dict[str, dict[str, Any]]:
@@ -194,6 +200,7 @@ class Stand:
                 "schema": "rivet_state",
                 "extra": {"rivet_params": "sslmode=require"},
             },
+            **{e.conn_id: e.connection(self.secrets) for e in self.sources},
             **self.extra_connections,
         }
 
@@ -203,11 +210,12 @@ class Stand:
             return {}
         return {f"AIRFLOW_CONN_{conn_id.upper()}": json.dumps(conn) for conn_id, conn in self.connections().items()}
 
-    def compose(self, *args: str, **kw: Any) -> subprocess.CompletedProcess:
-        """`docker compose` on this stack's project."""
+    def compose(self, *args: str, extra_env: dict[str, str] | None = None, **kw: Any) -> subprocess.CompletedProcess:
+        """`docker compose` on this stack's project; `extra_env` reaches `exec -e NAME` without a value on any argv."""
         files = ["-f", str(self.dir / "docker-compose.yaml"), "-f", str(self.dir / "docker-compose.gate.yaml")]
         env = {
             **os.environ,
+            **(extra_env or {}),
             "AIRFLOW_UID": str(os.getuid()),
             "AIRFLOW_PROJ_DIR": str(self.dir),
             "_AIRFLOW_WWW_USER_PASSWORD": self.secrets.admin,
@@ -276,6 +284,8 @@ class Stand:
             rivet_dir=self.rivet_dir,
             services=services,
             warehouses=",".join(self.warehouses),
+            sources=",".join(e.name for e in self.sources),
+            source_services="".join(e.service_yaml.format(**vars(self.secrets)) for e in self.sources),
             backend=backend,
             adc=adc,
             result_backend=self.flavor.result_backend,
