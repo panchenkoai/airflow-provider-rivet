@@ -992,6 +992,9 @@ def _apply(s: _Session) -> Outcome:
     units = _run_units(s, step, doc, error)
     if error is None and not has_summary:
         units = [_unit_from_metrics(s, cfg, export, pids[-1], now)]
+    for unit in units:
+        if unit.status == "already_applied":  # rivet found the run that applied this plan (an earlier try's record lost)
+            s.emit({"event": "rivet.apply.already_applied", "export": export, "run_id": unit.run_id, "artifact": str(artifact)})
     return s.outcome(step, units, error)
 
 

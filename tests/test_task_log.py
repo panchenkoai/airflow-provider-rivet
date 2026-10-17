@@ -195,6 +195,27 @@ def test_golden_skipped_already_applied_by_an_earlier_try(rig: Rig, log: Recorde
     ]
 
 
+def test_golden_rivet_answers_a_replay_of_an_applied_plan(rig: Rig, log: Recorder) -> None:
+    """rivet >= 0.32 (#623): the earlier try's record is gone, so the task applies the sealed plan again and rivet
+    answers with the run that applied it, `already_applied` with that run's counts; the task ends success with them."""
+    run_id = "orders_20261017T130550.929_55700"
+    entry = summary("orders", 30, 1, run_id, "already_applied", answered_by_run=run_id, mode="full")
+    rig.scenario(flags=NEW_FLAGS, apply={"summary": entry})
+    payload, _ = rig.run(rig.operator(RivetApplyOperator, export="orders"))
+    unit = payload["units"][0]
+    assert payload["decision"] == "success" and payload["degraded"] == ["state_url_sqlite"]
+    assert (unit["status"], unit["run_id"], unit["rows"], unit["files"], unit["error"]) == (
+        "already_applied",
+        run_id,
+        30,
+        1,
+        None,
+    )
+    assert log.shown()[0] == (
+        f"INFO rivet apply orders → SKIPPED: an earlier try already applied this plan: 30 rows, 1 file; not applied again (run {run_id})"
+    )
+
+
 # --- golden: failures -----------------------------------------------------------------------------------------------
 
 
