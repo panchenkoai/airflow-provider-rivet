@@ -191,6 +191,8 @@ def main():
     seen = {k: os.environ.get(k) for k in spec.get("record_env", [])}
     call = {"argv": argv, "env": seen, "env_keys": sorted(os.environ), "cwd": os.getcwd(), "sql": sql, "export": export}
     call["config"] = doc if spec.get("record_config") and not unreadable else None
+    if spec.get("record_stdin"):  # opt-in: whether the process was started with stdin on /dev/null
+        call["stdin_null"] = os.path.samestat(os.fstat(0), os.stat(os.devnull))
     with open(HERE / "calls.jsonl", "a") as log:
         log.write(json.dumps(call) + "\n")
     if sub not in BASE_FLAGS:
@@ -228,6 +230,8 @@ def main():
             modes = {e.get("name"): e.get("mode") for e in (read_config(argv)[0].get("exports") or [])}
             doc["strategy"] = modes.get(doc["export_name"])
             Path(out).write_text(json.dumps({**doc, "computed": {"cursor_snapshot": snapshot}}))
+            if "artifact_raw" in play:  # opt-in: the sealed artifact's exact bytes instead
+                Path(out).write_text(play["artifact_raw"])
         else:
             # rivet prints one plan as its bare object (no campaign) and several as an array (plan_cmd.rs emit_artifacts)
             planned = spec.get("plan_list", [])

@@ -209,6 +209,7 @@ def test_the_crashed_ledger_counts_one_series_and_every_failure_of_it_fails_clos
     ledger = tmp_path / "x" / "ledger.json"
     assert [crashed_retry_allowed(ledger, t, 5, 2) for t in (1, 2, 3)] == [(True, None), (True, None), (False, None)]
     assert crashed_retry_allowed(ledger, 5, 7, 2) == (True, None), "a clear moves max_tries and starts a new series"
+    assert crashed_retry_allowed(ledger, 5, 7, 1) == (True, None), "the try being judged is not one of its own earlier ones"
     for junk in ("{not json", "[1, 2]", '[[1, "x"]]', '{"a": 1}', ""):
         ledger.write_text(junk)
         first, second = crashed_retry_allowed(ledger, 1, 9, 2), crashed_retry_allowed(ledger, 2, 9, 2)
@@ -217,7 +218,7 @@ def test_the_crashed_ledger_counts_one_series_and_every_failure_of_it_fails_clos
     blocked = tmp_path / "file"
     blocked.write_text("")
     allowed, problem = crashed_retry_allowed(blocked / "crashed" / "ledger.json", 1, 2, 1)
-    assert allowed is False and "cannot be written" in problem
+    assert allowed is False and "cannot be written (PreflightRefusal)" in problem
 
 
 def test_a_crashed_ledger_that_cannot_be_written_grants_no_retry_and_still_publishes(rig: Rig) -> None:
@@ -376,6 +377,90 @@ def test_a_compaction_rivet_reports_as_skipped_is_an_airflow_skip(rig: Rig) -> N
     assert ti.store[("task", "return_value")]["skip_reason"] == "full_load"
     done, _ = rig.run(rig.operator(RivetCompactOperator, export="orders_cdc", table="orders"))
     assert done["units"][0]["status"] == "compacted" and done["units"][0]["rows"] == 1200
+
+
+def failed_unit(error: dict, export: str | None = None, table: str | None = None) -> dict:
+    """One failed unit as the XCom carries it."""
+    base = {"export": export, "table": table, "run_id": None, "rows": None, "files": None, "stop_reason": None}
+    return {**base, "status": "failed", "error": error}
+
+
+@pytest.mark.parametrize(
+    ("line", "raised", "decision"),
+    [
+        ({"error": "connection reset by peer", "exit_class": 2}, AirflowException, "retry"),
+        ({"error": "bad config", "exit_class": 5, "code": "RIVET_CONFIG_X"}, AirflowFailException, "fail"),
+    ],
+    ids=["transient", "refusal"],
+)
+def test_a_failed_plan_reports_rivets_own_class(rig: Rig, line: dict, raised: type, decision: str) -> None:
+    """A transient `rivet plan` failure is retried and a refusal fails with rivet's code: the plan task reads rivet's
+    error line, it does not fold every failure into "no plan layout" (mutants _plan 9-16, 24-26, 65, 69-79)."""
+    rig.scenario(plan={"exit": line["exit_class"], "line": line})
+    exc, ti = rig.run(rig.operator(RivetPlanOperator, plan_file=str(rig.tmp / "pg.plan.json")))
+    assert type(exc) is raised
+    assert rig.argv("plan") == ["plan", "--config", str(rig.copy()), "--format", "json", "--json-errors"]
+    payload = ti.store[("task", "return_value")]
+    retryable = decision == "retry"
+    error = {"code": line.get("code"), "kind": None, "class": "retryable" if retryable else "refusal"}
+    error |= {"exit_code": line["exit_class"], "retryable": retryable, "action": None}
+    assert payload["decision"] == decision and payload["error"] == error and payload["units"] == [failed_unit(error)]
+    assert "exit_zero_failed_unit" not in payload["degraded"]
+    assert payload["stderr_path"].endswith(".plan.stderr.log")
+
+
+def test_a_plan_without_a_layout_is_a_final_internal_failure_and_a_new_layout_file_is_world_readable(rig: Rig) -> None:
+    """mutants _plan 38, 45-57"""
+    target = rig.tmp / "pg.plan.json"
+    rig.scenario(plan_list=[])
+    exc, ti = rig.run(rig.operator(RivetPlanOperator, plan_file=str(target)))
+    error = {"code": None, "kind": None, "class": "internal", "exit_code": 6, "retryable": False, "action": None}
+    payload = ti.store[("task", "return_value")]
+    assert isinstance(exc, AirflowFailException) and payload["error"] == error and payload["units"] == [failed_unit(error)]
+    campaign = {"waves": [{"wave": 1, "exports": ["orders", "users"]}], "ordered_exports": []}
+    rig.scenario(plan_list=[{"export_name": n, "prioritization": {"campaign": campaign}} for n in ("orders", "users")])
+    payload, _ = rig.run(rig.operator(RivetPlanOperator, plan_file=str(target)))
+    assert payload["units"][0]["status"] == "success" and payload["units"][0]["error"] is None
+    assert mode(target) == 0o644
+
+
+def test_a_load_refused_by_todays_binary_reports_the_refusal_on_its_unit(rig: Rig) -> None:
+    """No result file: the one unit carries rivet's error (mutants _load 91-108)."""
+    rig.scenario(load={"exit": 5, "line": {"error": "x", "exit_class": 5, "code": "RIVET_LOAD_X"}})
+    exc, ti = rig.run(rig.operator(RivetLoadOperator, export="users", table="users"))
+    error = {"code": "RIVET_LOAD_X", "kind": None, "class": "refusal", "exit_code": 5, "retryable": False, "action": None}
+    payload = ti.store[("task", "return_value")]
+    assert isinstance(exc, AirflowFailException) and payload["error"] == error
+    assert payload["units"] == [failed_unit(error, "users", "users")]
+    assert "exit_zero_failed_unit" not in payload["degraded"]
+
+
+ROW = {"export": "events", "table": "events", "status": "failed", "skip_reason": None, "rows": 0}
+FAILURE = {"export": "events", "table": "events", "code": "RIVET_LOAD_Y", "kind": None, "class": "refusal"}
+FAILURE |= {"exit_code": 5, "retryable": False, "action": None}
+
+
+@pytest.mark.parametrize(
+    ("own", "failures", "malformed"),
+    [
+        (None, [{**FAILURE, "table": "other", "code": "RIVET_OTHER"}, FAILURE], False),
+        (None, ["junk", FAILURE], True),
+        ({"class": "nonsense"}, [FAILURE], True),
+    ],
+    ids=["by-table", "junk-entry", "unreadable-own"],
+)
+def test_a_failed_tables_error_is_its_own_entry_in_failures(rig: Rig, own: object, failures: list, malformed: bool) -> None:
+    """A row without a readable error takes the `failures[]` entry of its own export AND table; anything unreadable
+    on the way is recorded as `result_malformed` (mutants _Session.unit_error 8, 14-15, 22-23, 30-31)."""
+    line = {"error": "x", "exit_class": 5, "class": "refusal", "retryable": False, "exit_code": 5, "failures": failures}
+    rig.scenario(
+        flags=NEW_FLAGS, load={"exit": 5, "line": line, "summary": {"run_id": "r", "per_table": [{**ROW, "error": own}]}}
+    )
+    _, ti = rig.run(rig.operator(RivetLoadOperator, export="events", table="events"))
+    payload = ti.store[("task", "return_value")]
+    unit = payload["units"][0]
+    assert (unit["export"], unit["error"]["code"]) == ("events", "RIVET_LOAD_Y")
+    assert ("result_malformed" in payload["degraded"]) is malformed and "per_unit_error" not in payload["degraded"]
 
 
 def test_plan_swaps_the_layout_file_in_only_when_the_builder_can_read_it(rig: Rig) -> None:
@@ -1301,6 +1386,31 @@ def test_a_narrowed_copy_keeps_the_recipes_the_streams_backfill_reads(rig: Rig, 
     rig.run(rig.operator(RivetLoadOperator, export=export, table="orders"))
     names = [e["name"] for e in yaml.safe_load(rig.copy(export).read_text())["exports"]]
     assert names == kept, "a stream without its backfill recipes is refused by rivet: RIVET_CONFIG_CDC_SHAPE_INVALID"
+
+
+FAILED_ROW = {"run_id": "l1", "per_table": [{"export": "orders", "table": "users", "status": "failed", "error": None}]}
+
+
+def test_a_failed_table_row_without_its_error_fails_the_task_on_exit_zero(rig: Rig) -> None:
+    """The row's error is the process-level one, built from the exit when rivet printed none; without it the failed
+    unit had no error and the task ended success (mutants _load 139 / 140 / 150)."""
+    rig.scenario(flags=NEW_FLAGS, load={"summary": FAILED_ROW})
+    exc, ti = rig.run(rig.operator(RivetLoadOperator, export="orders", table="users"))
+    payload = ti.store[("task", "return_value")]
+    assert type(exc) is AirflowFailException and payload["decision"] == "fail"
+    (unit,) = payload["units"]
+    assert unit["status"] == "failed" and unit["error"]["class"] == "generic"
+    assert payload["degraded"] == ["exit_zero_failed_unit", "state_url_sqlite"], "one failed unit: no per_unit_error"
+
+
+def test_a_failed_table_row_without_its_error_takes_the_printed_process_error(rig: Rig) -> None:
+    """With a printed retryable line the row's error IS that line, so the task is retried (mutant _load 140)."""
+    line = {"class": "retryable", "retryable": True, "exit_code": 2, "exit_class": 2, "code": "RIVET_NET", "error": "reset"}
+    rig.scenario(flags=NEW_FLAGS, load={"exit": 2, "line": line, "summary": FAILED_ROW})
+    exc, ti = rig.run(rig.operator(RivetLoadOperator, export="orders", table="users"))
+    payload = ti.store[("task", "return_value")]
+    assert type(exc) is AirflowException and payload["decision"] == "retry"
+    assert (payload["units"][0]["error"]["code"], payload["units"][0]["error"]["class"]) == ("RIVET_NET", "retryable")
 
 
 @pytest.mark.parametrize(
