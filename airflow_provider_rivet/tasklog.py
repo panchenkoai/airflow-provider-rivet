@@ -76,7 +76,7 @@ class TaskLog:
         self.events.append(record)
         event = record.get("event")
         if event == "rivet.start":
-            self.steps.append({"step": record.get("step"), "start": clock(), "stderr_path": record.get("stderr_path")})
+            self.steps.append({"step": record.get("step"), "start": clock()})
         elif event == "rivet.step" and self.steps:
             self.steps[-1].update(end=clock(), exit_status=record.get("exit_status"), signal=record.get("signal"))
         elif event == "rivet.lock.wait":
@@ -127,7 +127,7 @@ class TaskLog:
             lines.append((logging.INFO, self._success(head, units, payload, seconds)))
         else:
             lines.append(self._failure(head, error, payload, units, retry_text, stop_requested))
-        lines += self._step_lines(payload)
+        lines += self._step_lines()
         if len(units) > 1 or (payload.get("decision") != "success" and units and units[0].get("status") == "failed"):
             lines += self._unit_lines(units)
         if payload.get("decision") not in (None, "success") and payload.get("stderr_path"):
@@ -185,7 +185,7 @@ class TaskLog:
         run = f" (run {runs[0]})" if len(runs) == 1 else ""
         return (logging.WARNING if retried else logging.ERROR), f"{head} {', '.join(parts)}{run}"
 
-    def _step_lines(self, payload: dict[str, Any]) -> list[tuple[int, str]]:
+    def _step_lines(self) -> list[tuple[int, str]]:
         """One line per rivet process the task started, and one for a sealed plan an earlier try made."""
         lines = []
         done = self._first("rivet.apply.already_applied")
@@ -196,11 +196,12 @@ class TaskLog:
             name = step["step"]
             if replayed and name == "apply":
                 lines.append((logging.INFO, f"  {'plan':<8} replayed the sealed plan of an earlier try"))
-            took = f" in {_secs(step['end'] - step['start'])}" if "end" in step else ""
+            if "end" not in step:
+                lines.append((logging.INFO, f"  {name:<8} did not end"))
+                continue
+            took = f" in {_secs(step['end'] - step['start'])}"
             if step.get("signal") is not None:
                 text = f"ended by signal {step['signal']}{took}"
-            elif "end" not in step:
-                text = "did not end"
             elif step.get("exit_status") != 0:
                 text = f"exit {step.get('exit_status')}{took}"
             elif name == "plan" and self.command == "apply":
