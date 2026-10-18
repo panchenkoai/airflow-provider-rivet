@@ -12,4 +12,7 @@
 # 2026-10-17: 951 after #31-#38 (main 6ddc6d9; run 39020026835): 6361 mutants, sum(tested) == 6361, 951 survived,
 # 0 segfault. invocation.py 369 -> 217 (#38: the critical functions' survivors, 18 left, all equivalent), result.py
 # 16 -> 4, _yaml.py 132 -> 125, connections.py 171 -> 169. The names are in .mutmut-survivors.
-951
+# 2026-10-18: 25 after round 3 (#40-#53; main ca0d9c8; run 39091249351): 6067 mutants, sum(tested) == 6067, 24
+# survived, 1 timeout, 0 segfault. Left: invocation.py 11 (the equivalents of #38), _yaml.py 4, result.py 4, and 6
+# string mutants of get_provider_info's metadata. The names are in .mutmut-survivors.
+25
