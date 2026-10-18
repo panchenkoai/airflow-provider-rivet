@@ -16,4 +16,6 @@
 # survived, 1 timeout, 0 segfault. Left: invocation.py 11 (the equivalents of #38), _yaml.py 4, result.py 4, and 6
 # string mutants of get_provider_info's metadata. The names are in .mutmut-survivors.
 # 2026-10-18: 19: test_dags pins get_provider_info's whole dict, which kills its 6 string mutants (no new full run)
-19
+# 2026-10-18: 18: the release run 39130390503 (5762 mutants) left 20; 2 sat in `step`'s `name != "metrics"` branch, dead
+# since G1b went (#58), which this change removes.
+18

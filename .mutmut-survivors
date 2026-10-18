@@ -1,11 +1,10 @@
 # The mutants of airflow_provider_rivet/ the last full run left alive, by name (dev/mutants_gate.py; README,
 # "Mutation testing"). Written with .mutmut-ratchet from the ratchet job's `mutmut-survivors` artifact. A PR that changes
 # a test fails on a mutant of a function that test calls when the mutant is alive and not listed here.
-# 2026-10-18: GitHub Actions run 39091249351 (main ca0d9c8, 6067 mutants), 25 names.
+# 2026-10-18: release run 39130390503 (tag airflow-v0.1.0 on 9d83682, 5762 mutants), 20 names less the two of the dead `metrics` branch removed after it: 18.
 airflow_provider_rivet._yaml.x__int__mutmut_18
 airflow_provider_rivet._yaml.x_narrow_text__mutmut_17
 airflow_provider_rivet._yaml.x_narrow_text__mutmut_18
-airflow_provider_rivet._yaml.x_substitute__mutmut_36
 airflow_provider_rivet.invocation.x__apply__mutmut_3
 airflow_provider_rivet.invocation.x__apply__mutmut_6
 airflow_provider_rivet.invocation.x__load__mutmut_140
