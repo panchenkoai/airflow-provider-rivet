@@ -5,6 +5,7 @@ CDC task on PostgreSQL state still needs, the default mode, a checkpoint in both
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 
 import pytest
@@ -14,6 +15,7 @@ from airflow_provider_rivet.preflight import (
     SETUP_GUIDE,
     Preflight,
     PreflightRefusal,
+    _packaged_rivet,
     check_nothing_left_beside_config,
     check_state_dir,
     ensure_marker,
@@ -56,10 +58,7 @@ def with_exports(rig: Rig, exports: str) -> str:
 
 
 def no_rivet_cli_binary(monkeypatch: pytest.MonkeyPatch) -> None:
-    def missing(name: str = "rivet") -> str:
-        raise FileNotFoundError(name)
-
-    monkeypatch.setattr("airflow_provider_rivet.preflight.rivet_cli.path", missing)
+    monkeypatch.setattr("airflow_provider_rivet.preflight._packaged_rivet", lambda: None)
 
 
 def test_a_missing_binary_is_refused_naming_it_and_the_path_searched(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -77,10 +76,16 @@ def test_without_rivet_on_path_the_binary_the_rivet_cli_dependency_installed_is_
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """A worker started as `/venv/bin/airflow` without activating the venv has no `/venv/bin` on PATH."""
-    monkeypatch.setattr("airflow_provider_rivet.preflight.rivet_cli.path", lambda name="rivet": "/venv/bin/rivet")
+    monkeypatch.setattr("airflow_provider_rivet.preflight._packaged_rivet", lambda: "/venv/bin/rivet")
     assert resolve_binary("rivet", {"PATH": str(tmp_path)}) == "/venv/bin/rivet"
     with pytest.raises(PreflightRefusal):  # an explicit other binary is never swapped for the packaged one
         resolve_binary("/opt/rivet-dev", {"PATH": str(tmp_path)})
+
+
+def test_the_packaged_binary_is_none_without_the_rivet_cli_package(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The gate's stand installs the provider with --no-deps beside its own binary: no rivet_cli module."""
+    monkeypatch.setitem(sys.modules, "rivet_cli", None)
+    assert _packaged_rivet() is None
 
 
 def test_each_state_directory_refusal_says_what_is_wrong_and_where_to_read_more(tmp_path: Path) -> None:
