@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
+from datetime import date
 from importlib import metadata
 from pathlib import Path
 
@@ -123,6 +125,9 @@ def test_batch_dag_limits_overlap_and_passes_one_state_directory_to_every_task(p
     assert {t.max_active_tis_per_dag for t in rivet_tasks} == {1}
     assert isinstance(dag.get_task("apply.a"), RivetApplyOperator) and dag.get_task("apply.a").retries == 2
     assert "compact" not in dag.task_group.children, "no compact task is created unless the author names the export"
+    assert dag.get_task("plan").plan_file == plan_file, "mutant build_batch_dag 97: the plan task refreshes the plan file"
+    assert set(dag.tags) == {"rivet", "batch"}, "mutants build_batch_dag 89-92"
+    assert dag.start_date.date() == date(2026, 1, 1), "mutants _dag 13, 14"
 
 
 def test_batch_dag_from_an_explicit_list_and_with_rivet_run() -> None:
@@ -182,9 +187,12 @@ def test_cdc_dag_is_one_run_then_load_and_compact_per_table() -> None:
         load = dag.get_task(f"load.{table}")
         assert load.trigger_rule == "all_success", "nothing is loaded after a drain that did not succeed"
         assert (load.export, load.table) == ("app_cdc", table)
+        compact = dag.get_task(f"compact.{table}")
+        assert (compact.export, compact.table) == ("app_cdc", table), "mutants build_cdc_dag 59, 62"
         assert dag.get_task(f"compact.{table}").trigger_rule == "all_success"
     assert "load.orders" not in upstream_closure(dag, "compact.users")
     assert dag.max_active_runs == 1 and dag.get_task("run").max_active_tis_per_dag == 1
+    assert set(dag.tags) == {"rivet", "cdc"}, "mutants build_cdc_dag 28-31"
 
 
 def test_cdc_dag_without_compact_or_load() -> None:
@@ -302,7 +310,8 @@ def test_d29_an_export_or_table_name_that_is_no_task_id_gets_a_sanitised_id_and_
     ids = [next(iter(by_export[n])) for n in names]
     assert len(set(ids)) == len(ids), f"two exports share a task id: {ids}"
     assert ids[2:] == ["daily_orders", "plain"], "a name that is already a task id is kept as it is"
-    assert ids[0].startswith("daily_orders_") and ids[1].startswith("orders_v2_")
+    assert ids[0] == "daily_orders_" + hashlib.sha256(b"daily orders").hexdigest()[:8], "mutant task_name 10"
+    assert ids[1].startswith("orders_v2_")
     assert dag.get_task(f"compact.{ids[1]}").export == "orders:v2"
     cdc = build_cdc_dag("c", config="c", export="e", tables=["sales orders", "public.users"])
     tables = {t.task_id: t.table for t in rivet_tasks(cdc) if t.task_id != "run"}
@@ -335,3 +344,41 @@ def test_d27_the_compat_layer_imports_no_deprecated_airflow_name() -> None:
 
         assert (_compat.AirflowSkipException, _compat.AirflowFailException) == (AirflowSkipException, AirflowFailException)
         assert origin.startswith("airflow.sdk"), origin
+
+
+def exactly(text: str) -> str:
+    """A `pytest.raises(match=)` pattern for the whole message."""
+    return f"^{re.escape(text)}$"
+
+
+def test_each_refused_argument_says_what_to_write_instead(plan_file: str) -> None:
+    """Mutants _common 6, 8, 9, build_batch_dag 26, 32, 39-41, 67, build_cdc_dag 13, read_plan_layout 5: whole messages."""
+    cases = [
+        (
+            {"exports": ["a"], "operator_kwargs": {"trigger_rule": "all_done"}},
+            "operator_kwargs may not set `trigger_rule`: every rivet task runs only after its upstream succeeded "
+            "(load after its extract, compact after its load); the watcher fails the run on any failure",
+        ),
+        (
+            {"plan_file": plan_file, "exports": ["a"]},
+            "give exactly one of `plan_file` (waves from rivet plan) or `exports` (one wave)",
+        ),
+        ({"exports": []}, "`exports` is empty: name at least one export, or give `plan_file`"),
+        ({"exports": ["a"], "extract": "load"}, "`extract` is 'apply' or 'run'"),
+        (
+            {"exports": ["a"], "compact_exports": ["a"], "load": False},
+            "compact_exports needs load=True: a compaction merges what the load buffered",
+        ),
+    ]
+    for kwargs, message in cases:
+        with pytest.raises(ValueError, match=exactly(message)):
+            build_batch_dag("b", config="c", **kwargs)
+    with pytest.raises(ValueError, match=exactly("`tables` lists the captured tables the load and compact tasks are built for")):
+        build_cdc_dag("c", config="c", export="e", tables=[])
+    absent = plan_file + ".absent"
+    message = (
+        f"{absent} is missing or is not `rivet plan --format json` output (FileNotFoundError); "
+        f"write it with: rivet plan --config <config> --format json > {absent}"
+    )
+    with pytest.raises(RuntimeError, match=exactly(message)):
+        read_plan_layout(absent)
