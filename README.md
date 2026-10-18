@@ -2,8 +2,8 @@
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/panchenkoai/airflow-provider-rivet/main/docs/assets/provider-flow-dark.svg">
-    <img src="https://raw.githubusercontent.com/panchenkoai/airflow-provider-rivet/main/docs/assets/provider-flow.svg" alt="Apache Airflow runs rivet as tasks: PostgreSQL, MySQL, SQL Server, MongoDB and Oracle → rivet → S3, GCS, Azure Blob or local disk → BigQuery, Snowflake or ClickHouse" width="900">
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/provider-flow-dark.svg">
+    <img src="docs/assets/provider-flow.svg" alt="Apache Airflow runs rivet as tasks: PostgreSQL, MySQL, SQL Server, MongoDB and Oracle → rivet → S3, GCS, Azure Blob or local disk → BigQuery, Snowflake or ClickHouse" width="900">
   </picture>
 </p>
 
