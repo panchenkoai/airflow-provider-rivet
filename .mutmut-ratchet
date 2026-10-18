@@ -15,4 +15,5 @@
 # 2026-10-18: 25 after round 3 (#40-#53; main ca0d9c8; run 39091249351): 6067 mutants, sum(tested) == 6067, 24
 # survived, 1 timeout, 0 segfault. Left: invocation.py 11 (the equivalents of #38), _yaml.py 4, result.py 4, and 6
 # string mutants of get_provider_info's metadata. The names are in .mutmut-survivors.
-25
+# 2026-10-18: 19: test_dags pins get_provider_info's whole dict, which kills its 6 string mutants (no new full run)
+19

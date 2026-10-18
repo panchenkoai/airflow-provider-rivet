@@ -204,9 +204,14 @@ def test_cdc_dag_without_compact_or_load() -> None:
     assert sorted(build_cdc_dag("c2", config="c", export="e", tables=[], load=False).task_ids) == ["run", "watcher"]
 
 
-def test_the_provider_entry_point_names_the_distribution_and_the_version_has_one_source() -> None:
+def test_the_provider_entry_point_names_the_distribution_and_the_version_has_one_source_and_the_metadata_is_exact() -> None:
     info = get_provider_info()
-    assert info["package-name"] == "airflow-provider-rivet" and info["versions"] == [__version__]
+    assert info == {
+        "package-name": "airflow-provider-rivet",
+        "name": "Rivet",
+        "description": "Run rivet exports, CDC drains, loads and compactions as Airflow tasks.",
+        "versions": [__version__],
+    }, "Airflow shows name and description on its Providers page"
     pyproject = (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text()
     assert 'dynamic = ["version"]' in pyproject and 'path = "airflow_provider_rivet/__init__.py"' in pyproject
     assert not re.search(r"^version\s*=", pyproject, re.M), "the version is written in __init__.py only"
