@@ -27,7 +27,7 @@ SWEEP_AGE_HOURS = 24
 #: A run tag (`%m%d%H%M` + 4 hex digits) and the names the gate builds from it; the sweep drops nothing else.
 TAG_SHAPE = re.compile(r"\d{8}[0-9a-f]{4}")
 SCHEMA_SHAPE = re.compile(r"AFGATE_\d{8}[0-9A-F]{4}_\d+")
-DATASET_SHAPE = re.compile(r"rivet_tmp_afgate_\d{8}[0-9a-f]{4}_\d+")
+DATASET_SHAPE = re.compile(r"rivet_tmp_afgate_\d{8}[0-9a-f]{4}_\d+(_[a-z]+_(batch|cdc))?")
 #: A Secret Manager secret holding one gate Connection: `<connections_prefix>_<conn_id>`.
 SECRET_SHAPE = re.compile(r"airflow-connections-afgate_\d{8}[0-9a-f]{4}_\d+_[a-z0-9_]+")
 SECRETS_BACKEND = "airflow.providers.google.cloud.secrets.secret_manager.CloudSecretManagerBackend"

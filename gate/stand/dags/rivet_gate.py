@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 
 from airflow_provider_rivet.dags import build_batch_dag, build_cdc_dag
@@ -74,4 +75,41 @@ for wh in filter(None, os.environ.get("GATE_WAREHOUSES", "").split(",")):
         state_dir=f"{ROOT}/state/wh_{wh}",
         operator_kwargs=kwargs,
         tags=["rivet", "gate", "warehouse", wh],
+    )
+
+
+# Source legs (gate/sources.py): another engine to GCS and BigQuery, on the configs `rivet init` wrote; the export and
+# stream names are init's, read from the shape the gate wrote beside them (no DAG until it exists).
+for engine in filter(None, os.environ.get("GATE_SOURCES", "").split(",")):
+    shape_file = f"{ROOT}/configs/{engine}_shape.json"
+    if not os.path.exists(shape_file):
+        continue
+    with open(shape_file) as handle:
+        shape = json.load(handle)
+    kwargs = {
+        # The stack's PostgreSQL state: the one `rivet init` recorded the source's primary keys in.
+        "env_from_connections": {
+            f"RIVET_GATE_{engine.upper()}_URL": f"rivet_gate_{engine}",
+            "RIVET_STATE_URL": "rivet_gate_state",
+        },
+        "connections": ["gate_gcp"],
+    }
+    batch = shape["batch"]["exports"]
+    globals()[f"gate_src_{engine}_batch"] = build_batch_dag(
+        f"gate_src_{engine}_batch",
+        config=f"{ROOT}/configs/{engine}_batch/rivet.yaml",
+        state_dir=f"{ROOT}/state/{engine}_batch",
+        exports=batch,
+        compact_exports=batch,
+        operator_kwargs=kwargs,
+        tags=["rivet", "gate", "source", engine],
+    )
+    globals()[f"gate_src_{engine}_cdc"] = build_cdc_dag(
+        f"gate_src_{engine}_cdc",
+        config=f"{ROOT}/configs/{engine}_cdc/rivet.yaml",
+        export=shape["cdc"]["stream"],
+        tables=shape["cdc"]["tables"],
+        state_dir=f"{ROOT}/state/{engine}_cdc",
+        operator_kwargs=kwargs,
+        tags=["rivet", "gate", "source", engine],
     )
