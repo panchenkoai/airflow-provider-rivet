@@ -174,11 +174,11 @@ def test_step_lines_of_a_step_that_did_not_end_an_unnamed_strategy_and_a_layout_
     assert render(log, {"decision": "fail", "error": {"class": "generic"}, "units": []})[1] == (INFO, "  run      did not end")
     log, _ = make("load")  # a step left without its end does not hide the steps after it (_step_lines 43, r3 PR)
     log.record({"event": "rivet.start", "step": "load"})
-    log.record({"event": "rivet.start", "step": "metrics"})
+    log.record({"event": "rivet.start", "step": "compact"})
     log.record({"event": "rivet.step", "exit_status": 0})
     assert render(log, {"decision": "success", "units": []})[1:3] == [
         (INFO, "  load     did not end"),
-        (INFO, "  metrics  read the run's counts from rivet's state in 1.0 s"),
+        (INFO, "  compact  done in 1.0 s"),
     ]
     log, _ = make()
     log.record({"event": "rivet.start", "step": "plan"})

@@ -32,7 +32,7 @@ from airflow_provider_rivet.operators import (
 
 GUIDE = "https://github.com/panchenkoai/airflow-provider-rivet/blob/main/docs/state.md#local-worker-setup-guide"
 SQLITE = f"  note     SQLite state is single-host — see {GUIDE}"
-OLD_LACKS = "  note     this binary lacks: apply_summary, lock_wait, no_notify (the operator works around them)"
+OLD_LACKS = "  note     this binary lacks: lock_wait, no_notify (the operator works around them)"
 
 
 class Recorder:
@@ -104,17 +104,16 @@ def test_golden_apply_success_with_counts(rig: Rig, log: Recorder) -> None:
 
 
 def test_golden_apply_success_on_a_degraded_binary(rig: Rig, log: Recorder) -> None:
-    """The owner's case: rivet 0.31.0 (no apply summary, no --lock-wait, no --no-notify) and SQLite state. The missing
-    flags are one note, not a `degraded: [...]` dump that reads like a fault; counts come from `rivet metrics`."""
-    rig.scenario(apply={"summary": {"per_export": [{"export_name": "users", "rows": 30, "files": 1}]}})
+    """The owner's case: rivet 0.32.0 (no --lock-wait, no --no-notify) and SQLite state. The missing flags are one
+    note, not a `degraded: [...]` dump that reads like a fault; the counts are apply's summary's."""
+    rig.scenario(apply={"summary": summary("users", 30, 1, "users_1")})
     payload, _ = rig.run(rig.operator(RivetApplyOperator, export="users"))
     run_id = payload["units"][0]["run_id"]
-    assert payload["degraded"] == ["apply_summary", "lock_wait", "no_notify", "state_url_sqlite"]
+    assert payload["degraded"] == ["lock_wait", "no_notify", "state_url_sqlite"]
     assert log.shown() == [
-        f"INFO rivet apply users → OK: 30 rows, 1 file in 7.0 s (run {run_id})",
+        f"INFO rivet apply users → OK: 30 rows, 1 file in 5.0 s (run {run_id})",
         "INFO   plan     sealed, strategy incremental in 1.0 s",
         "INFO   apply    done in 1.0 s",
-        "INFO   metrics  read the run's counts from rivet's state in 1.0 s",
         f"INFO {OLD_LACKS}",
         f"INFO {SQLITE}",
     ]
@@ -153,12 +152,12 @@ def test_golden_cdc_max_events_is_a_note(rig: Rig, log: Recorder) -> None:
 
 
 def test_golden_skipped_nothing_to_do(rig: Rig, log: Recorder) -> None:
-    """A `skip_empty` apply that delivered nothing: SKIPPED with rivet's reason, not OK with zero rows."""
-    rig.scenario(apply={"metric": {"status": "skipped", "skip_reason": "empty"}})
+    """A `skip_empty` apply that delivered nothing: SKIPPED, not OK with zero rows. rivet 0.32.0's apply summary
+    carries no `skip_reason`, so the headline gives none."""
+    rig.scenario(apply={"summary": summary("users", 0, 0, "users_1", "skipped")})
     payload, _ = rig.run(rig.operator(RivetApplyOperator, export="users"))
     assert payload["units"][0]["status"] == "skipped"
-    run_id = payload["units"][0]["run_id"]
-    assert log.shown()[0] == f"INFO rivet apply users → SKIPPED: nothing to do (empty) in 7.0 s (run {run_id})"
+    assert log.shown()[0] == "INFO rivet apply users → SKIPPED: nothing to do in 5.0 s (run users_1)"
 
 
 def test_golden_compact_skipped_is_an_airflow_skip_with_the_same_headline(rig: Rig, log: Recorder) -> None:
@@ -181,8 +180,9 @@ def test_golden_compact_skipped_is_an_airflow_skip_with_the_same_headline(rig: R
 
 
 def test_golden_skipped_already_applied_by_an_earlier_try(rig: Rig, log: Recorder) -> None:
-    """G1b: the retry finds the run its earlier try's apply made and applies nothing; the headline says so."""
-    rig.scenario(flags=NEW_FLAGS, apply={"summary": summary("orders", 30, 1, "ignored")})
+    """G1b: the retry replays the sealed plan and rivet answers with the run the earlier try's apply made; the headline
+    says nothing was applied again."""
+    rig.scenario(flags=NEW_FLAGS, apply={"summary": summary("orders", 30, 1, "orders_1", mode="full")})
     op = rig.operator(RivetApplyOperator, export="orders")
     rig.run(op, FakeTI(try_number=1, max_tries=2))
     log.lines.clear()
@@ -190,7 +190,8 @@ def test_golden_skipped_already_applied_by_an_earlier_try(rig: Rig, log: Recorde
     run_id = retry["units"][0]["run_id"]
     assert log.shown() == [
         f"INFO rivet apply orders → SKIPPED: an earlier try already applied this plan: 30 rows, 1 file; not applied again (run {run_id})",
-        "INFO   metrics  found the earlier try's run in rivet's state in 1.0 s",
+        "INFO   plan     replayed the sealed plan of an earlier try",
+        "INFO   apply    done in 1.0 s",
         f"INFO {SQLITE}",
     ]
 
@@ -248,7 +249,6 @@ def test_golden_stale_plan_refused_on_todays_binary(rig: Rig, log: Recorder) -> 
     payload = ti.store[("task", "return_value")]
     assert log.shown() == [
         "ERROR rivet apply users → REFUSED [RIVET_PLAN_ARTIFACT_STALE], final",
-        "INFO   metrics  no earlier try's apply of this plan in rivet's state in 1.0 s",
         "INFO   plan     replayed the sealed plan of an earlier try",
         "INFO   apply    exit 5 in 1.0 s",
         "INFO   export   users: failed [RIVET_PLAN_ARTIFACT_STALE] refusal",

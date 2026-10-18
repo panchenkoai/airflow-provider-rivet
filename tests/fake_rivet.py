@@ -12,7 +12,7 @@ HERE = Path(__file__).resolve().parent
 BASE_FLAGS = {
     "run": ["--config", "--export", "--summary-output", "--json", "--reconcile", "--json-errors"],
     "plan": ["--config", "--export", "--format", "--output", "--json-errors"],
-    "apply": ["--resume", "--force", "--json-errors"],
+    "apply": ["--resume", "--force", "--summary-output", "--json", "--json-errors"],
     "load": ["--config", "--run-id", "--pool", "--json-errors"],
     "compact": ["--config", "--run-id", "--pool", "--json-errors"],
     "metrics": ["--config", "--export", "--last", "--json", "--json-errors"],
@@ -125,6 +125,23 @@ def stale_artifact(spec, argv, export):
     return snapshot is not None and "--force" not in argv and snapshot != cursors(spec).get(export)
 
 
+def applied(update=None):
+    """The sealed plans this fake state has applied, by the artifact's bytes (`applied.json` beside the fake): rivet
+    >= 0.32 keys a plan's apply by its `plan_id` (state v37, src/pipeline/apply_cmd.rs) and answers a replay of it."""
+    path = HERE / "applied.json"
+    held = json.loads(path.read_text()) if path.exists() else {}
+    if update is not None:
+        path.write_text(json.dumps({**held, **update}))
+    return held
+
+
+def artifact_key(argv):
+    try:
+        return Path(argv[1]).read_text()
+    except (OSError, IndexError):
+        return None
+
+
 def run_id_of(export):
     """rivet's `fresh_run_id` (src/pipeline/summary.rs): `<export>_<UTC %Y%m%dT%H%M%S%.3f>_<pid>`."""
     now = datetime.now(UTC)
@@ -172,7 +189,7 @@ def main():
     if argv == ["--version"]:
         if broken.get("--version") == "hang":
             time.sleep(90)
-        print(f"rivet {spec.get('version', '0.31.0')} (fake)")
+        print(f"rivet {spec.get('version', '0.32.0')} (fake)")
         return 0
     sub = argv[0]
     if "--help" in argv:
@@ -237,7 +254,22 @@ def main():
             planned = spec.get("plan_list", [])
             print(json.dumps(planned[0] if isinstance(planned, list) and len(planned) == 1 else planned))
         return 0
-    if sub == "apply" and stale_artifact(spec, argv, export):
+    replay = applied().get(artifact_key(argv)) if sub == "apply" else None
+    target = value_of(argv, "--summary-output")
+    if replay is not None and replay["mode"] != "incremental":
+        # rivet 0.32 (#623): a replay of an applied point-in-time plan extracts nothing and answers with the run that
+        # applied it, `run_id` == `answered_by_run`, and that run's counts
+        entry = {"export_name": export, "status": "already_applied", "run_id": replay["run_id"], "mode": replay["mode"]}
+        entry.update(answered_by_run=replay["run_id"], rows=replay["rows"], files=replay["files"])
+        if target:
+            Path(target).write_text(json.dumps({"per_export": [entry]}))
+        return 0
+    if replay is not None:
+        # an incremental plan's own apply moved the cursor: its replay is no STALE refusal but a run from the moved
+        # cursor, which finds nothing new (measured on rivet 0.32.0)
+        empty = {"export_name": export, "status": "success", "mode": "incremental", "rows": 0, "files": 0}
+        play = {**play, "summary": {"per_export": [empty]}}
+    if sub == "apply" and replay is None and stale_artifact(spec, argv, export):
         line = {"error": f"plan '{export}': cursor has drifted since plan was generated", "exit_class": 5}
         print(json.dumps({**line, "code": "RIVET_PLAN_ARTIFACT_STALE"}), file=sys.stderr)
         return 5
@@ -260,7 +292,6 @@ def main():
         print(play["stderr"], file=sys.stderr)
     for name in spec.get("leak_env", []):
         print(f"connecting with {os.environ.get(name)}", file=sys.stderr)
-    target = value_of(argv, "--summary-output")
     if target and play.get("summary") is not None:
         Path(target).write_text(json.dumps(play["summary"]))
     if target and play.get("summary_raw") is not None:
@@ -292,8 +323,14 @@ def main():
         time.sleep(play["sleep"])
     if play.get("signal"):
         os.kill(os.getpid(), getattr(signal, play["signal"]))
-    if sub == "apply" and not play.get("exit"):
+    if sub == "apply" and not play.get("exit") and replay is None:
         cursors(spec, {export: str(int(cursors(spec).get(export) or 0) + 1)})
+        rows, files = counts_of(play, export)
+        mode = json.loads(artifact_key(argv) or "{}").get("strategy") or "full"
+        summary = play.get("summary") if isinstance(play.get("summary"), dict) else {}
+        entries = [e for e in summary.get("per_export") or [] if isinstance(e, dict) and e.get("export_name") == export]
+        run_id = (entries[0] if entries else {}).get("run_id") or (metric or {}).get("run_id")  # as the summary said
+        applied({artifact_key(argv): {"run_id": run_id, "rows": rows, "files": files, "mode": mode}})
     if metric is not None:
         # opt-in `metric`: what the terminal row records beside the status (a `skip_empty` run's `skipped`, its reason)
         record_metric({**metric, "status": "failed" if play.get("exit") else "success", **play.get("metric", {})})

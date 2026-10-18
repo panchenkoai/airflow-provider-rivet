@@ -16,7 +16,7 @@ builds it, runs the process, reads the outputs and classifies.
 
 | Operator | Runs | Notes |
 |---|---|---|
-| `RivetApplyOperator` | `rivet plan -e X --format json -o <artifact>` then `rivet apply <artifact>` | a retry replays the same sealed artifact while it is unexpired, unless rivet's state shows the apply an earlier try started already succeeded ("Retries"); a clear plans again |
+| `RivetApplyOperator` | `rivet plan -e X --format json -o <artifact>` then `rivet apply <artifact>` | a retry replays the same sealed artifact while it is unexpired, and rivet answers a replay of a plan it already applied (["Retries"](retries.md)); a clear plans again |
 | `RivetRunOperator` | `rivet run [-e X] --summary-output <file>` | the fallback when sealed apply is not wanted; also runs a whole config |
 | `RivetCdcRunOperator` | `rivet run -e X --summary-output <file>` for a `mode: cdc` export | one bounded drain; succeeds on `max_events`, reports it, never loops |
 | `RivetLoadOperator` | `rivet load` | per export, per table where the binary can narrow |
@@ -41,9 +41,9 @@ Every task returns (and, on failure, pushes before raising) one XCom value under
 { "command": "apply", "decision": "success",
   "units": [ { "export": "orders", "table": null, "status": "success", "run_id": "orders_...",
                "rows": 2500, "files": 1, "stop_reason": null, "error": null } ],
-  "error": null, "degraded": ["apply_summary", "lock_wait", "no_notify", "state_url_sqlite"],
+  "error": null, "degraded": ["lock_wait", "no_notify", "state_url_sqlite"],
   "exit_status": 0, "signal": null, "stderr_path": "/var/lib/rivet/postgres/logs/...",
-  "skip_reason": null, "state_marker": "1d86...", "rivet_version": "0.31.0" }
+  "skip_reason": null, "state_marker": "1d86...", "rivet_version": "0.32.0" }
 ```
 
 A unit has exactly the shape of `tests/fixtures/scheduler/xcom_unit*.json`; a package test
@@ -52,14 +52,13 @@ compares the two, so the package and the Rust contract cannot drift.
 ## Reading the task log
 
 Each task writes one block when it ends: a headline with the outcome first, one line per rivet
-step, and indented `note` lines. A successful apply on rivet 0.31.0 with SQLite state:
+step, and indented `note` lines. A successful apply on rivet 0.32.0 with SQLite state:
 
 ```
 rivet apply users → OK: 30 rows, 1 file in 4.1 s (run users_20261016T092509.120_4242)
   plan     sealed, strategy incremental in 0.8 s
   apply    done in 2.9 s
-  metrics  read the run's counts from rivet's state in 0.3 s
-  note     this binary lacks: apply_summary, lock_wait, no_notify (the operator works around them)
+  note     this binary lacks: lock_wait, no_notify (the operator works around them)
   note     SQLite state is single-host — see https://github.com/panchenkoai/airflow-provider-rivet/blob/main/docs/state.md#local-worker-setup-guide
 ```
 
@@ -67,12 +66,11 @@ A failed one (a retry whose sealed plan another run has overtaken):
 
 ```
 rivet apply users → REFUSED [RIVET_PLAN_ARTIFACT_STALE], final
-  metrics  no earlier try's apply of this plan in rivet's state in 0.3 s
   plan     replayed the sealed plan of an earlier try
   apply    exit 5 in 0.6 s
   export   users: failed [RIVET_PLAN_ARTIFACT_STALE] refusal
   stderr   <state_dir>/logs/<dag_id>/<task_id>-<hash>/<run_id>__try2.apply.stderr.log
-  note     this binary lacks: apply_summary, lock_wait, no_notify (the operator works around them)
+  note     this binary lacks: lock_wait, no_notify (the operator works around them)
   note     SQLite state is single-host — see https://github.com/panchenkoai/airflow-provider-rivet/blob/main/docs/state.md#local-worker-setup-guide
   note     rivet's failure line has no class or action: the class is read from its exit class
 ```

@@ -28,9 +28,9 @@ started rivet; a rivet that does not stop on SIGTERM) the lock above still keeps
 starting a second rivet until the first has exited.
 
 **Without a state directory (a pod) there is no lock file.** Only rivet's own lease protects the
-export: rivet main refuses the second holder with `RIVET_STATE_RUN_IN_PROGRESS` /
-`RIVET_LOAD_TABLE_BUSY` (exit 5), which the task retries ([Retries](retries.md)). rivet 0.31.0 has no lease for
-a non-checkpointed run, so on 0.31.0 a pod's zombie try and its retry can both run.
+export: rivet (>= 0.32.0) refuses the second holder with `RIVET_STATE_RUN_IN_PROGRESS` (exit class 2) /
+`RIVET_LOAD_TABLE_BUSY` (exit 5), which the task retries ([Retries](retries.md)); a plain `mode: full` run takes the
+run lease too (measured on 0.32.0).
 
 ## Known limits
 
@@ -46,7 +46,7 @@ a non-checkpointed run, so on 0.31.0 a pod's zombie try and its retry can both r
   (see ["Storage and warehouse connections"](connections-and-secrets.md#storage-and-warehouse-connections)).
 - With `load_table_filter` degraded, the per-table tasks of a multi-table CDC export each load
   the whole export; the first does the work, the others find the ledger up to date.
-- `rivet apply` prints no result today, so a successful apply task reads its counts from
-  `rivet metrics`; a failed one has no counts.
+- rivet 0.32.0's apply summary carries no `skip_reason`: a `skip_empty` apply that delivered
+  nothing is `SKIPPED` without the reason.
 - A failure callback runs where Airflow runs task callbacks, in the task's process on the worker;
   exercised live on Airflow 2.10.5 and 3.3.2 by hand (docs/slack.md), not by the live gate.

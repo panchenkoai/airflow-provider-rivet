@@ -94,9 +94,9 @@ def test_a_task_that_sees_another_state_directory_than_its_upstream_is_refused(r
 
 
 def test_a_binary_below_the_minimum_is_refused_with_both_versions(rig: Rig) -> None:
-    rig.scenario(version="0.30.9")
+    rig.scenario(version="0.31.9")  # the last below 0.32.0, which answers a replayed apply itself (G1b)
     exc, ti = rig.run(rig.operator(RivetApplyOperator, export="orders"))
-    assert isinstance(exc, AirflowFailException) and "0.30.9" in str(exc) and "0.31.0" in str(exc)
+    assert isinstance(exc, AirflowFailException) and "0.31.9" in str(exc) and "0.32.0" in str(exc)
     assert ti.store[("task", "return_value")]["preflight_refusal"] == "RIVET_AIRFLOW_BINARY_TOO_OLD"
 
 
@@ -134,7 +134,7 @@ def test_postgres_state_on_a_local_worker_does_not_warn_about_sqlite(rig: Rig) -
 def test_flags_are_probed_from_help_as_whole_words(rig: Rig) -> None:
     rig.scenario(flags={"load": ["--export-all"]})
     caps = probe(str(rig.bin / "rivet"))
-    assert caps.version == (0, 31, 0)
+    assert caps.version == (0, 32, 0)
     assert caps.has_flag("run", "--export") and not caps.has_flag("load", "--export")
     assert not caps.has_flag("run", "--no-notify")
 

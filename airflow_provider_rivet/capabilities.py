@@ -7,7 +7,7 @@ import re
 import subprocess
 from dataclasses import dataclass
 
-MIN_RIVET_VERSION = (0, 31, 0)
+MIN_RIVET_VERSION = (0, 32, 0)
 PROBE_TIMEOUT = 60
 _VERSION_RE = re.compile(r"rivet\s+(\d+)\.(\d+)\.(\d+)")
 
@@ -60,12 +60,6 @@ DEGRADATIONS: dict[str, Degradation] = {
             "CDC `stop_reason` and `tables[]` on the run entry",
             "`stop_reason` is null; a `max_events` stop cannot be told from `caught_up`",
             "output",
-        ),
-        Degradation(
-            "apply_summary",
-            "`--summary-output` on `rivet apply`",
-            "counts are read from `rivet metrics --json` after a successful apply",
-            "flag",
         ),
         Degradation(
             "load_filter",
