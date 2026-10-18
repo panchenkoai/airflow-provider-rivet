@@ -6,6 +6,7 @@ import hashlib
 import importlib.util
 import json
 import os
+import re
 import sys
 import tempfile
 from pathlib import Path
@@ -18,6 +19,21 @@ os.environ["AIRFLOW__CORE__UNIT_TEST_MODE"] = "True"
 import pytest
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
+# The documentation: the README (the front page) and the pages under docs/ it links to.
+DOC_FILES = (PACKAGE_ROOT / "README.md", *sorted((PACKAGE_ROOT / "docs").glob("*.md")))
+DOCS = "\n".join(p.read_text() for p in DOC_FILES)
+
+
+def doc_section(heading: str) -> str:
+    """The text under one heading of the one doc page that has it, up to the next heading of the same or a higher level."""
+    pages = [t for t in (p.read_text() for p in DOC_FILES) if re.search(rf"^{re.escape(heading)}$", t, re.M)]
+    assert len(pages) == 1, f"{heading!r} is a heading of {len(pages)} doc pages, not one"
+    level = heading.split(" ", 1)[0]
+    start = pages[0].index(heading + "\n") + len(heading) + 1
+    stop = re.compile(rf"^#{{1,{len(level)}}} ", re.M).search(pages[0], start)
+    return pages[0][start : stop.start() if stop else len(pages[0])]
+
+
 RIVET_SRC = Path(os.environ.get("RIVET_SRC") or PACKAGE_ROOT.parent / "rivet").resolve()
 FIXTURES = RIVET_SRC / "tests" / "fixtures" / "scheduler"
 SECRET = "postgresql://rivet:s3cr3t-pw@db.internal:5432/app"

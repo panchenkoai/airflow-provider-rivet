@@ -12,7 +12,7 @@ from types import SimpleNamespace
 
 import pytest
 from airflow.exceptions import AirflowFailException
-from conftest import Rig
+from conftest import DOCS, Rig
 
 from airflow_provider_rivet.connections import cloud_environment
 from airflow_provider_rivet.operators import RivetLoadOperator, RivetRunOperator, connection_url
@@ -267,7 +267,7 @@ def test_d22_a_connection_without_a_host_is_refused(tmp_path: Path, host: str | 
 def test_d32_the_readme_tells_the_config_to_read_the_azure_account_variable() -> None:
     """D32: the Azure Connection exports AZURE_STORAGE_ACCOUNT, which rivet never reads (its config needs
     `account_name`), and the README row omitted it: a user following the row was refused "requires account_name"."""
-    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text()
+    readme = DOCS
     row = next(line for line in readme.splitlines() if line.startswith("| `azure`"))
     assert "account_name: ${AZURE_STORAGE_ACCOUNT}" in row
 

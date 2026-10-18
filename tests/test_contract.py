@@ -6,7 +6,7 @@ import dataclasses
 import re
 
 import pytest
-from conftest import FIXTURES, PACKAGE_ROOT, fixture
+from conftest import DOCS, FIXTURES, PACKAGE_ROOT, fixture
 
 from airflow_provider_rivet.capabilities import DEGRADATIONS
 from airflow_provider_rivet.result import CLASSES, STATUSES, ErrorObject, UnitResult, error_from_exit, error_from_line
@@ -116,7 +116,7 @@ def test_the_exception_text_has_code_class_action_and_unit_and_no_message() -> N
 
 def test_every_degradation_is_documented_in_the_readme_and_every_recorded_key_is_a_degradation() -> None:
     package = PACKAGE_ROOT
-    readme = (package / "README.md").read_text()
+    readme = DOCS
     for key in DEGRADATIONS:
         assert f"| `{key}` |" in readme, f"README has no row for degradation `{key}`"
     source = "".join(p.read_text() for p in (package / "airflow_provider_rivet").glob("*.py"))

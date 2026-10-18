@@ -1,4 +1,4 @@
-# Mutation testing of airflow_provider_rivet/ (README, "Mutation testing"), in a Linux container (dev/mutants.sh).
+# Mutation testing of airflow_provider_rivet/ (docs/development.md, "Mutation testing"), in a Linux container (dev/mutants.sh).
 # RIVET_SRC: a rivet checkout at RIVET_CONTRACT_REF, as for `pytest` (default ../rivet).
 
 .PHONY: mutants mutants-results mutants-clean
