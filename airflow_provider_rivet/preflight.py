@@ -10,6 +10,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+import rivet_cli
+
 from . import _yaml
 from .capabilities import MIN_RIVET_VERSION, Capabilities, ProbeFailed, probe
 
@@ -67,8 +69,16 @@ def detect_deployment(env: Mapping[str, str], declared: str) -> str:
 def resolve_binary(rivet_bin: str, env: Mapping[str, str]) -> str:
     """The absolute path of the rivet binary, or a refusal naming where it was looked for."""
     found = shutil.which(rivet_bin, path=env.get("PATH"))
+    if not found and rivet_bin == "rivet":
+        # The `rivet-cli` dependency installs the binary into this interpreter's environment, which a worker
+        # started without activating it does not have on PATH.
+        try:
+            found = rivet_cli.path()
+        except FileNotFoundError:
+            pass
     if not found:
-        raise PreflightRefusal("RIVET_AIRFLOW_BINARY_MISSING", f"no rivet binary `{rivet_bin}` on the worker's PATH")
+        where = " nor installed by the rivet-cli package" if rivet_bin == "rivet" else ""
+        raise PreflightRefusal("RIVET_AIRFLOW_BINARY_MISSING", f"no rivet binary `{rivet_bin}` on the worker's PATH{where}")
     return found
 
 

@@ -55,11 +55,32 @@ def with_exports(rig: Rig, exports: str) -> str:
 # --- the text of each refusal -----------------------------------------------------------------------------------------
 
 
-def test_a_missing_binary_is_refused_naming_it_and_the_path_searched(tmp_path: Path) -> None:
+def no_rivet_cli_binary(monkeypatch: pytest.MonkeyPatch) -> None:
+    def missing(name: str = "rivet") -> str:
+        raise FileNotFoundError(name)
+
+    monkeypatch.setattr("airflow_provider_rivet.preflight.rivet_cli.path", missing)
+
+
+def test_a_missing_binary_is_refused_naming_it_and_the_path_searched(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     # resolve_binary 11, 14
+    no_rivet_cli_binary(monkeypatch)
     assert refusal(resolve_binary, "rivet", {"PATH": str(tmp_path)}) == (
-        "[RIVET_AIRFLOW_BINARY_MISSING] no rivet binary `rivet` on the worker's PATH"
+        "[RIVET_AIRFLOW_BINARY_MISSING] no rivet binary `rivet` on the worker's PATH nor installed by the rivet-cli package"
     )
+    assert refusal(resolve_binary, "rivet-dev", {"PATH": str(tmp_path)}) == (
+        "[RIVET_AIRFLOW_BINARY_MISSING] no rivet binary `rivet-dev` on the worker's PATH"
+    )
+
+
+def test_without_rivet_on_path_the_binary_the_rivet_cli_dependency_installed_is_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A worker started as `/venv/bin/airflow` without activating the venv has no `/venv/bin` on PATH."""
+    monkeypatch.setattr("airflow_provider_rivet.preflight.rivet_cli.path", lambda name="rivet": "/venv/bin/rivet")
+    assert resolve_binary("rivet", {"PATH": str(tmp_path)}) == "/venv/bin/rivet"
+    with pytest.raises(PreflightRefusal):  # an explicit other binary is never swapped for the packaged one
+        resolve_binary("/opt/rivet-dev", {"PATH": str(tmp_path)})
 
 
 def test_each_state_directory_refusal_says_what_is_wrong_and_where_to_read_more(tmp_path: Path) -> None:

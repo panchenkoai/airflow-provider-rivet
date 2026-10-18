@@ -2,8 +2,8 @@
 
 <p align="center">
   <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/provider-flow-dark.svg">
-    <img src="docs/assets/provider-flow.svg" alt="Apache Airflow runs rivet as tasks: PostgreSQL, MySQL, SQL Server, MongoDB and Oracle → rivet → S3, GCS, Azure Blob or local disk → BigQuery, Snowflake or ClickHouse" width="900">
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/panchenkoai/airflow-provider-rivet/airflow-v0.1.0/docs/assets/provider-flow-dark.svg">
+    <img src="https://raw.githubusercontent.com/panchenkoai/airflow-provider-rivet/airflow-v0.1.0/docs/assets/provider-flow.svg" alt="Apache Airflow runs rivet as tasks: PostgreSQL, MySQL, SQL Server, MongoDB and Oracle → rivet → S3, GCS, Azure Blob or local disk → BigQuery, Snowflake or ClickHouse" width="900">
   </picture>
 </p>
 
@@ -51,20 +51,18 @@ pip install airflow-provider-rivet            # or airflow-provider-rivet[slack]
 ```
 
 Install it into the Airflow environment with Airflow's own constraints file, so it does not move
-Airflow's pins.
-
-The rivet binary must be on every worker. On the official Airflow images (Debian 12, glibc 2.36)
-take it from rivet's container image, which is built on the same Debian release, or from the
-release's `*-linux-gnu-glibc2.28` archive; the plain `*-linux-gnu` archive needs glibc 2.38 and
-does not start there:
+Airflow's pins. It depends on [`rivet-cli`](https://pypi.org/project/rivet-cli/), which installs the
+rivet binary (wheels for Linux glibc 2.28+ x86_64/aarch64 and macOS), so the official Airflow images
+need nothing else:
 
 ```dockerfile
 FROM apache/airflow:3.3.2
-COPY --from=ghcr.io/panchenkoai/rivet:v0.32.0 /usr/local/bin/rivet /usr/local/bin/rivet
 RUN pip install --no-cache-dir airflow-provider-rivet
 ```
 
-The rivet binary must be on the worker's `PATH`, or pass `rivet_bin="/abs/path/rivet"`.
+The operators run `rivet` from the worker's `PATH`, else the binary `rivet-cli` installed into
+Airflow's environment. To run another build, pass `rivet_bin="/abs/path/rivet"` (for example one
+copied from `ghcr.io/panchenkoai/rivet:v0.32.0`).
 
 ## Example
 
