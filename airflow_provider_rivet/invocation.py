@@ -8,6 +8,7 @@ import fcntl
 import fnmatch
 import functools
 import hashlib
+import itertools
 import json
 import os
 import re
@@ -100,7 +101,7 @@ def plan_layout(plan: Any) -> list[dict[str, Any]]:
     if isinstance(plan, dict):
         rec = plan["prioritization"]["export_recommendation"]
         name = plan["export_name"]
-        if not isinstance(name, str) or rec.get("export_name", name) != name:
+        if not isinstance(name, str) or rec["export_name"] != name:  # no name there: KeyError, as the cost line read it
             raise ValueError("the plan's recommendation names another export")
         campaign = {"waves": [{"wave": int(rec["recommended_wave"]), "exports": [name]}], "ordered_exports": [rec]}
     else:
@@ -380,15 +381,12 @@ class _Session:
     def result_file(self, path: Path, step: _Step) -> Any:
         """A `--summary-output` file rivet was asked for; on exit 0 an absent or non-JSON one is recorded (D18)."""
         try:
-            doc = json.loads(path.read_text())
+            raw: bytes | None = path.read_bytes()
         except OSError:
-            doc, missing = None, True
-        except ValueError:
-            doc, missing = None, False
-        else:
-            missing = False
+            raw = None
+        doc = None if raw is None else _json_of(raw)
         if step.signal is None and step.exit_status == 0:
-            if missing:
+            if raw is None:
                 self.degraded.add("result_missing")
             elif not isinstance(doc, dict):
                 self.degraded.add("result_malformed")
@@ -468,7 +466,8 @@ def _write_atomic(path: Path, data: bytes) -> str:
 
 def _open_private(path: Path) -> Any:
     """Open a file for writing with mode 0600, whatever mode an earlier file of that name had."""
-    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    # The creation mode only closes the window before fchmod, which sets 0600 whatever this one is: no observable mutant.
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)  # pragma: no mutate
     os.fchmod(fd, 0o600)
     return os.fdopen(fd, "wb")
 
@@ -479,7 +478,8 @@ def _private_dir(base: Path, *parts: str) -> Path:
     for part in parts:
         path = path / part
         try:
-            os.mkdir(path, 0o700)
+            # The creation mode only closes the window before the chmod below, which sets 0700 whatever this one is.
+            os.mkdir(path, 0o700)  # pragma: no mutate
         except FileExistsError:
             pass
         except OSError as exc:
@@ -525,7 +525,7 @@ def _prune_stale(work: Path, now: float | None = None) -> None:
         for path in files:
             if _unexpired(path) if kind == "plans" else not isinstance(_read_json(path), list):
                 continue  # a replayable plan, or a ledger that is not one: left until a person deletes it
-            path.unlink(missing_ok=True)
+            path.unlink(missing_ok=True)  # pragma: no mutate - just listed; gone only if a parallel task removed it
         if kind == "plans":
             for folder in (work / kind).iterdir() if (work / kind).is_dir() else ():
                 try:
@@ -545,7 +545,7 @@ def _prune_logs(folder: Path, keep: int) -> None:
         newest_last = sorted(attempts, key=lambda a: max(f.stat().st_mtime_ns for f in attempts[a]))
         for attempt in newest_last[:-keep]:
             for entry in attempts[attempt]:
-                entry.unlink(missing_ok=True)
+                entry.unlink(missing_ok=True)  # pragma: no mutate - just listed; gone only if a parallel task removed it
     except OSError:
         return
 
@@ -724,16 +724,14 @@ def _wait_for_lock(s: _Session, fd: int, path: Path, unit: str) -> None:
     """Take the exclusive lock on `fd`, polling every `LOCK_POLL` seconds for up to `lock_wait`; raise `Busy` after
     it and `Stopped` when the task is stopped while waiting. Outside `_export_lock` so mutation testing reaches it."""
     deadline = time.monotonic() + max(0, s.req.lock_wait)
-    waiting = False
-    while True:
+    for attempt in itertools.count():
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
             return
         except BlockingIOError:
             if s.stopped is not None and s.stopped():
                 raise Stopped(s.req.command) from None
-            if not waiting:
-                waiting = True
+            if attempt == 0:  # the wait is recorded once, when it starts
                 s.emit({"event": "rivet.lock.wait", "lock": str(path), "unit": unit, "lock_wait": s.req.lock_wait})
             if time.monotonic() >= deadline:
                 raise Busy(path, unit, s.req.lock_wait) from None
@@ -820,8 +818,17 @@ def _has_broken_object(lines: list[str]) -> bool:
 def _read_json(path: Path) -> Any:
     """Parse a JSON file rivet wrote, `None` when it is absent or not JSON."""
     try:
-        return json.loads(path.read_text())
-    except (OSError, ValueError):
+        raw = path.read_bytes()
+    except OSError:
+        return None
+    return _json_of(raw)
+
+
+def _json_of(raw: bytes) -> Any:
+    """The JSON document of some bytes, `None` when they are not one (not UTF-8 included)."""
+    try:
+        return json.loads(raw)
+    except ValueError:
         return None
 
 
@@ -829,7 +836,7 @@ def _unexpired(artifact: Path) -> bool:
     """True when a sealed plan artifact exists and its `expires_at` is still ahead."""
     doc = _read_json(artifact)
     try:
-        expires = datetime.fromisoformat(str(doc["expires_at"]).replace("Z", "+00:00"))
+        expires = datetime.fromisoformat(str(doc["expires_at"]))
     except (TypeError, KeyError, ValueError):
         return False
     if expires.tzinfo is None:
@@ -849,7 +856,7 @@ def _plan_inputs(s: _Session, export: str) -> str:
                 parts.append(b"")
     digest = hashlib.sha256()
     for part in parts:
-        digest.update(len(part).to_bytes(8, "big") + part)
+        digest.update(len(part).to_bytes(8) + part)  # big-endian, the default
     return digest.hexdigest()[:16]
 
 
@@ -867,7 +874,7 @@ def _refuse_foreign_artifact(artifact: Path, export: str, config: str) -> None:
     if not isinstance(doc, dict):
         return
     named, planned = doc.get("export_name"), doc.get("config_path")
-    same_config = isinstance(planned, str) and planned != "" and _same_file(planned, config)
+    same_config = isinstance(planned, str) and _same_file(planned, config)  # "" names no file: not the same
     if named != export or not same_config:
         raise PreflightRefusal(
             "RIVET_AIRFLOW_PLAN_ARTIFACT_FOREIGN",
