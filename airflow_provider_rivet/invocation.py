@@ -349,8 +349,7 @@ class _Session:
                 "signal": -code if code < 0 else None,
             }
         )
-        if name != "metrics":
-            self.stderr_path = str(stderr_path)
+        self.stderr_path = str(stderr_path)
         lines = _lines(_tail(stderr_path))
         if self.req.stream_stderr:
             for raw in lines:
