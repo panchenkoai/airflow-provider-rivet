@@ -41,7 +41,7 @@ rivet itself (sources, destinations, warehouses, CDC, configs): **<https://githu
   the task; nothing secret is in argv, XCom or the task log.
 
 Status: alpha. It is versioned independently of the binary and checks
-the binary's version at run time (minimum **rivet 0.31.0**; a lower one is refused with both
+the binary's version at run time (minimum **rivet 0.32.0**; a lower one is refused with both
 versions in the message). Supported: Airflow 2.10+ and 3.x, Python 3.12+ (Airflow 2.10 only on 3.12).
 
 ## Install
@@ -54,12 +54,13 @@ Install it into the Airflow environment with Airflow's own constraints file, so 
 Airflow's pins.
 
 The rivet binary must be on every worker. On the official Airflow images (Debian 12, glibc 2.36)
-take it from rivet's container image, which is built on the same Debian release; the
-`*-linux-gnu` archive of rivet 0.31.0 needs glibc 2.38 and does not start there:
+take it from rivet's container image, which is built on the same Debian release, or from the
+release's `*-linux-gnu-glibc2.28` archive; the plain `*-linux-gnu` archive needs glibc 2.38 and
+does not start there:
 
 ```dockerfile
 FROM apache/airflow:3.3.2
-COPY --from=ghcr.io/panchenkoai/rivet:v0.31.0 /usr/local/bin/rivet /usr/local/bin/rivet
+COPY --from=ghcr.io/panchenkoai/rivet:v0.32.0 /usr/local/bin/rivet /usr/local/bin/rivet
 RUN pip install --no-cache-dir airflow-provider-rivet
 ```
 

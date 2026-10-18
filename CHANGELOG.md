@@ -5,7 +5,7 @@ rivet binary; its release tags will use the prefix `airflow-v`.
 
 ## 0.1.0 (unreleased)
 
-First release, against rivet 0.31.0 and the contract of ADR-0039; Python 3.12+, Airflow 2.10 and 3.x.
+First release, against rivet 0.32.0 and the contract of ADR-0039; Python 3.12+, Airflow 2.10 and 3.x.
 
 - Operators: `RivetApplyOperator`, `RivetRunOperator`, `RivetCdcRunOperator`, `RivetLoadOperator`,
   `RivetCompactOperator`, `RivetPlanOperator`; one invocation module builds argv and env, runs
@@ -14,7 +14,7 @@ First release, against rivet 0.31.0 and the contract of ADR-0039; Python 3.12+, 
   edges and ordered waves) and `build_cdc_dag` (one run task, load and compact per table).
 - Retries by the contract: a printed retryable failure is retried, exits 1 and 3-6 are not, an
   exit 2 with no error object is not, a kill is retried under its own budget.
-- Preflight: binary present and at least 0.31.0, state location by deployment (a pod needs
+- Preflight: binary present and at least 0.32.0, state location by deployment (a pod needs
   PostgreSQL state and refuses CDC), state directory checks, a warning for `notifications:`.
 - Secrecy: XCom and the task log never carry the error message; raw stderr goes to a file.
 - `slack_failure_callback` for the Slack provider: a one-line title per failed task,
@@ -41,14 +41,16 @@ Changed before the first release, after review (see the README sections named):
   are now at DEBUG. ("Reading the task log")
 - A retry after the task process died past a successful `rivet apply` no longer applies the plan
   again: a `mode: full` export was extracted twice and an incremental one was refused
-  `RIVET_PLAN_ARTIFACT_STALE` (a failed task, its load skipped). The task records the apply it
-  starts beside the sealed plan and, on a retry, takes the run rivet's state shows for that
-  process as its result (`rivet.apply.already_applied`). ("Retries")
+  `RIVET_PLAN_ARTIFACT_STALE` (a failed task, its load skipped). rivet 0.32.0, the minimum, answers
+  the replay itself (a full plan: `already_applied` with the run that applied it; an incremental
+  one reads from the cursor its own apply moved), so the package's own record of the apply beside
+  the sealed plan and its search of `rivet metrics` are gone, as is the `apply_summary` fallback:
+  every apply reads its unit from `apply --summary-output`. ("Retries")
 - A failure Airflow will not try again (no try left) is logged at ERROR, also when rivet called it retryable, a
   crash under the crash budget or a busy lock; WARNING stays for a failure Airflow retries.
 - rivet 0.32's own answer to a replay of an applied point-in-time plan (`per_export[].status:
   already_applied`, the answering run's `run_id` and counts) is a success with that run's unit,
-  logged like the provider's own find; the word read as `failed` before. The contract test now
+  logged `SKIPPED: an earlier try already applied this plan`; the word read as `failed` before. The contract test now
   requires every status word of rivet's `run_entry_*.json` fixtures to be known.
 - Two tries of one export no longer run rivet at once: every task but `plan` holds a per-export
   (per-table for a load with `--table`) lock file whose descriptor rivet inherits, so a rivet that

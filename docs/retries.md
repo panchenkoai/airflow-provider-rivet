@@ -17,7 +17,7 @@ How rivet's exit and error object become an Airflow success, retry or stop.
 | exit 1 with a printed line saying `class: "crashed"` (a killed child, future binary) | `crashed` | the same crashed budget |
 | any other status | built: `generic` | `AirflowFailException`: no retry |
 | the package's own preflight refused | `preflight_refusal: RIVET_AIRFLOW_*` in XCom | `AirflowFailException`: no retry |
-| exit 5 with code `RIVET_STATE_RUN_IN_PROGRESS` or `RIVET_LOAD_TABLE_BUSY` (another rivet holds the export's run lease or the table's load lease; rivet's remedy is "wait, then repeat") | `refusal`, `retryable: true` whatever the line says | `AirflowException`: retried under `retries` |
+| code `RIVET_STATE_RUN_IN_PROGRESS` (rivet 0.32.0 prints it with exit class 2) or `RIVET_LOAD_TABLE_BUSY` (exit 5) (another rivet holds the export's run lease or the table's load lease; rivet's remedy is "wait, then repeat") | `refusal`, `retryable: true` whatever the line says | `AirflowException`: retried under `retries` |
 | the export's lock stayed held for `lock_wait` seconds ([Overlap](limits.md#overlap)) | `busy: RIVET_AIRFLOW_EXPORT_BUSY` in XCom; rivet is not started | `AirflowException`: retried under `retries` |
 
 The exception text is `[code] class: action (export)`. It never contains rivet's error message.
@@ -45,19 +45,12 @@ resumed by the next process.
 
 **A retry of an apply that already succeeded.** The task process can die after `rivet apply` exited
 0 and before Airflow recorded the success (OOM of the task runner, a pod evicted, a zombie). The
-retry is a try of the same series, so it used to replay the same sealed plan: a `mode: full` export
-was extracted a second time, an incremental one was refused `RIVET_PLAN_ARTIFACT_STALE` (exit 5, a
-failed task and a skipped load). Before it starts `rivet apply`, the task writes
-`<artifact>.apply.json` beside the sealed plan: the plan's SHA-256, the start time and, once the
-process runs, its pid. A retry that finds this record for the same plan bytes asks
-`rivet metrics --export X --json` for a run of the export whose status is `success` (or `skipped`)
-and whose run id, `<export>_<UTC start>_<pid>` as rivet makes it, carries the recorded pid and a
-start no earlier than the record's. When there is one, the task starts no `rivet apply`, logs
-`SKIPPED: an earlier try already applied this plan` (record `rivet.apply.already_applied`) and ends success with that run's `run_id`, `rows` and `files`. A run
-recorded `running`, `interrupted` or failed, another process's run (a `rivet run` of the export, a
-second DAG), a plan that was replaced, or a state `rivet metrics` cannot read: the plan is applied
-again, as before. Residual risk: an unrelated successful run of the same export by a rivet process
-that got the same pid after the record was written (the pid reused on that host, or another host
-sharing the state directory) would be taken for it. A checkpointed run that a later apply resumed
-under the dead run's id carries the first process's pid, so it is not recognised and the plan is
-applied again.
+retry is a try of the same series, so it replays the same sealed plan, and rivet (>= 0.32.0, the
+minimum) answers it: a point-in-time plan (`mode: full`) it already applied is not extracted again,
+the summary names the run that applied it (`status: already_applied`, `answered_by_run`), and the
+task logs `SKIPPED: an earlier try already applied this plan` (record
+`rivet.apply.already_applied`) and ends success with that run's `run_id`, `rows` and `files`. An
+incremental plan whose own apply moved the cursor is not refused `RIVET_PLAN_ARTIFACT_STALE`
+(rivet 0.31 refused it, a failed task and a skipped load): the replay reads from the moved cursor
+and finds only rows that arrived since, so nothing is extracted twice. A cursor another process
+moved is still refused STALE. An apply that failed or was killed is replayed and runs as before.

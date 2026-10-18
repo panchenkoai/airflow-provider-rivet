@@ -1,4 +1,5 @@
-"""Retries that must not run rivet twice: a try that died after its apply succeeded (G1, G1b), two tries of one export
+"""Retries that must not run rivet twice: a try that died after its apply succeeded (G1, G1b: rivet answers the
+replay), two tries of one export
 at once (G2: the per-export lock passed to rivet, the parent-death signal), and rivet's busy refusals (G2c)."""
 
 from __future__ import annotations
@@ -66,36 +67,50 @@ def alive(pid: int) -> bool:
 # --- G1 / G1b: a retry of an apply whose plan already ran to success -------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    ("export", "summary", "cursors"), [("orders", FULL, {}), ("users", INCREMENTAL, {"users": "5"})], ids=["full", "incremental"]
-)
-def test_g1b_g1_a_retry_after_the_task_died_past_a_successful_apply_does_not_apply_again(
-    rig: Rig, export: str, summary: dict, cursors: dict
-) -> None:
-    """G1b (`mode: full`) / G1 (incremental): rivet apply exited 0, the task process died before Airflow recorded the
-    success, and the retry is a try of the same series. It replayed the sealed plan: a full export was extracted a
-    second time, an incremental one was refused RIVET_PLAN_ARTIFACT_STALE (exit 5, a red DAG run with no retry). The
-    retry finds the apply it started in rivet's state and ends success with that run's unit, starting no apply."""
-    rig.scenario(flags=NEW_FLAGS, cursors=cursors, apply={"summary": summary})
-    op = rig.operator(RivetApplyOperator, export=export)
+def test_g1b_a_retry_after_the_task_died_past_a_successful_full_apply_takes_rivets_answer(rig: Rig) -> None:
+    """G1b (`mode: full`): rivet apply exited 0, the task process died before Airflow recorded the success, and the
+    retry (a try of the same series) replays the sealed plan. rivet >= 0.32 extracts nothing and answers with the run
+    that applied it (`already_applied`, `run_id` == `answered_by_run`); the task ends success with that run's unit."""
+    rig.scenario(flags=NEW_FLAGS, apply={"summary": FULL})
+    op = rig.operator(RivetApplyOperator, export="orders")
     first, _ = rig.run(op, FakeTI(try_number=1, max_tries=2))
     assert first["decision"] == "success"  # ... and the task process died before Airflow saw it
     [run] = [r for r in recorded_runs(rig) if r["status"] == "success"]
     retry, _ = rig.run(op, FakeTI(try_number=2, max_tries=2))
-    assert len(applies(rig)) == 1, f"the retry applied the plan again: {retry}"
+    assert applies(rig)[0][1] == applies(rig)[1][1], "the retry replays the same sealed artifact"
+    assert [r["run_id"] for r in recorded_runs(rig)] == [run["run_id"]], "the replay extracted again"
     assert isinstance(retry, dict) and retry["decision"] == "success", retry
-    expected = summary["per_export"][0]
     unit = retry["units"][0]
-    assert (unit["export"], unit["status"], unit["run_id"]) == (export, "success", run["run_id"])
-    assert (unit["rows"], unit["files"]) == (expected["rows"], expected["files"])
+    assert (unit["export"], unit["status"], unit["run_id"], unit["rows"], unit["files"]) == (
+        "orders",
+        "already_applied",
+        run["run_id"],
+        7,
+        2,
+    )
     [done] = rig.events("rivet.apply.already_applied")
     assert done["run_id"] == run["run_id"]
+
+
+def test_g1_a_retry_after_the_task_died_past_a_successful_incremental_apply_is_not_refused(rig: Rig) -> None:
+    """G1 (incremental): the same death after a successful apply. On rivet 0.31 the replay was refused
+    RIVET_PLAN_ARTIFACT_STALE (exit 5, a red DAG run with no retry); rivet >= 0.32 knows its own apply moved the cursor
+    and runs from there, finding nothing new: the task ends success, and nothing is extracted twice."""
+    rig.scenario(flags=NEW_FLAGS, cursors={"users": "5"}, apply={"summary": INCREMENTAL})
+    op = rig.operator(RivetApplyOperator, export="users")
+    first, _ = rig.run(op, FakeTI(try_number=1, max_tries=2))
+    assert first["decision"] == "success"
+    retry, _ = rig.run(op, FakeTI(try_number=2, max_tries=2))
+    assert isinstance(retry, dict) and retry["decision"] == "success", retry
+    unit = retry["units"][0]
+    assert (unit["status"], unit["rows"], unit["files"]) == ("success", 0, 0)
+    assert not rig.events("rivet.apply.already_applied")
 
 
 @pytest.mark.parametrize("how", ["failed", "killed"])
 def test_g1b_a_retry_after_a_failed_or_killed_apply_replays_the_plan(rig: Rig, how: str) -> None:
     """G1b negative: the apply the earlier try started did not succeed (exit 2, or killed and left `running`), so the
-    retry applies the sealed plan again, as before."""
+    retry applies the sealed plan again and rivet extracts it."""
     first_play = {"exit": 2, "line": {"error": "network", "exit_class": 2}} if how == "failed" else {"signal": "SIGKILL"}
     rig.scenario(flags=NEW_FLAGS, apply=first_play)
     op = rig.operator(RivetApplyOperator, export="orders")
@@ -106,32 +121,19 @@ def test_g1b_a_retry_after_a_failed_or_killed_apply_replays_the_plan(rig: Rig, h
     retry, _ = rig.run(op, FakeTI(try_number=2, max_tries=2))
     assert retry["decision"] == "success" and len(applies(rig)) == 2
     assert applies(rig)[0][1] == applies(rig)[1][1], "the same sealed artifact is replayed"
-    assert not rig.events("rivet.apply.already_applied")
-
-
-def test_g1b_a_successful_run_of_the_export_that_this_apply_did_not_start_is_not_taken_for_it(rig: Rig) -> None:
-    """G1b negative: after the apply failed, a `rivet run` of the same export succeeded (another process, started after
-    the apply): it is not this plan's run, so the retry still applies the plan."""
-    rig.scenario(flags=NEW_FLAGS, apply={"exit": 2, "line": {"error": "network", "exit_class": 2}}, run={"summary": FULL})
-    op = rig.operator(RivetApplyOperator, export="orders")
-    rig.run(op, FakeTI(try_number=1, max_tries=2))
-    other, _ = rig.run(rig.operator(RivetRunOperator, task_id="other", export="orders"))
-    assert other["decision"] == "success"
-    assert [r["status"] for r in recorded_runs(rig)] == ["failed", "success"]
-    rig.scenario(flags=NEW_FLAGS, apply={"summary": FULL})
-    retry, _ = rig.run(op, FakeTI(try_number=2, max_tries=2))
-    assert retry["decision"] == "success" and len(applies(rig)) == 2
+    assert retry["units"][0]["status"] == "success"
     assert not rig.events("rivet.apply.already_applied")
 
 
 def test_g1b_a_new_try_series_plans_and_applies_again(rig: Rig) -> None:
-    """G1b negative: a clear (a new `max_tries`) plans a new artifact and applies it; the record of the earlier series
-    does not stand in for it."""
+    """G1b negative: a clear (a new `max_tries`) plans a new artifact and applies it; rivet's record of the earlier
+    series' plan does not answer for it."""
     rig.scenario(flags=NEW_FLAGS, apply={"summary": FULL})
     op = rig.operator(RivetApplyOperator, export="orders")
     rig.run(op, FakeTI(try_number=1, max_tries=2))
     again, _ = rig.run(op, FakeTI(try_number=2, max_tries=4))
     assert again["decision"] == "success" and len(applies(rig)) == 2 and applies(rig)[0][1] != applies(rig)[1][1]
+    assert again["units"][0]["status"] == "success"
 
 
 # --- G2: two tries of one export at once ---------------------------------------------------------------------------------

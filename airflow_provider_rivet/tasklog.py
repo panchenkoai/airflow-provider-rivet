@@ -191,11 +191,10 @@ class TaskLog:
     def _step_lines(self) -> list[tuple[int, str]]:
         """One line per rivet process the task started, and one for a sealed plan an earlier try made."""
         lines = []
-        done = self._first("rivet.apply.already_applied")
         names = [s["step"] for s in self.steps]
-        replayed = self.command == "apply" and done is None and "plan" not in names and "apply" in names
+        replayed = self.command == "apply" and "plan" not in names and "apply" in names
         sealed = self._first("rivet.plan.sealed") or {}
-        for index, step in enumerate(self.steps):
+        for step in self.steps:
             name = step["step"]
             if replayed and name == "apply":
                 lines.append((logging.INFO, f"  {'plan':<8} replayed the sealed plan of an earlier try"))
@@ -212,12 +211,6 @@ class TaskLog:
                 text = f"sealed{f', strategy {strategy}' if isinstance(strategy, str) else ''}{took}"
             elif name == "plan":
                 text = f"plan layout written{took}"
-            elif name == "metrics" and done is not None:
-                text = f"found the earlier try's run in rivet's state{took}"
-            elif name == "metrics" and "apply" in names[index:]:
-                text = f"no earlier try's apply of this plan in rivet's state{took}"
-            elif name == "metrics":
-                text = f"read the run's counts from rivet's state{took}"
             else:
                 text = f"done{took}"
             lines.append((logging.INFO, f"  {name:<8} {text}"))

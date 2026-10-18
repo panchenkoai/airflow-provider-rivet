@@ -38,7 +38,7 @@ def test_every_structured_event_and_the_payload_carry_their_keys(rig: Rig) -> No
     """A log pipeline reads these keys (outcome 15 18 24 34 51 52 58-69, step 60 61 88 89)."""
     rig.scenario(leak_env=[], run={"summary": {"per_export": [entry()]}, "stderr": "a warning"})
     payload = payload_of(rig, rig.operator(RivetRunOperator, export="orders", stream_stderr=True))
-    assert (payload["command"], payload["exit_status"], payload["rivet_version"]) == ("run", 0, "0.31.0")
+    assert (payload["command"], payload["exit_status"], payload["rivet_version"]) == ("run", 0, "0.32.0")
     [result] = rig.events("rivet.result")
     assert set(result) == RESULT_KEYS
     assert {k: result[k] for k in RESULT_KEYS - {"event"}} == {k: payload[k] for k in RESULT_KEYS - {"event"}}
@@ -175,36 +175,19 @@ def test_a_sealed_plan_that_is_not_an_object_has_no_strategy(rig: Rig) -> None:
     assert sealed == {"event": "rivet.plan.sealed", "export": "orders", "strategy": None}
 
 
-def test_a_retry_finds_the_earlier_apply_and_says_where_its_lines_are(rig: Rig) -> None:
-    """(apply 54 55 62 63 66 67 68)"""
+def test_a_replay_rivet_answers_already_applied_names_the_export_run_and_artifact(rig: Rig) -> None:
+    """The `rivet.apply.already_applied` record of a replay rivet answered (rivet >= 0.32)."""
     rig.scenario(flags=NEW_FLAGS, apply={"summary": {"per_export": [entry()]}})
     op = rig.operator(RivetApplyOperator, export="orders")
-    rig.run(op, FakeTI(try_number=1, max_tries=2))
-    retry = payload_of(rig, op, FakeTI(try_number=2, max_tries=2))
+    first = payload_of(rig, op, FakeTI(try_number=1, max_tries=2))
+    payload_of(rig, op, FakeTI(try_number=2, max_tries=2))
     [done] = rig.events("rivet.apply.already_applied")
-    assert set(done) == {"event", "export", "run_id", "artifact"}
-    assert (done["export"], done["artifact"]) == ("orders", rig.argv("apply")[1])
-    assert retry["stderr_path"].endswith(".metrics.stderr.log") and Path(retry["stderr_path"]).exists()
-
-
-def test_a_record_of_another_export_is_not_this_applys(rig: Rig) -> None:
-    """The record must name this export, whatever its pid (applied_by_earlier_try 3)."""
-    rig.scenario(flags=NEW_FLAGS, apply={"summary": {"per_export": [entry()]}})
-    op = rig.operator(RivetApplyOperator, export="orders")
-    rig.run(op, FakeTI(try_number=1, max_tries=2))
-    artifact = Path(rig.argv("apply")[1])
-    record = artifact.with_name(f"{artifact.stem}.apply.json")
-    record.write_text(json.dumps({**json.loads(record.read_text()), "export": "users"}))
-    rig.run(op, FakeTI(try_number=2, max_tries=2))
-    assert [c["argv"][0] for c in rig.calls()].count("apply") == 2
-
-
-def test_a_failed_metrics_call_gives_no_counts_whatever_it_printed(rig: Rig) -> None:
-    """(_metrics_rows 28)"""
-    rig.scenario(metrics={"exit": 2})
-    payload = payload_of(rig, rig.operator(RivetApplyOperator, export="orders"))
-    unit = payload["units"][0]
-    assert (unit["status"], unit["run_id"], unit["rows"]) == ("success", None, None)
+    assert done == {
+        "event": "rivet.apply.already_applied",
+        "export": "orders",
+        "run_id": first["units"][0]["run_id"],
+        "artifact": rig.argv("apply")[1],
+    }
 
 
 # --- the stderr readers and the crash ledger -------------------------------------------------------------------------

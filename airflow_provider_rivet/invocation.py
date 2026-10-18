@@ -54,7 +54,6 @@ _HASHED = re.compile(r".*-[0-9a-f]{12}")
 _LOG_FILE = re.compile(r"^(?P<attempt>.+)\.[a-z]+\.(?:stderr|stdout)\.log$")
 LOCK_POLL = 0.2  # seconds between two tries of a held export lock
 BUSY_CODE = "RIVET_AIRFLOW_EXPORT_BUSY"
-APPLIED_LOOKBACK = 50  # newest `rivet metrics` rows of an export searched for the run an earlier try's apply made
 PR_SET_PDEATHSIG = 1  # <linux/prctl.h>
 
 
@@ -308,16 +307,14 @@ class _Session:
             self.degraded.add("lock_wait")
         return flags
 
-    def step(
-        self, name: str, argv: list[str], stdout_to: Path | None = None, on_start: Callable[[int], Any] | None = None
-    ) -> _Step:
+    def step(self, name: str, argv: list[str], stdout_to: Path | None = None) -> _Step:
         """Run one rivet process with stdout and stderr sent to private files, and read its error line.
 
         A stop Airflow requested before this step raises `Stopped` instead of starting rivet: on Airflow 3 the SIGTERM
         handler returns, so a stop that met no running process is seen only here (D40).
 
         The process inherits the export's lock descriptor, so the lock is held as long as rivet lives, also when the
-        task process dies first; on Linux it gets SIGTERM when the task process dies (G2). `on_start` gets its pid."""
+        task process dies first; on Linux it gets SIGTERM when the task process dies (G2)."""
         if self.stopped is not None and self.stopped():
             raise Stopped(name)
         stderr_path = self.logs / f"{self.log_name}.{name}.stderr.log"
@@ -339,8 +336,6 @@ class _Session:
             if self.on_process:
                 self.on_process(running)
             try:
-                if on_start is not None:
-                    on_start(proc.pid)
                 code = running.wait()
             except BaseException:
                 running.request_stop()
@@ -951,13 +946,6 @@ def _apply(s: _Session) -> Outcome:
     name = path_name(export, s.req.label[2], *series, _plan_inputs(s, export))
     artifact = _private_dir(s.work, "plans", s.run) / f"{name}.json"
     _refuse_foreign_artifact(artifact, export, cfg)
-    record = artifact.with_name(f"{artifact.stem}.apply.json")
-    done = _applied_by_earlier_try(s, cfg, export, artifact, record)
-    if done is not None:
-        step, unit = done
-        s.stderr_path = str(s.logs / f"{s.log_name}.metrics.stderr.log")
-        _emit_already_applied(s, export, unit, artifact)
-        return s.outcome(step, [unit], None)
     if not _unexpired(artifact):
         plan_argv = [s.pf.binary, "plan", "--config", cfg, "--export", export, "--format", "json"]
         plan_argv += ["--output", str(artifact), "--json-errors"]
@@ -975,118 +963,24 @@ def _apply(s: _Session) -> Outcome:
                 "strategy": sealed.get("strategy") if isinstance(sealed, dict) else None,
             }
         )
-    has_summary = s.pf.caps.has_flag("apply", "--summary-output")
     summary = s.work / f"{s.name}.summary.json"
-    argv = [s.pf.binary, "apply", str(artifact)]
-    if has_summary:
-        argv += ["--summary-output", str(summary)]
-    else:
-        s.degraded.add("apply_summary")
-    argv += [*s.req.extra_args, *s.globals_for("apply")]
-    now = datetime.now(UTC)
-    started = {"export": export, "artifact": _digest(artifact), "started_at": now.isoformat()}
-    record.unlink(missing_ok=True)  # an earlier try's record never stands for this try's apply
-    pids: list[int] = []
-
-    def on_start(pid: int) -> None:
-        pids.append(pid)
-        _write_atomic(record, json.dumps({**started, "pid": pid}).encode())
-
-    step = s.step("apply", argv, on_start=on_start)
+    argv = [s.pf.binary, "apply", str(artifact), "--summary-output", str(summary), *s.req.extra_args]
+    step = s.step("apply", [*argv, *s.globals_for("apply")])
     error = s.classify(step)
-    doc = s.result_file(summary, step) if has_summary else None
+    doc = s.result_file(summary, step)
     summary.unlink(missing_ok=True)
     units = _run_units(s, step, doc, error)
-    if error is None and not has_summary:
-        units = [_unit_from_metrics(s, cfg, export, pids[-1], now)]
     for unit in units:
-        if unit.status == "already_applied":  # rivet found the run that applied this plan (an earlier try's record lost)
+        # rivet >= 0.32 answers a replay of a plan it already applied with the run that applied it (an earlier try's
+        # result lost to a dead task process); an incremental plan replays as an empty run of its moved cursor
+        if unit.status == "already_applied":
             _emit_already_applied(s, export, unit, artifact)
     return s.outcome(step, units, error)
 
 
 def _emit_already_applied(s: _Session, export: str, unit: UnitResult, artifact: Path) -> None:
-    """The record that an earlier try applied the sealed plan, found by the task (G1b) or answered by rivet (0.32)."""
+    """The record that an earlier try applied the sealed plan, as rivet answered the replay."""
     s.emit({"event": "rivet.apply.already_applied", "export": export, "run_id": unit.run_id, "artifact": str(artifact)})
-
-
-def _metrics_rows(s: _Session, cfg: str, export: str, last: int) -> tuple[_Step, list[dict[str, Any]]]:
-    """The export's newest `last` rows of `rivet metrics --json`, newest first; none when the call failed."""
-    argv = [s.pf.binary, "metrics", "--config", cfg, "--export", export, "--last", str(last), "--json"]
-    out = s.work / f"{s.name}.metrics.json"
-    step = s.step("metrics", argv, stdout_to=out)
-    rows = _read_json(out)
-    out.unlink(missing_ok=True)  # pragma: no mutate - `step` opened this file before rivet started: it exists
-    if step.exit_status != 0 or not isinstance(rows, list):
-        return step, []
-    return step, [row for row in rows if isinstance(row, dict)]
-
-
-def _digest(path: Path) -> str | None:
-    """SHA-256 of a file's bytes, `None` when it cannot be read."""
-    try:
-        return hashlib.sha256(path.read_bytes()).hexdigest()
-    except OSError:
-        return None
-
-
-def _applied_by_earlier_try(s: _Session, cfg: str, export: str, artifact: Path, record: Path) -> tuple[_Step, UnitResult] | None:
-    """The successful run of the apply an earlier try of this series started, when rivet's state holds one (G1, G1b).
-
-    Once `rivet apply` has started, the task records beside the sealed plan the plan's digest, when it started the
-    process and its pid. A try that died after that apply ended (the task process killed, a zombie) left the record and
-    no result Airflow saw. The record counts only for the same plan bytes, and a run is that apply's only when
-    `_apply_run` finds it. Anything else, a plan replaced or gone, a record without a pid, a run `running`,
-    `interrupted` or failed, or no readable state, is `None`: the plan is applied as before."""
-    doc = _read_json(record)
-    if not isinstance(doc, dict) or doc.get("export") != export or type(doc.get("pid")) is not int:
-        return None
-    if doc.get("artifact") is None or doc.get("artifact") != _digest(artifact):
-        return None
-    try:
-        started = datetime.fromisoformat(str(doc["started_at"]))
-    except ValueError:
-        return None
-    if started.tzinfo is None:
-        return None
-    step, rows = _metrics_rows(s, cfg, export, APPLIED_LOOKBACK)
-    row = _apply_run(rows, export, doc["pid"], started)
-    if row is None:
-        return None
-    unit = UnitResult(export, status=row["status"], run_id=row["run_id"])
-    unit.rows, unit.files = s.malformed(row.get("total_rows"), int), s.malformed(row.get("files_produced"), int)
-    return step, unit
-
-
-def _apply_run(rows: list[dict[str, Any]], export: str, pid: int, started: datetime) -> dict[str, Any] | None:
-    """The first of `rivet metrics` rows (newest first) that is the run of the apply process `pid`, started at `started`.
-
-    rivet's own run id names it: `<export>_<UTC start, ms>_<pid of the process>`, with that pid and a start no earlier
-    than `started`'s millisecond; and only a run that ended `success` or `skipped` counts. A newer row of the same
-    export is another process's run (another config of the export name on a shared state, a run outside Airflow)."""
-    floor = started.replace(microsecond=started.microsecond // 1000 * 1000)
-    shape = re.compile(re.escape(export) + r"_(\d{8}T\d{6}\.\d{3})_(\d+)")
-    for row in rows:
-        match = shape.fullmatch(str(row.get("run_id")))
-        if row.get("export_name") != export or row.get("status") not in ("success", "skipped") or match is None:
-            continue
-        if int(match[2]) != pid or datetime.strptime(match[1], "%Y%m%dT%H%M%S.%f").replace(tzinfo=UTC) < floor:
-            continue
-        return row
-    return None
-
-
-def _unit_from_metrics(s: _Session, cfg: str, export: str, pid: int, started: datetime) -> UnitResult:
-    """The apply's unit from its own run in `rivet metrics --json` (`_apply_run`): status, counts and run id; with no
-    such row, a success without counts (the process exited 0)."""
-    _, rows = _metrics_rows(s, cfg, export, APPLIED_LOOKBACK)
-    unit = UnitResult(export)
-    row = _apply_run(rows, export, pid, started)
-    if row is not None:  # a `skip_empty` run that delivered nothing is `skipped` (D31)
-        unit.status, unit.run_id = row["status"], row["run_id"]
-        unit.skip_reason = s.malformed(row.get("skip_reason"), str)
-        unit.rows, unit.files = s.malformed(row.get("total_rows"), int), s.malformed(row.get("files_produced"), int)
-    return unit
 
 
 def _plan(s: _Session) -> Outcome:
