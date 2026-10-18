@@ -36,11 +36,13 @@ class StandSecrets:
     jwt: str
     mysql: str
     mysql_root: str
+    mssql: str
+    mssql_root: str
     fernet: str
 
     @classmethod
     def generate(cls) -> StandSecrets:
-        return cls(*(secrets.token_hex(16) for _ in range(8)), fernet=base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())
+        return cls(*(secrets.token_hex(16) for _ in range(10)), fernet=base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())
 
 
 def write_private(path: Path, text: str) -> None:
@@ -144,6 +146,15 @@ def sh(
     return done
 
 
+def state_db(engine: str, kind: str) -> str:
+    """The state database of one config of a source leg."""
+    return f"rivet_state_{engine}_{kind}"
+
+
+def state_conn_id(engine: str, kind: str) -> str:
+    return f"rivet_gate_state_{engine}_{kind}"
+
+
 class Stand:
     """A compose project under `work/<version>`: Airflow from the official compose plus the gate overlay."""
 
@@ -201,6 +212,21 @@ class Stand:
                 "extra": {"rivet_params": "sslmode=require"},
             },
             **{e.conn_id: e.connection(self.secrets) for e in self.sources},
+            # A database of its own per config of a source leg: SQL Server's init names its CDC exports after their
+            # tables, as the batch ones, and an export's state is keyed by its name and source (one state, one name).
+            **{
+                state_conn_id(e.name, kind): {
+                    "conn_type": "postgres",
+                    "host": "gate-state",
+                    "port": 5432,
+                    "login": "rivet",
+                    "password": self.secrets.state,
+                    "schema": state_db(e.name, kind),
+                    "extra": {"rivet_params": "sslmode=require"},
+                }
+                for e in self.sources
+                for kind in ("batch", "cdc")
+            },
             **self.extra_connections,
         }
 
@@ -327,9 +353,9 @@ class Stand:
         """The host port docker published for a service's container port."""
         return int(self.compose("port", service, str(port)).stdout.strip().rsplit(":", 1)[1])
 
-    def state_url(self) -> str:
-        """The stack's PostgreSQL state as `rivet init` reads it inside the stack's network (the `rivet_gate_state` Connection)."""
-        return f"postgresql://rivet:{self.secrets.state}@gate-state:5432/rivet_state?sslmode=require"
+    def state_url(self, db: str = "rivet_state") -> str:
+        """A PostgreSQL state of the stack as `rivet init` reads it inside the stack's network (the Connection of `db`)."""
+        return f"postgresql://rivet:{self.secrets.state}@gate-state:5432/{db}?sslmode=require"
 
     def psql(self, service: str, db: str, sql: str) -> str:
         """Run SQL through psql inside a database container; the unaligned result."""

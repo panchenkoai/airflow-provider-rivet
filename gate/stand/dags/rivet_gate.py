@@ -78,6 +78,17 @@ for wh in filter(None, os.environ.get("GATE_WAREHOUSES", "").split(",")):
     )
 
 
+def leg_kwargs(engine: str, kind: str) -> dict:
+    """The config's own PostgreSQL state: the one `rivet init` recorded the source's primary keys in."""
+    return {
+        "env_from_connections": {
+            f"RIVET_GATE_{engine.upper()}_URL": f"rivet_gate_{engine}",
+            "RIVET_STATE_URL": f"rivet_gate_state_{engine}_{kind}",
+        },
+        "connections": ["gate_gcp"],
+    }
+
+
 # Source legs (gate/sources.py): another engine to GCS and BigQuery, on the configs `rivet init` wrote; the export and
 # stream names are init's, read from the shape the gate wrote beside them (no DAG until it exists).
 for engine in filter(None, os.environ.get("GATE_SOURCES", "").split(",")):
@@ -86,14 +97,7 @@ for engine in filter(None, os.environ.get("GATE_SOURCES", "").split(",")):
         continue
     with open(shape_file) as handle:
         shape = json.load(handle)
-    kwargs = {
-        # The stack's PostgreSQL state: the one `rivet init` recorded the source's primary keys in.
-        "env_from_connections": {
-            f"RIVET_GATE_{engine.upper()}_URL": f"rivet_gate_{engine}",
-            "RIVET_STATE_URL": "rivet_gate_state",
-        },
-        "connections": ["gate_gcp"],
-    }
+
     batch = shape["batch"]["exports"]
     globals()[f"gate_src_{engine}_batch"] = build_batch_dag(
         f"gate_src_{engine}_batch",
@@ -101,15 +105,17 @@ for engine in filter(None, os.environ.get("GATE_SOURCES", "").split(",")):
         state_dir=f"{ROOT}/state/{engine}_batch",
         exports=batch,
         compact_exports=batch,
-        operator_kwargs=kwargs,
+        operator_kwargs=leg_kwargs(engine, "batch"),
         tags=["rivet", "gate", "source", engine],
     )
-    globals()[f"gate_src_{engine}_cdc"] = build_cdc_dag(
-        f"gate_src_{engine}_cdc",
-        config=f"{ROOT}/configs/{engine}_cdc/rivet.yaml",
-        export=shape["cdc"]["stream"],
-        tables=shape["cdc"]["tables"],
-        state_dir=f"{ROOT}/state/{engine}_cdc",
-        operator_kwargs=kwargs,
-        tags=["rivet", "gate", "source", engine],
-    )
+    # One DAG per CDC stream: one over every table, or one per table where the engine captures per table (SQL Server).
+    for stream in shape["cdc"]["streams"]:
+        globals()[f"gate_src_{engine}{stream['dag']}"] = build_cdc_dag(
+            f"gate_src_{engine}{stream['dag']}",
+            config=f"{ROOT}/configs/{engine}_cdc/rivet.yaml",
+            export=stream["name"],
+            tables=stream["tables"],
+            state_dir=f"{ROOT}/state/{engine}_cdc",
+            operator_kwargs=leg_kwargs(engine, "cdc"),
+            tags=["rivet", "gate", "source", engine],
+        )

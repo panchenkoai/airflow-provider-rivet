@@ -11,6 +11,7 @@ import tomllib
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 from collections import Counter
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -400,7 +401,8 @@ def may_skip(dag_ids: Sequence[str]) -> dict[str, tuple[str, ...]]:
 # Each warehouse is read by a client the loader does not use (google-cloud-bigquery, snowflake-connector-python, the
 # ClickHouse HTTP interface as JSON), each hands back its own Python shapes, and every value is brought to one form
 # before the comparison: an integer, integer cents for an exact decimal (a sub-cent value stays a Decimal, never
-# rounded away), epoch microseconds for an instant (a naive one is UTC), text as text.
+# rounded away), epoch microseconds for an instant (a naive one is UTC), a UUID in its text form, bytes as hex, text
+# as text.
 
 EPOCH = datetime(1970, 1, 1, tzinfo=UTC)
 DELETED_FLAG = "__is_deleted"
@@ -419,6 +421,10 @@ def kinds_of(rows: Sequence[Mapping[str, Any]]) -> dict[str, str]:
                 kinds[col] = "money"
             elif isinstance(value, datetime):
                 kinds[col] = "ts"
+            elif isinstance(value, uuid.UUID):
+                kinds[col] = "uuid"
+            elif isinstance(value, bytes | bytearray | memoryview):
+                kinds[col] = "bytes"
             else:
                 kinds[col] = "text"
     return kinds
@@ -448,6 +454,13 @@ def canon(kind: str | None, value: Any) -> Any:
         return (delta.days * 86400 + delta.seconds) * 1_000_000 + delta.microseconds
     if kind == "text":
         return str(value)
+    if kind == "uuid":
+        # 16 bytes in RFC 4122 order (a Parquet UUID read back as BYTES), or any spelling of the text form.
+        return str(
+            uuid.UUID(bytes=bytes(value)) if isinstance(value, bytes | bytearray) and len(value) == 16 else uuid.UUID(str(value))
+        )
+    if kind == "bytes":
+        return bytes(value).hex() if isinstance(value, bytes | bytearray | memoryview) else str(value)
     return value
 
 
