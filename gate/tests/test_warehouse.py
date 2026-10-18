@@ -388,3 +388,15 @@ def test_a_release_older_than_0_32_is_refused_before_anything_is_downloaded(tmp_
     assert "is older than the minimum v0.32.0" in refused.value.stdout
     calls = (tmp_path / "calls").read_text().splitlines() if (tmp_path / "calls").exists() else []
     assert not any(c.startswith(("gh release download", "docker")) for c in calls), calls
+
+
+def test_a_uuid_and_bytes_compare_by_value_whatever_shape_the_warehouse_hands_back() -> None:
+    import uuid
+
+    u = uuid.UUID("5050beba-37a8-48ab-ab22-49de93372036")
+    kinds = warehouse.kinds_of([{"u": u, "b": b"\x00\xff"}])
+    assert kinds == {"u": "uuid", "b": "bytes"}
+    for read_back in (u.bytes, str(u).upper(), str(u)):
+        assert warehouse.canon("uuid", read_back) == str(u)
+    assert warehouse.canon("uuid", u.bytes_le) != str(u), "SQL Server's mixed-endian byte order is a different UUID"
+    assert warehouse.canon("bytes", b"\x00\xff") == warehouse.canon("bytes", memoryview(b"\x00\xff")) == "00ff"
