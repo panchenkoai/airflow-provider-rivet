@@ -1,4 +1,4 @@
-"""What the README and the CHANGELOG say, held to the code: parameters, connection kinds, and the warehouse compaction."""
+"""What the docs (README and docs/) and the CHANGELOG say, held to the code: parameters, connection kinds, compaction."""
 
 from __future__ import annotations
 
@@ -6,28 +6,19 @@ import inspect
 import re
 from pathlib import Path
 
-from conftest import Rig
+from conftest import DOCS, Rig, doc_section
 
 from airflow_provider_rivet import dags
 from airflow_provider_rivet.connections import KINDS
 from airflow_provider_rivet.operators import RivetBaseOperator, RivetCompactOperator
 
 ROOT = Path(__file__).resolve().parents[1]
-README = (ROOT / "README.md").read_text()
 CHANGELOG = (ROOT / "CHANGELOG.md").read_text()
 # What real rivet prints for a table of a Snowflake or ClickHouse export, then exits 0 (src/load/compact.rs,
 # `compact_skip_reason` and its `eprintln!`): rivet 0.31.0 and main have no `--summary-output` on compact.
 WAREHOUSE_COMPACT_SKIP = (
     "  compact [orders]: skipped — this warehouse keeps a change log behind a view and never compacts; nothing to merge"
 )
-
-
-def section(heading: str) -> str:
-    """The README text under one heading, up to the next heading of the same or a higher level."""
-    level = heading.split(" ", 1)[0]
-    start = README.index(heading + "\n") + len(heading) + 1
-    stop = re.compile(rf"^#{{1,{len(level)}}} ", re.M).search(README, start)
-    return README[start : stop.start() if stop else len(README)]
 
 
 def keyword_parameters(fn: object) -> list[str]:
@@ -49,14 +40,14 @@ def test_d30_a_warehouse_compact_on_todays_rivet_ends_compacted_as_the_readme_sa
     assert isinstance(payload, dict), f"the task did not succeed: {payload!r}"
     assert [u["status"] for u in payload["units"]] == ["compacted"] and payload["skip_reason"] is None
     assert "load_result" in payload["degraded"]
-    text = section("## Storage and warehouse connections")
-    assert "compact task is skipped" not in README, "README claims a skip today's binary never produces"
-    assert "`compacted`" in text and "`compact=False`" in text, "README must say the task ends `compacted` and how to drop it"
-    row = next(line for line in section("## Operators").splitlines() if line.startswith("| `RivetCompactOperator`"))
+    text = doc_section("## Storage and warehouse connections")
+    assert "compact task is skipped" not in DOCS, "the docs claim a skip today's binary never produces"
+    assert "`compacted`" in text and "`compact=False`" in text, "the docs must say the task ends `compacted` and how to drop it"
+    row = next(line for line in doc_section("## Operators").splitlines() if line.startswith("| `RivetCompactOperator`"))
     assert "`load_result`" in row, "the skip-to-Airflow-skip note holds only for a binary with compact's summary"
 
 
-def test_d30_every_builder_parameter_is_named_in_its_readme_section() -> None:
+def test_d30_every_builder_parameter_is_named_in_its_doc_section() -> None:
     """D30: `build_cdc_dag(compact=...)`, the way to drop the compaction no-op, was in no README text."""
     missing = [
         f"{fn.__name__}({p}=)"
@@ -65,17 +56,17 @@ def test_d30_every_builder_parameter_is_named_in_its_readme_section() -> None:
             (dags.build_cdc_dag, "### CDC: `build_cdc_dag`"),
         )
         for p in keyword_parameters(fn)
-        if not named(section(heading), p)
+        if not named(doc_section(heading), p)
     ]
-    assert not missing, f"the README's builder sections do not name {missing}"
+    assert not missing, f"the builder sections of docs/dag-builders.md do not name {missing}"
 
 
 def test_d39_the_operator_parameter_list_names_every_init_parameter() -> None:
     """D39: the README's "All of them take" list left out `connections`, `table` and `plan_file`."""
-    text = section("## Operators")
+    text = doc_section("## Operators")
     listed = text[text.index("All of them take") : text.index("Templated:")]
     missing = [p for p in keyword_parameters(RivetBaseOperator.__init__) if not named(listed, p)]
-    assert not missing, f"the README's parameter list does not name {missing}"
+    assert not missing, f"the parameter list of docs/operators.md does not name {missing}"
 
 
 def test_d39_the_changelog_names_connections_and_every_connection_kind() -> None:

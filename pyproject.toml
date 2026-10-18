@@ -66,7 +66,7 @@ testpaths = ["tests"]
 filterwarnings = ["ignore::DeprecationWarning"]
 
 [tool.mutmut]
-# Mutation testing (README, "Mutation testing"; run by `make mutants`): only the product package is mutated —
+# Mutation testing (docs/development.md, "Mutation testing"; run by `make mutants`): only the product package is mutated —
 # not tests/, gate/ or examples/, which are copied so the documentation tests that read them still run.
 source_paths = ["airflow_provider_rivet/"]
 also_copy = ["README.md", "CHANGELOG.md", "LICENSE", "RIVET_CONTRACT_REF", ".github/", "docs/", "examples/", "gate/", "dev/"]

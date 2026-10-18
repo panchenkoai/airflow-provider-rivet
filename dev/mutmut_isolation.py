@@ -1,4 +1,4 @@
-"""pytest plugin for mutation runs only (README, "Mutation testing"): each mutmut worker gets its own scratch space.
+"""pytest plugin for mutation runs only (docs/development.md, "Mutation testing"): each mutmut worker gets its own scratch space.
 
 mutmut forks one worker per mutant and runs the workers in parallel. Two things the suite shares across one process
 would then be shared across concurrent workers:

@@ -10,7 +10,7 @@ from importlib import metadata
 from pathlib import Path
 
 import pytest
-from conftest import fixture
+from conftest import DOCS, fixture
 
 from airflow_provider_rivet import __version__, get_provider_info
 from airflow_provider_rivet.callbacks import format_failure
@@ -168,7 +168,7 @@ def test_the_watcher_carries_no_failure_callback_from_default_args() -> None:
         assert no_callback(dag.get_task("watcher")), "the watcher would send a second message with no rivet result in it"
         others = [t for t in dag.tasks if t.task_id != "watcher"]
         assert others and all(not no_callback(t) for t in others)
-    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text()
+    readme = DOCS
     assert "The `watcher` task carries no failure callback" in readme
 
 

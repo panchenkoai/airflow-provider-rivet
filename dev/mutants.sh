@@ -1,5 +1,5 @@
 #!/bin/sh
-# Mutation testing of airflow_provider_rivet/ in a Linux container (README, "Mutation testing"); `make mutants`.
+# Mutation testing of airflow_provider_rivet/ in a Linux container (docs/development.md, "Mutation testing"); `make mutants`.
 # Linux, never the host's macOS Python: mutmut forks a worker per mutant, and macOS aborts a forked child of a
 # multithreaded process that touches Objective-C (psutil under Airflow's import), so a mutant's verdict there is the
 # crash, not its tests. Linux also runs the PR_SET_PDEATHSIG test of tests/test_retry.py.

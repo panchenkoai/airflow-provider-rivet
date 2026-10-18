@@ -21,6 +21,40 @@ Two ways to connect, both set up below:
 
 A webhook cannot thread: Slack answers it with `ok`, not with the message id a reply needs.
 
+## In short
+
+A failed rivet task posts one title to a Slack channel, `dag_id.task_id — <error type>` (the
+rivet code and `final` or `retryable`, else the exception's class), with the run id and a
+task-log link; its error text (rivet's error line for the failed step, else the exception's
+message, through Airflow's secrets masker) is a code block in the thread. A bot token
+(`slack` Connection, scope `chat:write`, `channel=` the channel id) threads; an incoming webhook
+(`slackwebhook` Connection, no `channel`) posts title and error text as one message.
+
+```python
+from airflow_provider_rivet.callbacks import slack_failure_callback
+from airflow_provider_rivet.dags import build_batch_dag
+
+dag = build_batch_dag(
+    "rivet_postgres",
+    config="/opt/rivet/configs/postgres.yaml",
+    state_dir="/opt/rivet/state",
+    exports=["users", "orders"],
+    default_args={"retries": 2, "on_failure_callback": slack_failure_callback("slack_rivet", channel="C0123ABCDEF")},
+)
+```
+
+The `watcher` task carries no failure callback: the builders set its `on_failure_callback` to
+none, so a failed run sends one message per failed task and nothing for the watcher (which has no
+rivet result to show). Unlike XCom and the task log ([Secrets](connections-and-secrets.md#secrets)), the thread carries rivet's error
+text, which can hold source values. `format_title`, `format_error_text` and `format_failure` are
+the formatters on their own, to send through another channel.
+
+Mutual exclusion: under Airflow, rivet's own notifications are off and alerting is Airflow's.
+The operators pass `--no-notify` to a binary that has it. Until then **do not configure
+`notifications:` in a rivet config run under Airflow**: every failure would be sent twice. The
+operator warns (a WARNING `note` line; record `rivet.warning`, `notifications_block`) when it sees
+the block.
+
 ## 1. Install the Slack provider
 
 On every worker, and wherever the scheduler or DAG processor parses DAGs:
@@ -77,8 +111,8 @@ wc -c < ~/.config/rivet/slack_bot_token    # a bot token is about 55-60 bytes; n
 `0600` from the start. The steps below read it and never print it.
 
 Where the Connection lives decides who else can read it. The reasoning, and the same choice for
-the database and warehouse Connections, is in the README section "Connections and secrets:
-recommended setup" (added by #21).
+the database and warehouse Connections, is in [Connections and secrets: recommended
+setup](connections-and-secrets.md#connections-and-secrets-recommended-setup).
 
 **Recommended: a secrets backend** (Google Secret Manager, AWS Secrets Manager, Vault). With
 Airflow's Secret Manager backend configured as in that section (`connections_prefix:
@@ -206,7 +240,7 @@ stderr file on the worker):
 The thread holds no Python traceback and no other stderr line: they are in the task log and in
 the stderr file, which the task log names.
 
-**What the thread can hold.** Unlike XCom and the task log (README, "Secrets"), the thread
+**What the thread can hold.** Unlike XCom and the task log ([Secrets](connections-and-secrets.md#secrets)), the thread
 carries rivet's error text, and that text can hold source values (a cell that failed to
 convert). The callback passes it through Airflow's secrets masker: every Connection password and
 masked value the task saw becomes `***` (rivet already removes credentials from its own error
