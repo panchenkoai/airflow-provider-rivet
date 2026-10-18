@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import oracle, warehouse
+from . import oracle, sources, warehouse
 from .stand import Stand
 
 TABLES = {
@@ -292,12 +292,16 @@ def run_cycle(
     history: dict[str, list[list[str]]],
     sabotage: str | None,
     leg: warehouse.Leg | None,
+    src_legs: list[sources.SourceLeg] | None = None,
 ) -> tuple[set[str], dict[str, Any]]:
-    """One cycle: the source changes, every DAG runs (the SQLite writers overlapping), each oracle grades."""
+    """One cycle: the sources change, every DAG runs (the SQLite writers overlapping), each oracle grades."""
     run_id = f"gate_{n}_{name}"
     if changes:
         stand.psql("gate-source", "rivet", changes)
-    dags = DAGS + (leg.dags if leg else [])
+        for src in src_legs or []:
+            src.apply_changes(stand)
+    src_legs = src_legs or []
+    dags = DAGS + (leg.dags if leg else []) + [d for src in src_legs for d in src.dags]
     states = trigger_cycle(stand, v, name, run_id, dags)
     files_after = parquet(stand.rivet_dir / "out")
     new = files_after - files_before
@@ -316,18 +320,30 @@ def run_cycle(
         if sabotage == "warehouse-value" and name == "delta":
             print(f"SABOTAGE {leg.sabotage()}", flush=True)
         leg.grade(stand, v, name, {t: DELETED_BY_BATCH[name] if t == "gate_orders" else 0 for t in TABLES})
+    for src in src_legs:
+        grade_runs(stand, v, name, run_id, states, src.tasks, may_skip=src.may_skip)
+        src.grade(stand, v, name)
     return files_after, marks
 
 
-def play(stand: Stand, v: Verdicts, sabotage: str | None, leg: warehouse.Leg | None = None) -> None:
+def play(
+    stand: Stand,
+    v: Verdicts,
+    sabotage: str | None,
+    leg: warehouse.Leg | None = None,
+    src_legs: list[sources.SourceLeg] | None = None,
+) -> None:
     """Seed, configure, and run the three cycles."""
+    src_legs = src_legs or []
     stand.psql("gate-source", "rivet", SEED)
     write_configs(stand.rivet_dir)
     if leg:
         leg.prepare(stand)
-    stand.wait_dags(DAGS + (leg.dags if leg else []))
+    for src in src_legs:
+        src.prepare(stand)
+    stand.wait_dags(DAGS + (leg.dags if leg else []) + [d for src in src_legs for d in src.dags])
     files: set[str] = set()
     high_water: dict[str, Any] = {}
     history: dict[str, list[list[str]]] = {state: [] for state in STATES}
     for n, (name, changes, ops) in enumerate(CYCLES, start=1):
-        files, high_water = run_cycle(stand, v, n, name, changes, ops, files, high_water, history, sabotage, leg)
+        files, high_water = run_cycle(stand, v, n, name, changes, ops, files, high_water, history, sabotage, leg, src_legs)

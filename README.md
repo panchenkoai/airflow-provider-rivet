@@ -439,6 +439,10 @@ SQLite state in `state_dir`.
    directory (the state database with its `-wal` and `-shm` files; the checkpoint to the same
    relative path), and run again. Using the config's own directory as `state_dir` needs no copy
    and no move.
+   **After `rivet init -o X`:** init records the source's primary keys in a `.rivet_state.db`
+   beside `X`, which the task then refuses the same way: move it (with `-wal` and `-shm`) into
+   `state_dir`, or run `init` with `RIVET_STATE_URL` set to the PostgreSQL state the tasks use.
+   rivet 0.32.1 adds `RIVET_STATE_URL=sqlite:<path>`, so init and the tasks can name one file.
 4. **What breaks when a task sees a different or an empty directory.** rivet creates a new,
    empty state there and treats every export as a first run: an incremental export re-reads
    from the start, a CDC stream re-anchors and the changes between the lost position and the new
@@ -852,6 +856,23 @@ cycle deleted left over (an incremental extract cannot see a delete); the CDC cu
 that DAG may not skip. `--sabotage warehouse-value` adds a cent to one BigQuery row after the delta load and must turn
 it red. The cleanup lists the dataset, schema and GCS prefix again and fails on anything left; the sweep of runs older
 than a day drops only names of the gate's own shape.
+
+**Source legs.** `--sources mysql` (needs `--warehouses` with `bigquery`) adds another source engine beside the
+postgres one: a MySQL 8.4 container in the stack (row binlog with `binlog_row_metadata=FULL`, GTIDs, utf8mb4) with
+the same tables in MySQL types (`DATETIME(6)` and `TIMESTAMP(6)` cursors, `DECIMAL(12,2)`, Cyrillic text), the same
+three cycles, and two DAGs: incremental batch and one CDC stream, each extracted to GCS and loaded and compacted into
+BigQuery from the `rivet_gate_mysql` and `gate_gcp` Connections. Every rivet config of the leg is the one
+`rivet init` writes against the live source inside the stack (`--mode incremental` / `--mode cdc`, `--gcs-bucket`,
+`--bigquery-project`, `--bigquery-dataset`), used as written: init's prefixes are fixed (`exports/<table>/`, `cdc/`),
+so the gate gives it a bucket of the run's own (`rivet-afgate-<tag>-<stack>-<engine>`), and since init names the
+batch exports after their tables, the batch and CDC loads get a dataset each; the export and stream names the DAGs
+run are read from what init wrote. init and the DAGs share the stack's TLS PostgreSQL state (`RIVET_STATE_URL`, the
+`rivet_gate_state` Connection), so the primary keys init records are the ones the runs read, and nothing is left beside
+the config (the leg fails if init leaves a `.rivet_state.db` there). rivet 0.31's `init` gives every MySQL stream the replica id `server_id: 4271`, so
+the leg runs one CDC config per MySQL server. Oracles: each compacted BigQuery base, read by google-cloud-bigquery,
+equals the source read by DuckDB's mysql scanner value by value (batch: with exactly the keys the cycle deleted left
+over; CDC: without the rows flagged `__is_deleted`), and no `__changes` buffer is left. The cleanup deletes the bucket
+and both datasets and looks again; the sweep drops gate-shaped buckets older than a day.
 
 **Connection legs.** Each stack runs with passwords made for it (32 random hex digits for the source, state,
 ClickHouse and metastore databases and the admin user) and a generated Fernet key, so no task log masks a word it

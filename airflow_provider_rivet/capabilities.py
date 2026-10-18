@@ -147,8 +147,8 @@ class Capabilities:
         """Run a probe with a minimal environment and return its stdout; `ProbeFailed` for every probe that does not answer."""
         env = {"PATH": os.environ.get("PATH", ""), "HOME": os.environ.get("HOME", "")}
         shown = " ".join(argv)
-        try:
-            done = subprocess.run(argv, capture_output=True, text=True, timeout=PROBE_TIMEOUT, env=env, check=False)
+        try:  # no `check=`: the exit code is read below
+            done = subprocess.run(argv, capture_output=True, text=True, timeout=PROBE_TIMEOUT, env=env)
         except subprocess.TimeoutExpired as exc:
             raise ProbeFailed(f"`{shown}` did not answer within {PROBE_TIMEOUT}s") from exc
         except (OSError, ValueError) as exc:
