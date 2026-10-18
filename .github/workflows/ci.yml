@@ -78,7 +78,7 @@ jobs:
       - name: Install Airflow ${{ matrix.airflow }} under its constraints, then the package
         run: |
           uv venv --python ${{ matrix.python }}
-          uv pip install "apache-airflow==${{ matrix.airflow }}" apache-airflow-providers-slack pytest \
+          uv pip install "apache-airflow==${{ matrix.airflow }}" apache-airflow-providers-slack "rivet-cli>=0.32.0" pytest \
             --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-${{ matrix.airflow }}/constraints-${{ matrix.python }}.txt"
           uv pip install --no-deps -e .
       - run: .venv/bin/python -m pytest -q

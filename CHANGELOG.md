@@ -3,9 +3,12 @@
 All notable changes to `airflow-provider-rivet`. The package is versioned independently of the
 rivet binary; its release tags will use the prefix `airflow-v`.
 
-## 0.1.0 (unreleased)
+## 0.1.0 (2026-10-18)
 
 First release, against rivet 0.32.0 and the contract of ADR-0039; Python 3.12+, Airflow 2.10 and 3.x.
+
+- Depends on `rivet-cli>=0.32.0`, which installs the rivet binary; without `rivet` on the worker's
+  `PATH` the operators run the binary it installed into Airflow's environment.
 
 - Operators: `RivetApplyOperator`, `RivetRunOperator`, `RivetCdcRunOperator`, `RivetLoadOperator`,
   `RivetCompactOperator`, `RivetPlanOperator`; one invocation module builds argv and env, runs
