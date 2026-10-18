@@ -61,6 +61,15 @@ def test_a_killed_process_has_no_exit_status_and_its_cut_line_is_not_malformed_o
     assert "result_malformed" not in result["degraded"]
 
 
+def test_a_failed_process_whose_error_line_is_cut_is_recorded_malformed(rig: Rig) -> None:
+    """Exit 1 with a broken `{` line and no whole one: the error is built from the exit and the cut line is
+    recorded (step 100: the broken flag reaches `classify`)."""
+    rig.scenario(run={"line_raw": '{"exit_class": 2, "err', "exit": 1})
+    rig.run(rig.operator(RivetRunOperator, export="orders"))
+    [result] = rig.events("rivet.result")
+    assert "result_malformed" in result["degraded"]
+
+
 @pytest.mark.parametrize(
     ("bad", "field", "shown"),
     [({"rows": "7"}, "rows", None), ({"status": "weird"}, "status", "failed")],
