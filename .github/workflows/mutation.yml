@@ -1,6 +1,6 @@
 name: Mutation
 
-# Mutation testing of airflow_provider_rivet/ with mutmut (README, "Mutation testing"; dev/mutants_gate.py), on Linux
+# Mutation testing of airflow_provider_rivet/ with mutmut (docs/development.md, "Mutation testing"; dev/mutants_gate.py), on Linux
 # so the PR_SET_PDEATHSIG test runs. When mutants run:
 # 1. A pull request that changes airflow_provider_rivet/ code: the mutants of every function it touches; one not killed
 #    that mutates a line the pull request changed fails the job (a survivor elsewhere in the function is listed). Nothing else runs on a pull request: a change to tests or to the harness gets no mutants.

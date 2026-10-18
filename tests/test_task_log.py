@@ -30,7 +30,7 @@ from airflow_provider_rivet.operators import (
     RivetRunOperator,
 )
 
-GUIDE = "https://github.com/panchenkoai/airflow-provider-rivet#local-worker-setup-guide"
+GUIDE = "https://github.com/panchenkoai/airflow-provider-rivet/blob/main/docs/state.md#local-worker-setup-guide"
 SQLITE = f"  note     SQLite state is single-host — see {GUIDE}"
 OLD_LACKS = "  note     this binary lacks: apply_summary, lock_wait, no_notify (the operator works around them)"
 

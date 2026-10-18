@@ -203,3 +203,7 @@ is now the one place rivet's environment is assembled; README "Storage and wareh
   Google Secret Manager through a reader limited to the gate's secrets, `--gcp-auth adc` runs
   rivet keyless as the containers' identity; each has cells proving where the Connection came
   from, and the cleanup and sweep delete the secrets.
+- Documentation: the README is a front page (the flow picture with rivet inside Airflow, badges,
+  how the operators work, install, one example) and links the pages under `docs/`: operators,
+  DAG builders, retries, state, connections and secrets, Slack alerts, capabilities, overlap and
+  limits, development. The setup-guide link the operators print points at `docs/state.md`.

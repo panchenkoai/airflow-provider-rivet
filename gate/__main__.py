@@ -1,7 +1,7 @@
 """python -m gate --rivet-bin <linux rivet> [--airflow 2.10.5,3.3.2] [--sources mysql] [--verdicts out.jsonl] [--keep] [--sabotage drop-delta-file|warehouse-value]
 
 With --warehouses: [--connections env|gsm] [--gcp-auth key|adc] choose where the stack's Connections live and how
-rivet authenticates to GCP; see "Connections and secrets" in the README.
+rivet authenticates to GCP; see docs/connections-and-secrets.md.
 
 Exit 0 only when every cell ran and passed; each stack is torn down (volumes too) before and after it runs.
 """

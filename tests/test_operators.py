@@ -14,7 +14,7 @@ from types import SimpleNamespace
 import pytest
 import yaml
 from airflow.exceptions import AirflowException, AirflowFailException, AirflowSkipException
-from conftest import NEW_FLAGS, SECRET, FakeTI, Rig, fixture
+from conftest import DOCS, NEW_FLAGS, SECRET, FakeTI, Rig, fixture
 
 from airflow_provider_rivet import invocation
 from airflow_provider_rivet.dags import read_plan_layout
@@ -626,7 +626,7 @@ def test_the_subprocess_gets_the_allow_list_and_what_the_operator_declares_and_n
     assert not keys & {"AZURE_CLIENT_SECRET", "AIRFLOW__CORE__FERNET_KEY", "HOMEBREW_GITHUB_API_TOKEN", "PATH_SECRET"}
     with pytest.raises(ValueError, match="cloud_credentials"):
         RivetRunOperator(task_id="t", config="c.yaml", cloud_credentials=["gcs"])
-    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text()
+    readme = DOCS
     assert all(f"`{name}`" in readme for name in ENV_ALLOWLIST), "README lists the allow-list"
 
 
@@ -950,7 +950,7 @@ def test_a_worker_state_url_the_task_does_not_pass_on_is_refused_before_rivet_st
         monkeypatch.setenv("RIVET_STATE_URL", used)
         exc, _ = rig.run(rig.operator(RivetRunOperator, export="orders"))
         assert isinstance(exc, AirflowFailException) and "RIVET_AIRFLOW_STATE_ENV_NOT_PASSED" in str(exc), used
-    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text()
+    readme = DOCS
     assert "RIVET_AIRFLOW_STATE_ENV_NOT_PASSED" in readme and "RIVET_AIRFLOW_PLAN_ARTIFACT_FOREIGN" in readme
 
 
@@ -1250,7 +1250,7 @@ def test_pruning_removes_only_this_tasks_own_files_and_never_an_older_layouts(ri
     assert [p.exists() for p in mine] == [False, False, True] * 2, "retention still counts this task's own tries"
     assert all(p.exists() and p.read_text().startswith("written for") for p in old), "a file of the older layout is left alone"
     assert not any(p.parent in {m.parent for m in mine} for p in old), "the new layout's folder is never an older layout's folder"
-    readme = (Path(__file__).resolve().parents[1] / "README.md").read_text()
+    readme = DOCS
     assert "Upgrading a state directory" in readme
 
 

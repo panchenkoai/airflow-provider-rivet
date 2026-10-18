@@ -1,8 +1,8 @@
 """Example: Slack alerts for rivet tasks, and two DAGs that fail on purpose so you can see one arrive.
 
 `slack_failure_callback(conn_id)` in `default_args` posts one message per failed rivet task (never for the
-watcher): a title `dag.task — <error type>` and, with a bot token, the full trace in its thread. See README
-"Slack alerts" for the whole setup.
+watcher): a title `dag.task — <error type>` and, with a bot token, the full trace in its thread. See docs/slack.md
+for the whole setup.
 
 Set on the worker before the scheduler parses this file:
   RIVET_EXAMPLE_STATE_DIR  an existing directory on a host volume (as for rivet_provider_batch.py)

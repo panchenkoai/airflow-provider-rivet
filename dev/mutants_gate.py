@@ -1,6 +1,6 @@
-"""The mutation gate of CI and the release (README, "Mutation testing"); run inside the project environment.
+"""The mutation gate of CI and the release (docs/development.md, "Mutation testing"); run inside the project environment.
 
-    python dev/mutants_gate.py mode [BASE]           # targeted / none: what a pull request runs (README policy)
+    python dev/mutants_gate.py mode [BASE]           # targeted / none: what a pull request runs (docs/development.md policy)
     python dev/mutants_gate.py changed [BASE]        # the mutmut name globs of the functions `git diff BASE...HEAD` touches
     python dev/mutants_gate.py pr [BASE]             # run those mutants; fail on any that is not killed
     python dev/mutants_gate.py full                  # run every mutant; fail when more survive than `.mutmut-ratchet`
@@ -78,7 +78,7 @@ def mangled_functions(path: str) -> list[tuple[str, int, int]]:
 
 
 def mode(base: str) -> tuple[str, list[str]]:
-    """`targeted` or `none` for a pull request, and why (README, "Mutation testing"). A pull request never gets the
+    """`targeted` or `none` for a pull request, and why (docs/development.md, "Mutation testing"). A pull request never gets the
     full run: that one is for a release and for a run on demand."""
     touched = [f for f in changed_files(base) if f.startswith(f"{PACKAGE}/") and f.endswith(".py")]
     return ("targeted", [f"{f} changed" for f in touched]) if touched else ("none", [f"no {PACKAGE}/ code changed"])
