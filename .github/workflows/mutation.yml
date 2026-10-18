@@ -4,16 +4,14 @@ name: Mutation
 # so the PR_SET_PDEATHSIG test runs. When mutants run:
 # 1. A pull request that changes airflow_provider_rivet/ code: the mutants of every function it touches; one not killed
 #    that mutates a line the pull request changed fails the job (a survivor elsewhere in the function is listed). Nothing else runs on a pull request: a change to tests or to the harness gets no mutants.
-# 2. A release (release.yml calls this workflow on the tagged commit): the full run, judged against `.mutmut-ratchet`.
-# 3. On demand (workflow_dispatch): the full run. There is no run on push to main and no nightly run.
-# The ratchet changes only through a full run (2 or 3).
+# 2. On demand (workflow_dispatch): the full run, judged against `.mutmut-ratchet`. There is no run on push to main,
+#    no nightly run and none at a release (owner, 2026-10-18). The ratchet changes only through this full run.
 # Ten shards (the mutants whose number ends in 0, 1, ... 9) run in parallel: a surviving mutant of a function every
 # test passes through runs the whole suite, so one runner would need most of a day for the package.
 
 on:
   pull_request:
   workflow_dispatch:
-  workflow_call:
 
 permissions:
   contents: read

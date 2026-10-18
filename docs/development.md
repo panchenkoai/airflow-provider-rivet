@@ -57,7 +57,6 @@ When mutants run (`.github/workflows/mutation.yml`, on Linux, through `dev/mutan
 |---|---|---|
 | a pull request changes `airflow_provider_rivet/` code | the mutants of every function it touches | one that mutates a line the pull request changed is not killed (the other survivors of those functions are listed, not failed) |
 | a pull request changes only tests, docs or the harness | nothing | — |
-| a release (`release.yml` runs it on the tagged commit before it builds) | the full run | as above: nothing is published from a commit whose mutants were not counted |
 | on demand (workflow_dispatch) | the full run | as above |
 
 There is no full run on push to main and no nightly run. Every run is split into ten parallel shards (the mutants
@@ -66,7 +65,7 @@ whose number ends in 0 … 9). Each shard prints `shard N: M of TOTAL mutants`, 
 graded every mutant exactly once (`sum(tested) == total`) and `survivors N <= ratchet M`. A survivor of a function
 every test passes through (`_Session.step`) runs the whole suite, so one runner would need most of a day.
 
-Moving the ratchet: it changes only through a full run (on demand or at a release).
+Moving the ratchet: it changes only through a full run on demand.
 `.mutmut-survivors` lists the survivors of that run by name (the ratchet job uploads it as `mutmut-survivors`); the
 two are committed together.
 Lowering it (after tests kill survivors) is an ordinary PR; raising it needs a dated comment line in that file saying
