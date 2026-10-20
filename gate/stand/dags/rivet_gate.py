@@ -16,7 +16,8 @@ def operator_kwargs(state: str) -> dict:
     """SQLite state lives in the shared state_dir (the SQLite CDC run holds a pause window); PostgreSQL state comes from a connection."""
     if state == "pg":
         return {"cwd": f"{ROOT}/out", "env_from_connections": {**SOURCE, "RIVET_STATE_URL": "rivet_gate_state"}}
-    return {"cwd": f"{ROOT}/out", "env_from_connections": dict(SOURCE), "env": {"RIVET_STATE_URL": ""}}
+    # One state_dir volume that every worker of the stack mounts: one disk, so SQLite under Celery is declared single-host.
+    return {"cwd": f"{ROOT}/out", "env_from_connections": dict(SOURCE), "env": {"RIVET_STATE_URL": ""}, "single_host": True}
 
 
 for state in ("sqlite", "pg"):
@@ -56,6 +57,7 @@ for wh in filter(None, os.environ.get("GATE_WAREHOUSES", "").split(",")):
         "cwd": f"{ROOT}/out",
         "env_from_connections": dict(SOURCE),
         "env": {"RIVET_STATE_URL": ""},
+        "single_host": True,  # the stack's one state volume
         "connections": WAREHOUSE_CONNECTIONS[wh],
     }
     globals()[f"gate_wh_{wh}_batch"] = build_batch_dag(
