@@ -54,8 +54,7 @@ SQLite state in `state_dir`.
    - a relative `cdc.checkpoint`, which resolves beside the copied config, that is, here.
    - `airflow/<dag_id>/`: sealed plan artifacts
      (`plans/<run_id>/<export>__<task_id>__s<max_tries>__<inputs>-<hash>.json`), the crashed ledger, scratch
-     files; `airflow/<dag_id>/plans/<run_id>/<artifact>.apply.json` (the record of an apply a try
-     started, [Retries](retries.md)); `airflow/locks/run/<export>.lock` (run, apply, cdc_run),
+     files; `airflow/locks/run/<export>.lock` (run, apply, cdc_run),
      `airflow/locks/<export>.lock` (load and compact of a whole export) and
      `airflow/locks/table/<export>__<table>-<hash>.lock` (load and compact of one table) ([Overlap](limits.md#overlap)).
    - `logs/<dag_id>/<task_id>-<hash>/`: rivet's stdout and stderr, one file per step and try.
