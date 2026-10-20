@@ -173,7 +173,7 @@ class MultiHost:
             states = wait_runs(self.stand, dags, run_id)
             after = self.everything()
             new = after - files
-            history.append(sorted(f for f in new if "/cdc/output/cdc/" in f))
+            history.append(sorted(f for f in new if "/cdc/output/cdc/" in f and "/snapshot/" not in f))
             self.grade_cycle(name, run_id, states, ops, new, history, marks)
             if name == "initial":
                 self.chain()
@@ -267,18 +267,18 @@ class MultiHost:
         self, con: Any, cell: str, run_id: str, ops: Mapping[str, Mapping[str, int]], new: set[str], history: list[list[str]]
     ) -> None:
         v = self.v
-        stream_new = [f for f in new if "/cdc/output/cdc/" in f]
+        stream_new = history[-1]
         for table, cols in TABLES.items():
             c = f"{cell}/cdc/{table}"
-            baseline = sorted(self.files("cdc", table))
-            changes = [f for f in stream_new if f"/{table}/" in f]
+            # backfill: auto runs the table's batch recipe once, after the anchor, into the stream's `<table>/snapshot/`
+            baseline = sorted(self.files("cdc", f"cdc/{table}/snapshot"))
+            changes = [f for f in stream_new if f"/cdc/output/cdc/{table}/" in f]
             v.check(c + "/operations", oracle.cdc_ops, con, changes, ops[table], c)
             stream = [[f for f in run if f"/cdc/output/cdc/{table}/" in f] for run in history]
             v.check(c + "/replay-equals-source", oracle.cdc_replay, con, baseline, stream, f"src.public.{table}", cols, "id")
             v.check(c + "/baseline-once", oracle.duplicates, con, baseline, ["id"], c + " baseline")
-            v.check(
-                c + "/each-event-once", oracle.duplicates, con, sorted(self.files("cdc", f"cdc/{table}")), ["__pos", "__seq"], c
-            )
+            events = sorted(f for f in self.files("cdc", f"cdc/{table}") if "/snapshot/" not in f)
+            v.check(c + "/each-event-once", oracle.duplicates, con, events, ["__pos", "__seq"], c)
         xcom = v.guard(f"{cell}/cdc/xcom-rows", self.stand.xcom, "gate_mh_cdc", run_id, "run")
         if xcom is not None:
             reported = sum(u.get("rows") or 0 for u in xcom["units"])

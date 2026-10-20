@@ -496,7 +496,10 @@ class Stand:
 
     def celery(self, *args: str) -> str:
         """A Celery control or inspect command against the stack's broker, run in the first worker."""
-        return self.compose("exec", "-T", "airflow-worker", "celery", "--app", CELERY_APP, *args, timeout=120).stdout
+        # `--timeout`: a worker on a busy docker host answers after celery's default second
+        return self.compose(
+            "exec", "-T", "airflow-worker", "celery", "--app", CELERY_APP, *args, "--timeout", "20", timeout=180
+        ).stdout
 
     def queues(self) -> dict[str, set[str]]:
         """The queues each host's worker consumes now, by host (`celery inspect active_queues`)."""
@@ -507,21 +510,24 @@ class Stand:
             found[host] = {q["name"] for qs in reply.values() for q in qs}
         return found
 
-    def route(self, queue: str, host: str) -> None:
-        """Make `host` the only worker that consumes `queue`; a task already running stays where it runs."""
-        node = f"celery@{worker_hostname(host)}"
-        self.celery("control", "add_consumer", queue, "-d", node)
-        for other in self.hosts:
-            if other != host:
-                self.celery("control", "cancel_consumer", queue, "-d", f"celery@{worker_hostname(other)}")
-        deadline = time.monotonic() + 60
-        while True:
-            now = self.queues()
-            if {h for h, qs in now.items() if queue in qs} == {host}:
-                return
-            if time.monotonic() > deadline:
-                raise TimeoutError(f"queue {queue} is consumed by {now}, not by {host} alone")
-            time.sleep(1)
+    def route(self, queue: str, host: str, timeout: float = 300) -> None:
+        """Make `host` the only worker that consumes `queue`; a task already running stays where it runs. Asked again
+        until the workers' answer shows it: a worker still starting, or busy, answers no control command."""
+        deadline = time.monotonic() + timeout
+        now: dict[str, set[str]] | str = {}
+        while time.monotonic() < deadline:
+            try:
+                now = self.queues()
+                if {h for h, qs in now.items() if queue in qs} == {host}:
+                    return
+                for other in self.hosts:
+                    verb = "add_consumer" if other == host else "cancel_consumer"
+                    if (queue in now.get(other, set())) != (other == host):
+                        self.celery("control", verb, queue, "-d", f"celery@{worker_hostname(other)}")
+            except (RuntimeError, ValueError) as exc:
+                now = str(exc)[-300:]
+            time.sleep(2)
+        raise TimeoutError(f"queue {queue} is consumed as {now}, not by {host} alone, after {timeout:.0f} s")
 
     def tasks(self, dag: str, run_id: str) -> dict[str, dict[str, Any]]:
         """Task instances of a run by task id: state, start, end."""
