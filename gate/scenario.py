@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from . import oracle, sources, warehouse
+from . import destinations, oracle, sources, warehouse
 from .stand import Stand
 
 TABLES = {
@@ -293,15 +293,18 @@ def run_cycle(
     sabotage: str | None,
     leg: warehouse.Leg | None,
     src_legs: list[sources.SourceLeg] | None = None,
+    dest_legs: list[destinations.S3Leg] | None = None,
 ) -> tuple[set[str], dict[str, Any]]:
     """One cycle: the sources change, every DAG runs (the SQLite writers overlapping), each oracle grades."""
     run_id = f"gate_{n}_{name}"
+    src_legs, dest_legs = src_legs or [], dest_legs or []
     if changes:
         stand.psql("gate-source", "rivet", changes)
-        for src in src_legs or []:
+        for src in src_legs:
             src.apply_changes(stand)
-    src_legs = src_legs or []
-    dags = DAGS + (leg.dags if leg else []) + [d for src in src_legs for d in src.dags]
+        for dest in dest_legs:
+            dest.apply_changes(stand, changes)
+    dags = DAGS + (leg.dags if leg else []) + [d for src in src_legs for d in src.dags] + [d for x in dest_legs for d in x.dags]
     states = trigger_cycle(stand, v, name, run_id, dags)
     files_after = parquet(stand.rivet_dir / "out")
     new = files_after - files_before
@@ -323,6 +326,9 @@ def run_cycle(
     for src in src_legs:
         grade_runs(stand, v, name, run_id, states, src.tasks, may_skip=src.may_skip)
         src.grade(stand, v, name)
+    for dest in dest_legs:
+        grade_runs(stand, v, name, run_id, states, dest.tasks, may_skip=dest.may_skip)
+        dest.grade(stand, v, name, run_id)
     return files_after, marks
 
 
@@ -332,18 +338,30 @@ def play(
     sabotage: str | None,
     leg: warehouse.Leg | None = None,
     src_legs: list[sources.SourceLeg] | None = None,
+    dest_legs: list[destinations.S3Leg] | None = None,
 ) -> None:
-    """Seed, configure, and run the three cycles."""
-    src_legs = src_legs or []
+    """Seed, configure, and run the three cycles (then each destination leg's missing-bucket run)."""
+    src_legs, dest_legs = src_legs or [], dest_legs or []
     stand.psql("gate-source", "rivet", SEED)
     write_configs(stand.rivet_dir)
     if leg:
         leg.prepare(stand)
     for src in src_legs:
         src.prepare(stand)
-    stand.wait_dags(DAGS + (leg.dags if leg else []) + [d for src in src_legs for d in src.dags])
+    for dest in dest_legs:
+        dest.prepare(stand, SEED)
+    stand.wait_dags(
+        DAGS
+        + (leg.dags if leg else [])
+        + [d for src in src_legs for d in src.dags]
+        + [d for x in dest_legs for d in [*x.dags, destinations.CONFIGS["missing"].dag]]
+    )
     files: set[str] = set()
     high_water: dict[str, Any] = {}
     history: dict[str, list[list[str]]] = {state: [] for state in STATES}
     for n, (name, changes, ops) in enumerate(CYCLES, start=1):
-        files, high_water = run_cycle(stand, v, n, name, changes, ops, files, high_water, history, sabotage, leg, src_legs)
+        files, high_water = run_cycle(
+            stand, v, n, name, changes, ops, files, high_water, history, sabotage, leg, src_legs, dest_legs
+        )
+    for dest in dest_legs:
+        dest.missing_bucket_probe(stand, v, wait_runs)
