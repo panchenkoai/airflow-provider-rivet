@@ -228,29 +228,38 @@ def test_notes_sqlite_an_unknown_degradation_warnings_max_events_and_a_ledger_pr
     ]
 
 
+BQ = {"target": "bigquery", "project": "p", "dataset": "d"}
+EXPORTS = [{"name": "snap", "mode": "full"}, {"name": "inc", "mode": "incremental"}, {"name": "cdc", "mode": "cdc"}]
+
+
 @pytest.mark.parametrize(
-    ("load", "table", "expected"),
+    ("load", "cmd", "export", "table", "expected"),
     [
-        ({"target": "bigquery", "project": "p", "dataset": "d"}, "t", "p.d.t"),
-        ({"target": "bigquery", "dataset": "d"}, "t", "d.t"),  # the project left to the credentials' default
-        ({"target": "snowflake", "database": "DB", "schema": "S"}, "T", "DB.S.T"),
-        ({"target": "clickhouse", "database": "db"}, "t", "db.t"),
-        ({"target": "duckdb"}, "t", None),
-        ({"target": "bigquery", "dataset": "d"}, None, None),
-        ("bigquery", "t", None),
+        (BQ, "load", "snap", "t", ("p.d.t", None)),  # a full export's load replaces the table itself
+        (BQ, "load", "inc", "t", ("p.d.t__changes", None)),  # any other appends to its log
+        (BQ, "load", "cdc", "t", ("p.d.t__changes", None)),
+        (BQ, "load", "unknown", "t", ("p.d.t__changes", None)),
+        (BQ, "compact", "cdc", "t", ("p.d.t", "p.d.t__changes")),  # the buffer merged into the base
+        ({"target": "bigquery", "dataset": "d"}, "load", "snap", "t", ("d.t", None)),  # project from the credentials
+        ({"target": "snowflake", "database": "DB", "schema": "S"}, "load", "snap", "T", ("DB.S.T", None)),
+        ({"target": "clickhouse", "database": "db"}, "load", "snap", "t", ("db.t", None)),
+        ({"target": "duckdb"}, "load", "snap", "t", (None, None)),
+        (BQ, "load", "snap", None, (None, None)),
+        ("bigquery", "load", "snap", "t", (None, None)),
     ],
 )
-def test_the_config_names_the_warehouse_table(load: Any, table: str | None, expected: str | None) -> None:
+def test_the_config_names_the_warehouse_objects(load: Any, cmd: str, export: str, table: str | None, expected: tuple) -> None:
     from airflow_provider_rivet.invocation import config_target
 
-    assert config_target({"load": load}, table) == expected
-    assert config_target({}, "t") is None
+    assert config_target({"load": load, "exports": EXPORTS}, cmd, export, table) == expected
+    assert config_target({"exports": EXPORTS}, cmd, export, "t") == (None, None)
 
 
 def test_several_units_each_name_their_table() -> None:
     log, _ = make("load", "orders")
     for table, target, source in (("a", "p.d.a", "rivet"), ("b", "p.d.b", "config")):
-        log.record({"event": "rivet.unit", "export": "orders", "table": table, "target": target, "target_from": source})
+        record = {"export": "orders", "table": table, "target": target, "buffer": None, "target_from": source}
+        log.record({"event": "rivet.unit", **record})
     units = [{"export": "orders", "table": t, "status": "loaded", "rows": 1} for t in "ab"]
     lines = render(log, {"decision": "success", "units": units})
     assert lines[0][1].startswith("rivet load orders → OK: 2 tables")

@@ -113,9 +113,11 @@ class UnitResult:
     stop_reason: str | None = None
     error: ErrorObject | None = None
     skip_reason: str | None = field(default=None, compare=False)
-    # The warehouse table a load / compact unit wrote, and whether rivet named it (`rivet`) or the config's `load:` did
-    # (`config`); in the task log and the `rivet.unit` record, not yet in the contract's XCom unit.
+    # The warehouse object a load / compact unit wrote, the `__changes` buffer a compact read, and whether rivet named
+    # them (`rivet`) or the config's `load:` did (`config`); in the task log and the `rivet.unit` record, not yet in the
+    # contract's XCom unit.
     target: str | None = field(default=None, compare=False)
+    buffer: str | None = field(default=None, compare=False)
     target_from: str | None = field(default=None, compare=False)
 
     def to_xcom(self) -> dict[str, Any]:

@@ -21,6 +21,7 @@ UNIT_KEYS = {
     "event",
     "skip_reason",
     "target",
+    "buffer",
     "target_from",
     "export",
     "table",

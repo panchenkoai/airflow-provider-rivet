@@ -59,14 +59,14 @@ def _counts(units: list[dict[str, Any]]) -> list[str]:
     return parts
 
 
-def _target(record: dict[str, Any], command: str) -> str | None:
-    """`p.d.orders`, or `p.d.orders__changes into p.d.orders (from config)` for a compact the config names."""
-    target = record.get("target")
+def _target(record: dict[str, Any]) -> str | None:
+    """`p.d.orders__changes`, or `p.d.orders__changes into p.d.orders` for a compact; `(from config)` when the config
+    named them, not rivet."""
+    target, buffer = record.get("target"), record.get("buffer")
     if not isinstance(target, str):
         return None
-    if record.get("target_from") != "config":
-        return target
-    return f"{target}__changes into {target} (from config)" if command == "compact" else f"{target} (from config)"
+    text = f"{buffer} into {target}" if isinstance(buffer, str) else target
+    return f"{text} (from config)" if record.get("target_from") == "config" else text
 
 
 def _unit_name(unit: dict[str, Any]) -> str:
@@ -113,7 +113,7 @@ class TaskLog:
         seconds = clock() - self.started
         subject = " ".join(p for p in (self.command.replace("cdc_", ""), self.export, self.table and f"table {self.table}") if p)
         head = f"rivet {subject} →"
-        targets = [_target(e, self.command) for e in self.events if e.get("event") == "rivet.unit"]
+        targets = [_target(e) for e in self.events if e.get("event") == "rivet.unit"]
         if len(targets) == 1 and targets[0]:
             head += f" {targets[0]}:"
         tries = f"try {try_number} of {max_tries + 1}"
@@ -238,9 +238,7 @@ class TaskLog:
     def _unit_lines(self, units: list[dict[str, Any]]) -> list[tuple[int, str]]:
         """One line per unit of a task with several, and the failed unit of a failed task."""
         lines = []
-        targets = {
-            (e.get("export"), e.get("table")): _target(e, self.command) for e in self.events if e.get("event") == "rivet.unit"
-        }
+        targets = {(e.get("export"), e.get("table")): _target(e) for e in self.events if e.get("event") == "rivet.unit"}
         for unit in units:
             error = unit.get("error") or {}
             if unit.get("status") == "failed":

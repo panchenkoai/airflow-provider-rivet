@@ -78,10 +78,11 @@ headline says it. The step line stays when the step failed or the task spent a s
 outside it (a lock wait). Flags the binary lacks are noted at DEBUG only. `rivet_version` is the
 whole `rivet --version` line after `rivet`, so a branch build is told apart from the release.
 
-A load or compact task names the warehouse table it wrote after the arrow, as rivet's result names
-it (`rivet load cdc table orders → my-project.demo_cdc.orders: OK: 50 rows in 12.0 s`). A binary
-whose result has no table name gets it from the config's `load:` block, marked `(from config)`; a
-compact then names its buffer and base (`….orders__changes into ….orders (from config)`).
+A load or compact task names the warehouse object it wrote after the arrow, as rivet's result names
+it: a load the table of a `full` export, else its `__changes` log
+(`rivet load cdc table orders → my-project.demo_cdc.orders__changes: OK: 50 rows in 12.0 s`); a
+compact the buffer it merged and the base (`….orders__changes into ….orders`). A binary whose
+result has no such name gets it from the config's `load:` block, marked `(from config)`.
 
 - The headline's outcome is `OK`, `SKIPPED` (nothing to do: rivet's `skip_reason`, or an earlier
   try already applied the plan), `REFUSED` (class `refusal`, or a preflight refusal before rivet

@@ -483,11 +483,32 @@ def test_golden_load_names_the_warehouse_table_rivet_wrote(rig: Rig, log: Record
     """Owner, 2026-10-20: the headline names the table, fully qualified, for debugging; rivet's own name wins."""
     rig.config.write_text(CONFIG + LOAD_BLOCK)
     row = {"export": "orders", "table": "t", "status": "loaded", "rows": 50, "target": "rivet-data-tool.demo_cdc_1432.t"}
+    row["buffer"] = None
     rig.scenario(flags=NEW_FLAGS, load={"summary": {"run_id": "l1", "per_table": [row]}})
     rig.run(rig.operator(RivetLoadOperator, export="orders", table="t"))
     assert log.shown()[0] == "INFO rivet load orders table t → rivet-data-tool.demo_cdc_1432.t: OK: 50 rows in 3.0 s (run l1)"
     unit = next(json.loads(t) for lvl, t in log.lines if lvl == "DEBUG" and '"rivet.unit"' in t)
-    assert (unit["target"], unit["target_from"]) == ("rivet-data-tool.demo_cdc_1432.t", "rivet")
+    assert (unit["target"], unit["buffer"], unit["target_from"]) == ("rivet-data-tool.demo_cdc_1432.t", None, "rivet")
+
+
+def test_golden_compact_names_the_buffer_rivet_merged_into_the_base(rig: Rig, log: Recorder) -> None:
+    row = {"export": "orders", "table": "t", "status": "compacted", "target": "p.d.t", "buffer": "p.d.t__changes"}
+    rig.scenario(flags=NEW_FLAGS, compact={"summary": {"run_id": "c1", "per_table": [row]}})
+    rig.run(rig.operator(RivetCompactOperator, export="orders", table="t"))
+    assert log.shown()[0] == "INFO rivet compact orders table t → p.d.t__changes into p.d.t: OK in 3.0 s (run c1)"
+
+
+def test_golden_incremental_load_names_the_log_the_config_names(rig: Rig, log: Recorder) -> None:
+    """`users` is incremental: its load appends to `users__changes`, which the view `users` reads."""
+    rig.config.write_text(CONFIG + LOAD_BLOCK)
+    rig.scenario(
+        flags=NEW_FLAGS,
+        load={"summary": {"run_id": "l1", "per_table": [{"export": "users", "table": "users", "status": "loaded", "rows": 2}]}},
+    )
+    rig.run(rig.operator(RivetLoadOperator, export="users", table="users"))
+    assert log.shown()[0] == (
+        "INFO rivet load users table users → rivet-data-tool.demo_cdc.users__changes (from config): OK: 2 rows in 3.0 s (run l1)"
+    )
 
 
 def test_golden_compact_names_the_buffer_and_base_the_config_names(rig: Rig, log: Recorder) -> None:
