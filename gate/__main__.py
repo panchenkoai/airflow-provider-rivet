@@ -21,7 +21,17 @@ from . import conns as proofs
 from . import multihost, sources
 from .scenario import TABLES, Verdicts, play
 from .stand import FLAVORS, Stand
-from .warehouse import TAG_SHAPE, WAREHOUSES, Cloud, Leg, connections, delete_connections, publish_connections, sweep
+from .warehouse import (
+    TAG_SHAPE,
+    WAREHOUSES,
+    Cloud,
+    Leg,
+    connections,
+    delete_connections,
+    gcp_connection,
+    publish_connections,
+    sweep,
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -106,7 +116,7 @@ def main(argv: list[str] | None = None) -> int:
     if not warehouses and (args.connections != "env" or args.gcp_auth != "key"):
         ap.error("--connections gsm and --gcp-auth adc are legs of the warehouse leg: pass --warehouses")
     cloud = None
-    if warehouses:
+    if warehouses or args.workers > 1:
         keyfile = args.gcp_keyfile or Path.home() / ".config/gcloud/application_default_credentials.json"
         cloud = Cloud(
             keyfile,
@@ -123,8 +133,8 @@ def main(argv: list[str] | None = None) -> int:
             gsm_reader=args.gsm_reader.format(project=args.bq_project),
         )
         print(
-            f"warehouse leg {list(warehouses)}, tag {tag}, connections {args.connections}, gcp auth {args.gcp_auth}; "
-            f"swept: {sweep(cloud) + sources.sweep(cloud)}",
+            f"{'warehouse leg ' + str(list(warehouses)) if warehouses else 'multi-host leg'}, tag {tag}, connections {args.connections}, gcp auth {args.gcp_auth}; "
+            f"swept: {(sweep(cloud) if warehouses else []) + sources.sweep(cloud)}",
             flush=True,
         )
     work = args.work or Path(tempfile.mkdtemp(prefix="rivet-airflow-gate-"))
@@ -144,27 +154,32 @@ def main(argv: list[str] | None = None) -> int:
             sources=sources.engines(engines),
             workers=args.workers,
         )
-        leg = Leg(cloud, version, TABLES, warehouses) if cloud else None
+        leg = Leg(cloud, version, TABLES, warehouses) if cloud and warehouses else None
+        hosts = multihost.MultiHost(stand, Verdicts(version), cloud) if cloud and args.workers > 1 else None
         src_legs = sources.legs(cloud, version, engines)
-        verdicts = Verdicts(version)
+        verdicts = hosts.v if hosts else Verdicts(version)
         try:
-            if cloud:
+            if hosts:
+                stand.extra_connections = {"gate_gcp": gcp_connection(cloud)}
+            elif cloud:
                 stand.extra_connections = verdicts.guard("connections", connections, cloud, stand.secrets.clickhouse) or {}
             if gsm:
                 verdicts.guard("gsm-publish", publish_connections, cloud, version, stand.connections())
             if not verdicts.rows:
                 verdicts.guard("stand-up", stand.up)
             if not verdicts.rows:
-                if args.workers > 1:
-                    verdicts.guard("multihost", multihost.play, stand, verdicts)
+                if hosts:
+                    verdicts.guard("multihost", hosts.play)
                 else:
                     verdicts.guard("scenario", play, stand, verdicts, args.sabotage, leg, src_legs)
-                verdicts.guard("proofs", proofs.prove, stand, verdicts, cloud)
+                verdicts.guard("proofs", proofs.prove, stand, verdicts, cloud if warehouses else None)
         finally:
             if not args.keep:
                 verdicts.guard("teardown", stand.down)
                 if leg:
                     verdicts.guard("cloud-cleanup", leg.cleanup)
+                if hosts:
+                    verdicts.guard("cloud-cleanup/multihost", hosts.cleanup)
                 for src in src_legs:
                     verdicts.guard(f"cloud-cleanup/{src.engine.name}", src.cleanup)
                 if gsm:

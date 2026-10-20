@@ -114,15 +114,20 @@ def snow_login(name: str) -> dict[str, str]:
     )
 
 
+def gcp_connection(cloud: Cloud) -> dict[str, Any]:
+    """The gate_gcp Connection (GCS + BigQuery): the project, and the credential unless rivet runs as the containers'."""
+    gcp: dict[str, Any] = {"project": cloud.project}
+    if cloud.gcp_auth == "key":
+        gcp["keyfile_dict"] = cloud.keyfile.read_text()
+    return {"conn_type": "google_cloud_platform", "extra": gcp}
+
+
 def connections(cloud: Cloud, clickhouse_password: str) -> dict[str, dict[str, Any]]:
     """The warehouse leg's Connections by conn_id: GCP (GCS + BigQuery), Snowflake, ClickHouse."""
     sf = snow_login(cloud.sf_connection)
     key = Path(sf["private_key_file"]).expanduser().read_text()
-    gcp: dict[str, Any] = {"project": cloud.project}
-    if cloud.gcp_auth == "key":
-        gcp["keyfile_dict"] = cloud.keyfile.read_text()
     return {
-        "gate_gcp": {"conn_type": "google_cloud_platform", "extra": gcp},
+        "gate_gcp": gcp_connection(cloud),
         "gate_snowflake": {
             "conn_type": "snowflake",
             "login": sf["user"],

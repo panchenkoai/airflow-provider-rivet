@@ -25,7 +25,7 @@ ADC_IN_CONTAINER = "/home/airflow/.config/gcloud/application_default_credentials
 #: The multi-host leg (`--workers 2`): each Celery worker is a host of its own, with a disk of its own mounted at this
 #: one absolute path (two hosts share no disk); `HOST_DIRS` are the state directories on it, one per pipeline.
 HOST_DISK = "/opt/rivet-host"
-HOST_DIRS = ("batch", "cdc", "sqlite", "chain")
+HOST_DIRS = ("batch", "cdc", "sqlite", "local", "chain")
 #: The Celery app every Airflow worker runs (the provider's; the official healthcheck names the same).
 CELERY_APP = "airflow.providers.celery.executors.celery_executor.app"
 #: The queues of the multi-host leg; each task of its DAGs names one, and the gate moves a queue between the workers.
@@ -164,9 +164,10 @@ def state_conn_id(engine: str, kind: str) -> str:
     return f"rivet_gate_state_{engine}_{kind}"
 
 
-#: The multi-host leg's state databases beside `rivet_state` (its batch pipeline's): a config's exports share their
-#: names with another's (init names the CDC config's baseline exports after their tables, as the batch ones).
-MULTIHOST_STATE = {"cdc": "rivet_state_mh_cdc", "chain": "rivet_state_mh_chain"}
+#: The multi-host leg's state databases beside `rivet_state` (its batch pipeline's), each behind a Connection
+#: `rivet_gate_state_mh_<name>`: a config's exports share their names with another's (init names the CDC config's
+#: baseline exports after their tables, as the batch ones).
+MULTIHOST_STATE = ("cdc", "local", "chain")
 
 
 def worker_service(name: str) -> str:
@@ -262,10 +263,10 @@ class Stand:
                         "port": 5432,
                         "login": "rivet",
                         "password": self.secrets.state,
-                        "schema": db,
+                        "schema": f"rivet_state_mh_{kind}",
                         "extra": {"rivet_params": "sslmode=require"},
                     }
-                    for kind, db in MULTIHOST_STATE.items()
+                    for kind in MULTIHOST_STATE
                 }
                 if self.workers > 1
                 else {}
