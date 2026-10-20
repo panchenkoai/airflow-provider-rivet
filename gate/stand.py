@@ -319,7 +319,15 @@ class Stand:
         (self.dir / ".env").write_text("")
         shutil.copy2(HERE / "stand" / "dags" / "rivet_gate.py", self.dir / "dags" / "rivet_gate.py")
         services = "\n".join(
-            f"  {s}:\n    <<: *rivet" + ('\n    ports: !override ["127.0.0.1::8080"]' if s == self.flavor.ui_service else "")
+            f"  {s}:\n    <<: *rivet"
+            + (
+                '\n    ports: !override ["127.0.0.1::8080"]'
+                # The official 30 s + 5 x 30 s lose to an API server's first start on a docker host busy with other
+                # stacks; the workers wait for it healthy, so `up` fails with "dependency failed to start".
+                "\n    healthcheck: { retries: 30, start_period: 120s }"
+                if s == self.flavor.ui_service
+                else ""
+            )
             for s in self.flavor.services
         )
         write_private(self.dir / "docker-compose.gate.yaml", self.overlay(services))
