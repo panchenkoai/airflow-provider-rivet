@@ -520,6 +520,7 @@ def current_state(
 def compacted(objects: set[str], table: str, what: str) -> list[str]:
     """After `compact`, a base_buffer table has its base and no buffer left."""
     names = {o.lower() for o in objects}
+    table = table.lower()  # BigQuery lists Oracle's GATE_ORDERS as it was created; the objects are compared lower-case
     problems = [] if table in names else [f"{what}: no base table {table}"]
     if f"{table}__changes" in names:
         problems.append(f"{what}: the buffer {table}__changes is still there (the compaction was skipped or did not merge)")

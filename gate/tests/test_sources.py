@@ -108,12 +108,12 @@ def test_sources_need_bigquery(capsys) -> None:
         gate_main.main(["--rivet-bin", "x", "--sources", "mysql"])
     assert "--warehouses with bigquery" in capsys.readouterr().err
     with pytest.raises(SystemExit):
-        gate_main.main(["--rivet-bin", "x", "--sources", "oracle", "--warehouses", "bigquery"])
+        gate_main.main(["--rivet-bin", "x", "--sources", "db2", "--warehouses", "bigquery"])
     assert "unknown source" in capsys.readouterr().err
 
 
 def test_every_engine_is_known_by_name() -> None:
-    assert sources.engines(["mysql", "mssql"]) == (MYSQL, MSSQL)
+    assert sources.engines(["mysql", "mssql", "mongodb", "oracle"]) == (MYSQL, MSSQL, sources.MONGODB, sources.ORACLE)
 
 
 def test_init_and_the_dags_of_each_config_share_a_postgresql_state_of_its_own(tmp_path: Path) -> None:
