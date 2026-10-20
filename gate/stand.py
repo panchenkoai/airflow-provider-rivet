@@ -350,7 +350,13 @@ class Stand:
                 (self.host_disk(host) / sub).mkdir(parents=True)
         shutil.copy2(HERE / "stand" / "dags" / "rivet_gate.py", self.dir / "dags" / "rivet_gate.py")
         services = "\n".join(
-            f"  {s}:\n    <<: *rivet" + ('\n    ports: !override ["127.0.0.1::8080"]' if s == self.flavor.ui_service else "")
+            f"  {s}:\n    <<: *rivet"
+            + (
+                # The official 2.5 min of health checks lose to a docker host busy with other stacks; the workers wait on it.
+                '\n    ports: !override ["127.0.0.1::8080"]\n    healthcheck: { retries: 40 }'
+                if s == self.flavor.ui_service
+                else ""
+            )
             for s in self.flavor.services
             if not (self.workers > 1 and s == "airflow-worker")
         )
