@@ -4,15 +4,32 @@ The operators, the XCom value every task returns, and the block each task writes
 
 ## Operators
 
-All of them take `config`, `export`, `table` (one table of the export, for `load` and `compact`),
-`state_dir`, `plan_file` (the layout file `RivetPlanOperator` rewrites), `rivet_bin`, `env`,
-`env_from_connections`, `env_passthrough`, `cloud_credentials`, `connections` (storage and
-warehouse Connections, see ["Storage and warehouse connections"](connections-and-secrets.md#storage-and-warehouse-connections)), `deployment` (`auto` / `local` /
-`pod`), `extra_args`, `lock_wait` (default 600), `crashed_retries` (default 1), `stderr_dir`,
-`stream_stderr`, `log_keep` (default 10) and `cwd`. Templated: `config`, `export`, `table`, `state_dir`, `plan_file`,
-`extra_args`, `stderr_dir`, `cwd`. **`env` and `env_from_connections` are not templated**, so their
-values are never stored as rendered fields. No operator builds argv: one module, `invocation.py`,
-builds it, runs the process, reads the outputs and classifies.
+Every operator takes the same parameters (plus Airflow's own: `task_id`, `retries`, ...).
+**Templated** ones accept Jinja; `env` and `env_from_connections` are not templated, so their
+values are never stored as rendered fields. No operator builds argv: one module,
+`invocation.py`, builds it, runs the process, reads the outputs and classifies.
+
+| Parameter | Default | Templated | What it is |
+|---|---|---|---|
+| `config` | required | yes | path of the rivet YAML config on the worker |
+| `export` | `None` | yes | the export to run; required by `RivetApplyOperator` and `RivetCdcRunOperator`; `RivetRunOperator` without it runs the whole config |
+| `table` | `None` | yes | one table of the export, for `load` and `compact` |
+| `state_dir` | `None` | yes | an existing absolute directory on the worker for SQLite state, the config copy, sealed plans, locks and stderr files; never created by a task; required for SQLite state and CDC checkpoints (see [State](state.md)) |
+| `plan_file` | `None` | yes | the layout file `RivetPlanOperator` rewrites and `build_batch_dag` reads waves from |
+| `rivet_bin` | `"rivet"` | no | the binary: a name looked up on the worker's `PATH`, else the one `rivet-cli` installed; or an absolute path |
+| `env` | `None` | no | extra variables for the rivet process; computed by your DAG file, so no secret literals |
+| `env_from_connections` | `None` | no | `{ENV_NAME: conn_id}`: a database URL built from an Airflow Connection inside the task (see [Connections and secrets](connections-and-secrets.md)) |
+| `env_passthrough` | `()` | no | worker variables (names or `MY_*` patterns) passed on; nothing outside the allow-list is inherited otherwise |
+| `cloud_credentials` | `()` | no | `"gcp"`, `"aws"`, `"azure"`: pass the worker's credential variables of that kind |
+| `connections` | `()` | no | storage and warehouse Connection ids (see ["Storage and warehouse connections"](connections-and-secrets.md#storage-and-warehouse-connections)) |
+| `deployment` | `"auto"` | no | `local` (a host that keeps its disk) or `pod` (ephemeral); `auto` reads `KUBERNETES_SERVICE_HOST` |
+| `extra_args` | `None` | yes | arguments appended to rivet's argv, e.g. `["-p", "day=2026-10-20"]` |
+| `lock_wait` | `600` | no | seconds a task waits for another task holding its export's lock before it ends retryable (`RIVET_AIRFLOW_EXPORT_BUSY`) |
+| `crashed_retries` | `1` | no | retries of a crash (a signal, exit 129-255) on their own budget, beside Airflow's `retries` (see [Retries](retries.md)) |
+| `stderr_dir` | `None` | yes | where rivet's stdout/stderr files go; default `<state_dir>/logs`, else the temp directory |
+| `stream_stderr` | `False` | no | also copy rivet's stderr lines into the task log as they come |
+| `log_keep` | `10` | no | stderr/stdout files kept per task; `None` keeps all |
+| `cwd` | `None` | yes | the rivet process's working directory (default: the original config's directory); it does not move a relative local `destination.path`, which lands under `state_dir` |
 
 | Operator | Runs | Notes |
 |---|---|---|
