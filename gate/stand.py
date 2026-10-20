@@ -524,7 +524,7 @@ class Stand:
                     verb = "add_consumer" if other == host else "cancel_consumer"
                     if (queue in now.get(other, set())) != (other == host):
                         self.celery("control", verb, queue, "-d", f"celery@{worker_hostname(other)}")
-            except (RuntimeError, ValueError) as exc:
+            except (RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
                 now = str(exc)[-300:]
             time.sleep(2)
         raise TimeoutError(f"queue {queue} is consumed as {now}, not by {host} alone, after {timeout:.0f} s")
