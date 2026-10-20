@@ -126,12 +126,12 @@ def check_shape(kind: str, shape: Mapping[str, Any]) -> list[str]:
 # --- Oracles --------------------------------------------------------------------------------------------------------
 
 
-def table_parts(files: Sequence[str], bucket: str, table: str) -> dict[str, list[str]]:
+def table_parts(files: Sequence[str], root: str, table: str) -> dict[str, list[str]]:
     """A config's Parquet parts of one table by role: `batch` (an export's `exports/<table>/`), `snapshot` (a stream's
     baseline, `cdc/<table>/snapshot/`), `changes` (the rest of `cdc/<table>/`)."""
     out: dict[str, list[str]] = {"batch": [], "snapshot": [], "changes": []}
     for f in sorted(files):
-        key = f.removeprefix(f"s3://{bucket}/")
+        key = f.removeprefix(root)
         if key.startswith(f"exports/{table}/"):
             out["batch"].append(f)
         elif key.startswith(f"cdc/{table}/"):
@@ -319,7 +319,11 @@ class S3Leg:
 
     def parts(self, con: Any, bucket: str) -> set[str]:
         """Every Parquet object of a bucket, as `s3://bucket/key`."""
-        return {r[0] for r in con.execute(f"SELECT file FROM glob('s3://{bucket}/**/*.parquet')").fetchall()}
+        return {r[0] for r in con.execute(f"SELECT file FROM glob('{self.root(bucket)}**/*.parquet')").fetchall()}
+
+    def root(self, bucket: str) -> str:
+        """Where DuckDB reads a bucket (the unit tests point it at a folder)."""
+        return f"s3://{bucket}/"
 
     def source_rows(self, dsn: str) -> dict[str, list[dict[str, Any]]]:
         con = oracle.connect(dsn)
@@ -360,7 +364,7 @@ class S3Leg:
         print(f"INVENTORY {name} s3 " + json.dumps({k: sorted(p or []) for k, p in after.items()}), flush=True)
         if after["batch"] is not None:
             cursors = v.guard(f"{name}/s3/batch/stored-cursors", self.stored_cursors, stand)
-            bucket = CONFIGS["batch"].bucket
+            bucket = self.root(CONFIGS["batch"].bucket)
             new = after["batch"] - self.files_before["batch"]
             for table, cols in TABLES.items():
                 cell, src = f"{name}/s3/batch/{table}", f"src.public.{table}"
@@ -385,7 +389,7 @@ class S3Leg:
             from .scenario import CHANGED_OPS, NO_OPS
 
             ops = CHANGED_OPS if name == "delta" else NO_OPS
-            bucket = CONFIGS["cdc"].bucket
+            bucket = self.root(CONFIGS["cdc"].bucket)
             new = after["cdc"] - self.files_before["cdc"]
             changes_new = sorted(f for t in TABLES for f in table_parts(new, bucket, t)["changes"])
             self.history.append(changes_new)
