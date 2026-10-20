@@ -272,9 +272,7 @@ class S3Leg:
             if kind != "missing":
                 self.mc(stand, "mb", f"gate/{cfg.bucket}")
             if cfg.clickhouse_db:
-                warehouse._ch(
-                    stand.clickhouse_port, stand.secrets.clickhouse, f"CREATE DATABASE IF NOT EXISTS {cfg.clickhouse_db}"
-                )
+                ch_exec(stand.clickhouse_port, stand.secrets.clickhouse, f"CREATE DATABASE IF NOT EXISTS {cfg.clickhouse_db}")
             stand.psql("gate-state", "rivet_state", f"CREATE DATABASE {state_db(NAME, kind)};")
             (stand.rivet_dir / "state" / f"s3_{kind}").mkdir(parents=True, exist_ok=True)
             host = stand.rivet_dir / "configs" / f"s3_{kind}"
