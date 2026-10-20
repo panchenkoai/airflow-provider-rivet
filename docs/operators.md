@@ -30,6 +30,7 @@ values are never stored as rendered fields. No operator builds argv: one module,
 | `stream_stderr` | `False` | no | also copy rivet's stderr lines into the task log as they come |
 | `log_keep` | `10` | no | stderr/stdout files kept per task; `None` keeps all |
 | `cwd` | `None` | yes | the rivet process's working directory (default: the original config's directory); it does not move a relative local `destination.path`, which lands under `state_dir` |
+| `single_host` | `False` | no | declares that every task of this deployment runs on one host; needed for SQLite state under an executor that may use several (Celery, Kubernetes), which is refused otherwise (`RIVET_AIRFLOW_STATE_SQLITE_MULTI_HOST`, see [State](state.md)) |
 
 | Operator | Runs | Notes |
 |---|---|---|
