@@ -508,10 +508,8 @@ def _temp_base() -> Path:
 
 def _tighten(path: Path) -> None:
     """Mode 0600 on a file rivet wrote through its umask (D38); a missing file is left to the step that reads it."""
-    try:
+    with contextlib.suppress(FileNotFoundError):
         os.chmod(path, 0o600)
-    except FileNotFoundError:
-        pass
 
 
 def _prune_stale(work: Path, now: float | None = None) -> None:

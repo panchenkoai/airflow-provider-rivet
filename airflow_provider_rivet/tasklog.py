@@ -34,7 +34,7 @@ NOTES = {
     "result_malformed": "part of rivet's result did not have the contract's shape and was ignored (XCom `degraded`)",
     "exit_zero_failed_unit": "rivet exited 0 while its summary reports a failed unit",
 }
-LACKS = sorted(key for key, d in DEGRADATIONS.items() if d.detect == "flag")
+LACKS = sorted(key for key, detect in DEGRADATIONS.items() if detect == "flag")
 # A single step's line is shown only when the task took this much longer than the step (a lock wait, a slow preflight).
 STEP_SLACK = 1.0
 UNIT_WORD = {"load": "table", "compact": "table"}

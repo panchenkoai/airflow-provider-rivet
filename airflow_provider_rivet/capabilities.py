@@ -5,118 +5,30 @@ from __future__ import annotations
 import os
 import re
 import subprocess
-from dataclasses import dataclass
 
 MIN_RIVET_VERSION = (0, 32, 0)
 PROBE_TIMEOUT = 60
 _VERSION_RE = re.compile(r"rivet\s+(\d+)\.(\d+)\.(\d+)")
 
 
-@dataclass(frozen=True)
-class Degradation:
-    """One thing ADR-0039 promises that a binary, its output or the worker may lack, and what the package does instead."""
-
-    key: str
-    missing: str
-    fallback: str
-    detect: str
-
-
-DEGRADATIONS: dict[str, Degradation] = {
-    d.key: d
-    for d in (
-        Degradation(
-            "no_notify",
-            "global flag `--no-notify`",
-            "flag not passed; a `notifications:` block in the config is warned about",
-            "flag",
-        ),
-        Degradation(
-            "lock_wait",
-            "global flag `--lock-wait` and the per-export run lease",
-            "flag not passed; overlap is limited by the builders' max_active_runs=1 and max_active_tis_per_dag=1",
-            "flag",
-        ),
-        Degradation(
-            "state_url_sqlite",
-            "`RIVET_STATE_URL=sqlite:<dir>`",
-            "the config is materialised into the state directory so the state lands beside it",
-            "none",
-        ),
-        Degradation(
-            "error_object",
-            "`class` / `retryable` / `kind` / `action` on the `--json-errors` line",
-            "class and retryable are derived from the printed line's integer `exit_class`",
-            "output",
-        ),
-        Degradation(
-            "per_unit_error",
-            "`failures[]` and the per-export `error` object",
-            "every failed unit of the process carries the process-level object",
-            "output",
-        ),
-        Degradation(
-            "stop_reason",
-            "CDC `stop_reason` and `tables[]` on the run entry",
-            "`stop_reason` is null; a `max_events` stop cannot be told from `caught_up`",
-            "output",
-        ),
-        Degradation(
-            "load_filter",
-            "`--export` on `rivet load` / `rivet compact`",
-            "a single-export copy of the config is materialised and loaded instead",
-            "flag",
-        ),
-        Degradation(
-            "load_table_filter",
-            "`--table` on `rivet load` / `rivet compact`",
-            "the task handles every table of its export, serialised by a file lock on a local worker",
-            "flag",
-        ),
-        Degradation(
-            "load_result",
-            "`--summary-output` on `rivet load` / `rivet compact`",
-            "status comes from the exit code only: `skipped` and row counts are unknown",
-            "flag",
-        ),
-        Degradation(
-            "stderr_temp",
-            "a declared state directory or `stderr_dir` on the worker",
-            "stdout and stderr files go to a private per-user directory under the temp directory; a pod loses them",
-            "worker",
-        ),
-        Degradation(
-            "crashed_ledger",
-            "a readable, writable crashed-budget ledger in the state directory",
-            "no crash retry beyond the first `crashed_retries` tries without a ledger; none at all with a broken one",
-            "worker",
-        ),
-        Degradation(
-            "result_missing",
-            "the `--summary-output` file of a process that exited 0",
-            "units are built from the exit, as for a binary without the summary flag",
-            "output",
-        ),
-        Degradation(
-            "result_malformed",
-            "an error object or result entry with the contract's keys and types",
-            "the entry is read by the exit-code table, a bad value is null, an unknown status counts as failed",
-            "output",
-        ),
-        Degradation(
-            "exit_zero_failed_unit",
-            "a non-zero exit whenever the summary reports a failed unit",
-            "the task fails by the worst failed unit of the summary although the process exited 0",
-            "output",
-        ),
-    )
+# Every `degraded` key a task can record, by how it is detected: a flag the binary's `--help` lacks, a member its output
+# lacks, the worker, or nothing (a fixed workaround). What each one means and does: docs/capabilities.md.
+DEGRADATIONS = {
+    "no_notify": "flag",
+    "lock_wait": "flag",
+    "state_url_sqlite": "none",
+    "error_object": "output",
+    "per_unit_error": "output",
+    "stop_reason": "output",
+    "load_filter": "flag",
+    "load_table_filter": "flag",
+    "load_result": "flag",
+    "stderr_temp": "worker",
+    "crashed_ledger": "worker",
+    "result_missing": "output",
+    "result_malformed": "output",
+    "exit_zero_failed_unit": "output",
 }
-
-UNDETECTABLE = (
-    "a child killed by a signal is not reported as `crashed` (the parent exits 1 or 2 by text)",
-    "no `RIVET_STATE_FOREIGN` refusal: the state directory is checked only by the package's marker",
-    "a relative `cdc.checkpoint` under PostgreSQL state is not warned about by rivet",
-)
 
 
 class ProbeFailed(RuntimeError):
