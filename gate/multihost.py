@@ -111,8 +111,8 @@ class Measure(Verdicts):
     unsupported does, recorded as evidence."""
 
     def grade(self, cell: str, problems: list[str], ok: str = "") -> None:
-        detail = "; ".join(problems) if problems else (ok or "as the oracle expects")
-        print(f"MEASURE airflow-{self.stack} {cell} — {'FINDS ' if problems else ''}{detail}"[:1500], flush=True)
+        if problems:  # what the oracle accepts is not evidence of anything
+            print(f"MEASURE airflow-{self.stack} {cell} — {'; '.join(problems)}"[:1500], flush=True)
 
 
 def bucket(cloud: warehouse.Cloud, stack: str, pipeline: str) -> str:
@@ -288,6 +288,13 @@ class MultiHost:
             if name == "retry":
                 self.paused_then_killed(f"multihost/{name}", "a", "b")
             states = wait_runs(self.stand, list(dags), run_id)
+            if name == "retry":
+                # The sealed plan the killed try made is on host a's disk; the retry on b finds none and plans again.
+                plans = {
+                    h: sorted(f.name for f in (self.stand.host_disk(h) / "batch" / "airflow").rglob("*.json") if run_id in str(f))
+                    for h in self.stand.hosts
+                }
+                print(f"MEASURE airflow-{self.stack} multihost/retry sealed plans by host: {plans}", flush=True)
             for dag, state in states.items():
                 if state != "success":
                     print(
@@ -402,6 +409,19 @@ class MultiHost:
         self.stand.trigger("gate_mh_chain", run_id)
         state = wait_runs(self.stand, ["gate_mh_chain"], run_id)["gate_mh_chain"]
         print(f"MEASURE airflow-{self.stack} multihost/chain {state}: {self.outcomes('gate_mh_chain', run_id)}", flush=True)
+        # The config has no `load:` block, so rivet's load itself fails; what is graded is that the task ran rivet on
+        # host b instead of refusing the other host's state_dir (PostgreSQL state reads nothing from it).
+        load = "load.gate_customers"
+        seen = self.hostnames("gate_mh_chain", run_id, ["apply.gate_customers", load])
+        x = self.v.guard("multihost/chain/load-on-other-host", self.stand.xcom, "gate_mh_chain", run_id, load)
+        if x is not None:
+            hosts = [h.split(".")[0] for h in seen["apply.gate_customers"] + seen[load][:1]]
+            self.v.grade(
+                "multihost/chain/load-on-other-host",
+                ([f"refused {x['preflight_refusal']}"] if x.get("preflight_refusal") else [])
+                + ([f"ran on {hosts}"] if hosts != [worker_hostname("a"), worker_hostname("b")] else []),
+                ok=f"apply on a, load on b ran rivet: {(x.get('error') or {}).get('code')}",
+            )
 
     def budget(self, n: int) -> None:
         """crashed_retries=1 across two hosts: the paused apply is killed on a, its retry routed to b and killed there."""

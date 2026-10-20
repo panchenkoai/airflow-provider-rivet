@@ -98,14 +98,27 @@ directory, default a fresh temporary one), `--verdicts <file>` (one JSON line pe
 
 **Multi-host leg.** `--workers 2` runs, instead of the scenario above, a stack with two Celery workers, each a host
 with a disk of its own (`hosts/a` and `hosts/b` of the stack's directory, each mounted at `/opt/rivet-host` in one
-worker only): every `state_dir` (the config copy, sealed plans, locks, crashed ledger, logs, marker) and init's
-relative `./output/` destination are on the host that ran the task. Its configs are the ones `rivet init` writes
-against the live source (`--mode incremental` and `--mode cdc`, `--include` the two tables), used as written, and
-rivet's state is the stack's TLS PostgreSQL (`RIVET_STATE_URL` from the `rivet_gate_state` Connection; the CDC
-config's from `rivet_gate_state_mh_cdc`, since init names its baseline exports after the tables, as the batch ones).
-Every task names a queue (`gate_a`, `gate_b`, `gate_cdc`) and the gate moves each queue to one worker per cycle with
-Celery's `add_consumer` / `cancel_consumer`, so the two extracts of one batch run land on both hosts and every
-export changes host between cycles; each try's `hostname` from the REST API proves it (`.../hosts`).
+worker only): every `state_dir` (the config copy, sealed plans, locks, crashed ledger, logs, marker) is on the host
+that ran the task. rivet's state is the stack's TLS PostgreSQL (`RIVET_STATE_URL` from the `rivet_gate_state`
+Connection; the CDC config's from `rivet_gate_state_mh_cdc`, since init names its baseline exports after the tables,
+as the batch ones), and the files go to GCS, which both hosts reach: each config is the one `rivet init` writes against
+the live source (`--mode incremental` / `--mode cdc`, `--include` the two tables, `--gcs-bucket` a bucket of the run's
+own, `rivet-afgate-<tag>-<stack>-mh*-batch|cdc`), used as written, with the `gate_gcp` Connection (`--gcp-keyfile`,
+`--bq-project`, `--bq-location` as in the warehouse leg). Every task names a queue (`gate_a`, `gate_b`, `gate_cdc`)
+and the gate moves each queue to one worker per cycle with Celery's `add_consumer` / `cancel_consumer`, so the two
+extracts of one batch run land on both hosts and every export and the stream change host between cycles; each try's
+`hostname` from the REST API proves it (`.../hosts`). Four cycles (initial, delta, idle, and `retry`: a delta whose
+orders extract pauses at `pg_after_snapshot_open` on host a, is SIGKILLed there, and is retried on host b, where its
+sealed plan is not). Oracles, reading the buckets through `gcloud storage` and the source through DuckDB: the batch
+delta and latest-version cells of the base scenario, each `(id, cursor)` version written once across both hosts
+(`each-version-once`), the stored cursor (psql) equal to the source high-water and never moved back
+(`cursor-not-regressed`), XCom rows == file rows; for the stream: the baseline once, each event `(__pos, __seq)` once,
+replay == source, exact operation counts. `multihost/budget` kills the paused extract on a and its retry on b:
+`crashed_retries=1` must not grant the second crash (it does today: each host keeps its own crashed ledger).
+`multihost/chain/load-on-other-host`: an extract on a and its load on b, on PostgreSQL state, must run rivet rather than
+be refused for the other host's state_dir marker. Printed as `MEASURE` lines, not graded: the same batch config on
+SQLite state in each host's state_dir, and init's default local `./output/` destination (which lands in the state_dir)
+on PostgreSQL state. The cleanup deletes the buckets and looks again.
 
 **Warehouse leg.** `--warehouses bigquery,snowflake,clickhouse` (any subset) also extracts to GCS and runs
 `load` and `compact` into those warehouses from Airflow Connections (`connections=`). It needs a GCP credential
