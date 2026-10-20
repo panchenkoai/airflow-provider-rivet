@@ -173,6 +173,13 @@ def test_an_apply_seals_under_plans_passes_its_globals_and_starts_rivet_with_no_
     assert all(c["stdin_null"] for c in rig.calls())
 
 
+def test_rivet_notifications_true_keeps_rivets_own_notifications_and_records_no_degradation(rig: Rig) -> None:
+    rig.scenario(flags={"run": ["--no-notify", "--lock-wait"]}, run={"summary": {"per_export": [entry()]}})
+    payload = payload_of(rig, rig.operator(RivetRunOperator, export="orders", rivet_notifications=True))
+    assert "--no-notify" not in rig.argv("run") and "--lock-wait" in rig.argv("run")
+    assert "no_notify" not in payload["degraded"]
+
+
 def test_an_apply_summary_with_a_failed_export_gives_it_an_error(rig: Rig) -> None:
     """(apply 212)"""
     rig.scenario(flags=NEW_FLAGS, apply={"summary": {"per_export": [entry("failed")]}})

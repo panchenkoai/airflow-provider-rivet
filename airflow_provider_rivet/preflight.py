@@ -216,6 +216,7 @@ def run_preflight(
     cdc: bool,
     upstream_markers: tuple[str, ...] = (),
     extra_args: Sequence[str] = (),
+    rivet_notifications: bool = False,
 ) -> Preflight:
     """Run every check; raise `PreflightRefusal` or return what the invocation needs."""
     binary = resolve_binary(rivet_bin, env)
@@ -274,7 +275,7 @@ def run_preflight(
                 ("sqlite_single_host", f"SQLite state in {state_dir}: this setup is single-host; see {SETUP_GUIDE}")
             )
 
-    if "notifications" in config and not caps.has_flag("run", "--no-notify"):
+    if "notifications" in config and not rivet_notifications and not caps.has_flag("run", "--no-notify"):
         result.warnings.append(
             (
                 "notifications_block",

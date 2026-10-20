@@ -25,6 +25,7 @@ values are never stored as rendered fields. No operator builds argv: one module,
 | `deployment` | `"auto"` | no | `local` (a host that keeps its disk) or `pod` (ephemeral); `auto` reads `KUBERNETES_SERVICE_HOST` |
 | `extra_args` | `None` | yes | arguments appended to rivet's argv, e.g. `["-p", "day=2026-10-20"]` |
 | `lock_wait` | `600` | no | seconds a task waits for another task holding its export's lock before it ends retryable (`RIVET_AIRFLOW_EXPORT_BUSY`) |
+| `rivet_notifications` | `False` | no | `True` keeps rivet's own `notifications:` on: `--no-notify` is not passed and nothing is warned (see [Slack](slack.md)) |
 | `crashed_retries` | `1` | no | retries of a crash (a signal, exit 129-255) on their own budget, beside Airflow's `retries` (see [Retries](retries.md)) |
 | `stderr_dir` | `None` | yes | where rivet's stdout/stderr files go; default `<state_dir>/logs`, else the temp directory |
 | `stream_stderr` | `False` | no | also copy rivet's stderr lines into the task log as they come |

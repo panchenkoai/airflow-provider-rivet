@@ -131,6 +131,7 @@ class Request:
     deployment: str = "auto"
     extra_args: Sequence[str] = ()
     lock_wait: int = 600
+    rivet_notifications: bool = False
     plan_file: str | None = None
     cwd: str | None = None
     stderr_dir: str | None = None
@@ -300,7 +301,9 @@ class _Session:
     def globals_for(self, subcommand: str) -> list[str]:
         """The global flags this binary accepts; a missing one is recorded, never passed."""
         flags = ["--json-errors"]
-        if self.pf.caps.has_flag(subcommand, "--no-notify"):
+        if self.req.rivet_notifications:
+            pass  # the user keeps rivet's own `notifications:` on
+        elif self.pf.caps.has_flag(subcommand, "--no-notify"):
             flags.append("--no-notify")
         else:
             self.degraded.add("no_notify")
@@ -1128,6 +1131,7 @@ def _invoke(request: Request, emit: Emit, on_process: Callable | None, stopped: 
         cdc=request.command == "cdc_run",
         upstream_markers=tuple(request.upstream_markers),
         extra_args=tuple(request.extra_args),
+        rivet_notifications=request.rivet_notifications,
     )
     for key, text in pf.warnings:
         emit({"event": "rivet.warning", "warning": key, "text": text})
