@@ -46,6 +46,9 @@ class StandSecrets:
     mysql_root: str
     mssql: str
     mssql_root: str
+    mongodb: str
+    mongodb_root: str
+    oracle: str
     minio: str
     source_s3: str
     fernet: str
@@ -263,7 +266,7 @@ class Stand:
                     "extra": {"rivet_params": "sslmode=require"},
                 }
                 for e in self.sources
-                for kind in ("batch", "cdc")
+                for kind in e.kinds
             },
             **(
                 {

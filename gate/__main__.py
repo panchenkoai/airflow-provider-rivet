@@ -1,4 +1,4 @@
-"""python -m gate --rivet-bin <linux rivet> [--airflow 2.10.5,3.3.2] [--sources mysql,mssql] [--destinations s3] [--workers 2] [--verdicts out.jsonl] [--keep] [--sabotage drop-delta-file|warehouse-value]
+"""python -m gate --rivet-bin <linux rivet> [--airflow 2.10.5,3.3.2] [--sources mysql,mssql,mongodb,oracle] [--destinations s3] [--workers 2] [--verdicts out.jsonl] [--keep] [--sabotage drop-delta-file|warehouse-value]
 
 With --warehouses: [--connections env|gsm] [--gcp-auth key|adc] choose where the stack's Connections live and how
 rivet authenticates to GCP; see docs/connections-and-secrets.md.

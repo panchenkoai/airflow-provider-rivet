@@ -98,18 +98,21 @@ for engine in filter(None, os.environ.get("GATE_SOURCES", "").split(",")):
     with open(shape_file) as handle:
         shape = json.load(handle)
 
-    batch = shape["batch"]["exports"]
-    globals()[f"gate_src_{engine}_batch"] = build_batch_dag(
-        f"gate_src_{engine}_batch",
-        config=f"{ROOT}/configs/{engine}_batch/rivet.yaml",
-        state_dir=f"{ROOT}/state/{engine}_batch",
-        exports=batch,
-        compact_exports=batch,
-        operator_kwargs=leg_kwargs(engine, "batch"),
-        tags=["rivet", "gate", "source", engine],
-    )
-    # One DAG per CDC stream: one over every table, or one per table where the engine captures per table (SQL Server).
-    for stream in shape["cdc"]["streams"]:
+    # A kind the engine cannot run (MongoDB batch, Oracle CDC into a warehouse) has no shape and no DAG.
+    batch = shape.get("batch", {}).get("exports", [])
+    if batch:
+        globals()[f"gate_src_{engine}_batch"] = build_batch_dag(
+            f"gate_src_{engine}_batch",
+            config=f"{ROOT}/configs/{engine}_batch/rivet.yaml",
+            state_dir=f"{ROOT}/state/{engine}_batch",
+            exports=batch,
+            compact_exports=batch,
+            operator_kwargs=leg_kwargs(engine, "batch"),
+            tags=["rivet", "gate", "source", engine],
+        )
+    # One DAG per CDC stream: one over every table, or one per table where the engine captures per table (SQL Server,
+    # MongoDB).
+    for stream in shape.get("cdc", {}).get("streams", []):
         globals()[f"gate_src_{engine}{stream['dag']}"] = build_cdc_dag(
             f"gate_src_{engine}{stream['dag']}",
             config=f"{ROOT}/configs/{engine}_cdc/rivet.yaml",
