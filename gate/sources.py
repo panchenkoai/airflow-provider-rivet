@@ -423,6 +423,12 @@ ENGINES = {e.name: e for e in (MYSQL, MSSQL, MONGODB, ORACLE)}
 DELETED_BY_BATCH = {"initial": {}, "delta": {"gate_orders": 5}, "idle": {"gate_orders": 5}}
 
 
+def deleted_by_batch(cycle: str, table: str) -> int:
+    """Keys of `table` the batch target keeps after `cycle` although the source deleted them (Oracle's names are
+    upper-case)."""
+    return DELETED_BY_BATCH.get(cycle, {}).get(table.lower(), 0)
+
+
 def init_argv(kind: str, engine: Engine, bucket: str, project: str, dataset: str, out: str) -> list[str]:
     """`rivet init` for one config: batch (`incremental`) or the CDC stream, GCS and a BigQuery `load:` block, over the
     scenario's tables (`--include`: a database holds other tables, SQL Server's CDC its own `dbo.systranschemas`)."""
@@ -675,7 +681,6 @@ class SourceLeg:
         source = v.guard(f"{name}/{self.engine.name}/source", self.source_rows, stand)
         if source is None:
             return
-        deleted = DELETED_BY_BATCH.get(name, {})
         for kind in self.engine.kinds:
             objects = v.guard(f"{name}/{self.engine.name}/{kind}/objects", self.objects, kind)
             print(f"INVENTORY {name} {self.engine.name} {kind} {sorted(objects or [])}", flush=True)
@@ -683,7 +688,7 @@ class SourceLeg:
                 cell = f"{name}/{self.engine.name}/bigquery/{kind}/{table}"
                 v.check(
                     cell + "/current-equals-source",
-                    self._compare(kind, table, source[table], cols, 0 if kind == "cdc" else deleted.get(table.lower(), 0)),
+                    self._compare(kind, table, source[table], cols, 0 if kind == "cdc" else deleted_by_batch(name, table)),
                     ok=f"{len(source[table])} row(s)",
                 )
                 if objects is not None:
@@ -820,12 +825,9 @@ def mongo_id(value: Any) -> str:
 def _mongo_value(value: Any) -> Any:
     from bson import Decimal128, ObjectId
 
-    if value is None or isinstance(value, bool | str):
+    # JSON text keeps an integer and a double apart (`2` and `2.0`), a double at its shortest round-trip digits.
+    if value is None or isinstance(value, bool | str | int | float):
         return value
-    if isinstance(value, int):
-        return value
-    if isinstance(value, float):
-        return {"$double": repr(value)}
     if isinstance(value, Decimal128):
         return {"$numberDecimal": str(value)}
     if isinstance(value, ObjectId):

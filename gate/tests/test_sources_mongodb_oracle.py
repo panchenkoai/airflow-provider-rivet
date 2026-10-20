@@ -37,14 +37,12 @@ def test_oracle_init_names_its_batch_exports_upper_case_and_the_gate_matches_the
 
 def test_mongodb_init_writes_one_cdc_export_and_dag_per_collection() -> None:
     shape = read_config((FIXTURES / "init_mongodb_cdc_0.32.1.yaml").read_text(), list(MONGODB.tables))
-    assert shape == {
-        "exports": [],
-        "streams": [
-            {"name": "gate_customers_cdc", "tables": ["gate_customers"], "dag": "_cdc_gate_customers_cdc"},
-            {"name": "gate_orders_cdc", "tables": ["gate_orders"], "dag": "_cdc_gate_orders_cdc"},
-        ],
-        "extra": [],
-    }
+    assert (shape["exports"], shape["extra"]) == ([], [])
+    # rivet 0.32.1 writes the collections in listCollections order, which differs between two inits of one database.
+    assert sorted(shape["streams"], key=lambda s: s["name"]) == [
+        {"name": "gate_customers_cdc", "tables": ["gate_customers"], "dag": "_cdc_gate_customers_cdc"},
+        {"name": "gate_orders_cdc", "tables": ["gate_orders"], "dag": "_cdc_gate_orders_cdc"},
+    ]
 
 
 def test_the_mongodb_batch_limit_holds_only_while_init_refuses_with_its_code() -> None:
@@ -147,8 +145,8 @@ def test_oracle_numbers_compare_exactly_whatever_the_reader_hands_back() -> None
 
 def test_the_batch_deletes_of_each_engine_are_the_count_the_oracle_expects() -> None:
     assert "BETWEEN 4996 AND 5000" in ORACLE.changes
-    deleted = sources.DELETED_BY_BATCH["delta"]
-    assert [deleted.get(t.lower(), 0) for t in ORACLE.tables] == [0, 5]
+    assert [sources.deleted_by_batch("delta", t) for t in ORACLE.tables] == [0, 5]
+    assert [sources.deleted_by_batch("initial", t) for t in ORACLE.tables] == [0, 0]
 
 
 def test_compaction_is_judged_on_the_upper_case_names_bigquery_keeps() -> None:
@@ -208,6 +206,6 @@ def test_a_limit_kind_runs_init_without_failing_the_leg_and_builds_no_dag(tmp_pa
     monkeypatch.setattr(sources.warehouse, "_bq", lambda *a, **k: None)
     leg.prepare(stand)
     assert leg.limits == {"batch": []}
-    assert leg.dags == ["gate_src_mongodb_cdc_gate_customers_cdc", "gate_src_mongodb_cdc_gate_orders_cdc"]
+    assert sorted(leg.dags) == ["gate_src_mongodb_cdc_gate_customers_cdc", "gate_src_mongodb_cdc_gate_orders_cdc"]
     assert leg.tasks["gate_src_mongodb_cdc_gate_orders_cdc"] == ["run", "load.gate_orders", "compact.gate_orders"]
     assert "batch" not in json.loads((stand.rivet_dir / "configs" / "mongodb_shape.json").read_text())

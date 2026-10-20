@@ -140,6 +140,27 @@ through `sqlcmd`, an instant cut to the microseconds rivet keeps; batch: with ex
 over; CDC: without the rows flagged `__is_deleted`), and no `__changes` buffer is left. The cleanup deletes both buckets
 and both datasets and looks again; the sweep drops gate-shaped buckets older than a day.
 
+`--sources mongodb` and `--sources oracle` (together: `--sources mongodb,oracle`) are the same leg where rivet can run
+it, and a known-limit cell where it cannot. **MongoDB 7** runs as a one-member replica set (a change stream needs one)
+with users and a key file, the member named `gate-mongodb:27017` so clients inside the stack reach the primary it
+advertises; the collections hold ObjectId and int64 `_id`s, documents nested two deep with arrays, Decimal128, dates,
+an int64 past 2^53, doubles, binary and nulls. init writes one CDC export per collection (`<collection>_cdc`, one
+DAG each), loaded and compacted into BigQuery, where `document` is a JSON column. `init --mode incremental` is refused
+(`RIVET_CONFIG_SOURCE_MODE_UNSUPPORTED`: MongoDB's only batch mode is `full`), so the leg has no MongoDB batch DAG; the
+cell `initial/mongodb/batch/known-limit` runs that init on every stack and fails when it does anything but that
+refusal. **Oracle 23ai Free** (`gvenzl/oracle-free:23-slim-faststart`, rivet's own stand image, arm64 too) gets
+LogMiner's prerequisites as rivet's stand sets them (`dev/oracle/init/02-logminer.sh`: ARCHIVELOG, minimal and per-table
+ALL COLUMNS supplemental logging); its tables hold `NUMBER(19)` identity keys, `NUMBER(12,2)`, a `TIMESTAMP(6) WITH
+TIME ZONE` at `+03:00` (the delta's at `-05:30`), Cyrillic `NVARCHAR2`, `RAW` and `BLOB`, with `TIMESTAMP(6)` cursors.
+init names Oracle's batch exports after the upper-case tables (`GATE_ORDERS`); they run as incremental batch, loaded
+and compacted. Oracle CDC cannot feed a `load:` block (rivet's oracle.md, *Known limits*), and `init --mode cdc` writes
+the config without one: `initial/oracle/cdc/known-limit` fails when init writes a `load:` block (the leg must then load
+and compact Oracle CDC). Oracles: MongoDB is read by pymongo, each document brought to one canonical text (every type
+tagged: ObjectId, Decimal128 with its digits, a double apart from an integer, a date at its millisecond, binary with
+its subtype) and compared with BigQuery's `document` read back as extended JSON by pymongo's own parser, beside the
+`_id` text; Oracle is read by python-oracledb (exact decimals, LOBs as bytes, the zoned instant as `TO_CHAR` text with
+its offset).
+
 **Connection legs.** Each stack runs with passwords made for it (32 random hex digits for the source, state,
 ClickHouse and metastore databases and the admin user) and a generated Fernet key, so no task log masks a word it
 carries: the cells `hygiene/no-masked-words` (no `***` in any task log) and `hygiene/fernet-key-set` (no

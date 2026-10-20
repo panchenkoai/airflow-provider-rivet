@@ -10,21 +10,6 @@ source:
 # One export per table/view — per-table prefix `exports/<name>/` under the given bucket; review
 # modes before running.
 exports:
-  - name: gate_customers_cdc
-    # change data capture — reads the transaction log (grants: docs/reference/cdc.md)
-    table: gate_customers
-    mode: cdc
-    format: parquet
-    cdc:
-      checkpoint: ./cdc/gate_customers.ckpt  # resume position; keep it (semantics of omitting
-      # differ per engine — see cdc.md)
-      until_current: true  # drain to the current log end and exit (good for a scheduler)
-      initial: snapshot  # first run: anchor, then read the whole table as the baseline; later runs
-      # take only changes
-    destination:
-      type: gcs
-      bucket: rivet-afgate-bucket
-      prefix: exports/gate_customers_cdc/
   - name: gate_orders_cdc
     # change data capture — reads the transaction log (grants: docs/reference/cdc.md)
     table: gate_orders
@@ -40,6 +25,21 @@ exports:
       type: gcs
       bucket: rivet-afgate-bucket
       prefix: exports/gate_orders_cdc/
+  - name: gate_customers_cdc
+    # change data capture — reads the transaction log (grants: docs/reference/cdc.md)
+    table: gate_customers
+    mode: cdc
+    format: parquet
+    cdc:
+      checkpoint: ./cdc/gate_customers.ckpt  # resume position; keep it (semantics of omitting
+      # differ per engine — see cdc.md)
+      until_current: true  # drain to the current log end and exit (good for a scheduler)
+      initial: snapshot  # first run: anchor, then read the whole table as the baseline; later runs
+      # take only changes
+    destination:
+      type: gcs
+      bucket: rivet-afgate-bucket
+      prefix: exports/gate_customers_cdc/
 
 # The warehouse half of the cycle: `rivet load` fills it, `rivet compact` merges.
 # Review every value below — they are guesses from the catalog, not decisions.
