@@ -119,3 +119,41 @@ for engine in filter(None, os.environ.get("GATE_SOURCES", "").split(",")):
             operator_kwargs=leg_kwargs(engine, "cdc"),
             tags=["rivet", "gate", "source", engine],
         )
+
+
+# Destination legs (gate/destinations.py): the postgres scenario to S3 (MinIO in the stack), extract-only and loaded
+# into ClickHouse, on the configs `rivet init` wrote; the S3 credential and endpoint come from the `aws` Connection.
+if "s3" in os.environ.get("GATE_DESTINATIONS", "").split(",") and os.path.exists(f"{ROOT}/configs/s3_shape.json"):
+    with open(f"{ROOT}/configs/s3_shape.json") as handle:
+        s3_shape = json.load(handle)
+    for kind, cfg in s3_shape.items():
+        kwargs = {
+            "env_from_connections": {cfg["url_env"]: cfg["source_conn"], "RIVET_STATE_URL": cfg["state_conn"]},
+            "connections": cfg["connections"],
+        }
+        dag_id = f"gate_s3_{kind}"
+        tags = ["rivet", "gate", "destination", "s3"]
+        if cfg["streams"]:
+            stream = cfg["streams"][0]
+            globals()[dag_id] = build_cdc_dag(
+                dag_id,
+                config=cfg["config"],
+                export=stream["name"],
+                tables=stream["tables"],
+                state_dir=cfg["state_dir"],
+                load=cfg["load"],
+                compact=cfg["load"],
+                operator_kwargs=kwargs,
+                tags=tags,
+            )
+        else:
+            globals()[dag_id] = build_batch_dag(
+                dag_id,
+                config=cfg["config"],
+                state_dir=cfg["state_dir"],
+                exports=cfg["exports"],
+                load=cfg["load"],
+                compact_exports=cfg["exports"] if cfg["load"] else [],
+                operator_kwargs=kwargs,
+                tags=tags,
+            )

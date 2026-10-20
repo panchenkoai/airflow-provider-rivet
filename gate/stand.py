@@ -12,7 +12,7 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
 
@@ -38,11 +38,17 @@ class StandSecrets:
     mysql_root: str
     mssql: str
     mssql_root: str
+    minio: str
+    source_s3: str
     fernet: str
 
     @classmethod
     def generate(cls) -> StandSecrets:
-        return cls(*(secrets.token_hex(16) for _ in range(10)), fernet=base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())
+        hex_fields = [f.name for f in fields(cls) if f.name != "fernet"]
+        return cls(
+            **{name: secrets.token_hex(16) for name in hex_fields},
+            fernet=base64.urlsafe_b64encode(secrets.token_bytes(32)).decode(),
+        )
 
 
 def write_private(path: Path, text: str) -> None:
@@ -108,6 +114,7 @@ x-rivet: &rivet
     AIRFLOW__API_AUTH__JWT_SECRET: '{jwt}'
     GATE_WAREHOUSES: '{warehouses}'
     GATE_SOURCES: '{sources}'
+    GATE_DESTINATIONS: '{destinations}'
 {backend}  env_file: [gate-connections.env]
   volumes:
     - {rivet_dir}:/opt/rivet
@@ -133,7 +140,7 @@ x-rivet: &rivet
     environment: {{ CLICKHOUSE_USER: loader, CLICKHOUSE_PASSWORD: {clickhouse}, CLICKHOUSE_DB: gate, CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1" }}
     ulimits: {{ nofile: {{ soft: 262144, hard: 262144 }} }}
     ports: ["127.0.0.1::8123"]
-{source_services}"""
+{source_services}{destination_services}"""
 
 
 def sh(
@@ -168,6 +175,7 @@ class Stand:
         secrets_backend: dict[str, str] | None = None,
         adc: Path | None = None,
         sources: tuple[Any, ...] = (),
+        destinations: tuple[Any, ...] = (),
     ) -> None:
         self.flavor = FLAVORS[version]
         # The run tag keeps two gate runs of one Airflow version apart: each `down -v` and image build is its own.
@@ -189,6 +197,8 @@ class Stand:
         self.adc = adc
         #: Source engines beside the postgres source (gate.sources.Engine): their containers and Connections.
         self.sources = sources
+        #: Destination legs (gate.destinations): their containers, Connections and the states of their configs.
+        self.destinations = destinations
         self._token: str | None = None
 
     def connections(self) -> dict[str, dict[str, Any]]:
@@ -226,6 +236,20 @@ class Stand:
                 }
                 for e in self.sources
                 for kind in ("batch", "cdc")
+            },
+            **{conn_id: conn for d in self.destinations for conn_id, conn in d.connections(self.secrets).items()},
+            **{
+                state_conn_id(d.name, kind): {
+                    "conn_type": "postgres",
+                    "host": "gate-state",
+                    "port": 5432,
+                    "login": "rivet",
+                    "password": self.secrets.state,
+                    "schema": state_db(d.name, kind),
+                    "extra": {"rivet_params": "sslmode=require"},
+                }
+                for d in self.destinations
+                for kind in d.configs
             },
             **self.extra_connections,
         }
@@ -312,6 +336,8 @@ class Stand:
             warehouses=",".join(self.warehouses),
             sources=",".join(e.name for e in self.sources),
             source_services="".join(e.service_yaml.format(**vars(self.secrets)) for e in self.sources),
+            destinations=",".join(d.name for d in self.destinations),
+            destination_services="".join(d.service_yaml.format(**vars(self.secrets)) for d in self.destinations),
             backend=backend,
             adc=adc,
             result_backend=self.flavor.result_backend,
