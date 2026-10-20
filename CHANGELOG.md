@@ -5,6 +5,10 @@ rivet binary; its release tags will use the prefix `airflow-v`.
 
 ## Unreleased
 
+- README Quickstart: `rivet init` with `RIVET_STATE_URL=sqlite:` into the state directory, the
+  Connection, a scheduled DAG, where the Parquet lands. The docs now say that a relative local
+  `destination.path` lands under `state_dir` (rivet 0.32 anchors it to the config's directory),
+  not under `cwd`.
 - The task log is shorter: a one-step task whose step took the task's time has no step line, and
   "this binary lacks" is written at DEBUG, not on every task (#62).
 - XCom `rivet_version` holds the whole version line (`0.32.1 (3f337e9e3)`), not only the number.

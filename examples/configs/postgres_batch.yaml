@@ -1,5 +1,5 @@
-# Batch example for the repo's PostgreSQL fixture (docker compose up -d postgres; port 5432).
-# Relative destination paths resolve against the task's working directory: the DAG sets it.
+# Batch example for the rivet repo's PostgreSQL fixture (docker compose up -d postgres; port 5432).
+# Relative destination paths resolve against the config rivet reads: under the operator, the state directory.
 source:
   type: postgres
   url_env: RIVET_PG_URL
