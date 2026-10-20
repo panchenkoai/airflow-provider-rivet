@@ -121,9 +121,12 @@ SQLite state in `state_dir`.
    from the start, a CDC stream re-anchors and the changes between the lost position and the new
    anchor are gone, with no error. What the operator can check without rivet's state identity:
    the directory exists, is absolute and writable, and its marker equals the marker of each
-   direct upstream rivet task of the same DAG run (taken from their XCom); a difference is
-   refused with `RIVET_AIRFLOW_STATE_DIR_DIFFERS`. It cannot see a directory that was emptied
-   between two DAG runs, or two hosts that each have their own copy.
+   direct upstream rivet task of the same DAG run (taken from their XCom); on SQLite state a
+   difference is refused with `RIVET_AIRFLOW_STATE_DIR_DIFFERS`. On PostgreSQL state it is not:
+   no task reads what another left in the directory, and several hosts, each with its own
+   directory at one path, are the deployment that state is for (an extract on one host and its
+   load on the other, measured by the live gate's multi-host leg). It cannot see a directory that
+   was emptied between two DAG runs, or two hosts that each have their own copy.
 5. **Relative paths in the config.** The copy changes the directory rivet takes as the
    config's, and nothing else:
 

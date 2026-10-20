@@ -93,6 +93,24 @@ def test_a_task_that_sees_another_state_directory_than_its_upstream_is_refused(r
     assert again["state_marker"] == payload["state_marker"]
 
 
+def test_on_postgresql_state_a_task_on_another_host_than_its_upstream_runs(rig: Rig) -> None:
+    """Two Celery workers on two hosts, each with its own state_dir at one path, on PostgreSQL state (docs/state.md's
+    deployment for several workers): the load lands on the other host than its extract. Nothing it reads is in the
+    state_dir, so the marker difference is no refusal (measured live: RIVET_AIRFLOW_STATE_DIR_DIFFERS failed the load,
+    not retried, `python -m gate --workers 2`, multihost/chain)."""
+    store: dict = {}
+    first = rig.operator(RivetApplyOperator, task_id="apply.orders", export="orders", env=PG_STATE)
+    payload, _ = rig.run(first, FakeTI("apply.orders", store=store))
+    store[("apply.orders", "return_value")] = payload
+    other = rig.tmp / "other-host-state"
+    other.mkdir()
+    load = rig.operator(RivetLoadOperator, task_id="load.orders", export="orders", state_dir=str(other), env=PG_STATE)
+    load.upstream_task_ids.add("apply.orders")
+    done, _ = rig.run(load, FakeTI("load.orders", store=store))
+    assert isinstance(done, dict) and done["decision"] == "success", done
+    assert done["state_marker"] != payload["state_marker"], "two hosts, two markers"
+
+
 def test_a_binary_below_the_minimum_is_refused_with_both_versions(rig: Rig) -> None:
     rig.scenario(version="0.31.9")  # the last below 0.32.0, which answers a replayed apply itself (G1b)
     exc, ti = rig.run(rig.operator(RivetApplyOperator, export="orders"))
