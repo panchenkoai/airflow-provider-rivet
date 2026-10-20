@@ -64,19 +64,61 @@ The operators run `rivet` from the worker's `PATH`, else the binary `rivet-cli` 
 Airflow's environment. To run another build, pass `rivet_bin="/abs/path/rivet"` (for example one
 copied from `ghcr.io/panchenkoai/rivet:v0.32.0`).
 
-## Example
+## Quickstart
 
-```python
-from airflow_provider_rivet.dags import build_batch_dag
+A daily PostgreSQL → Parquet DAG on one worker, with SQLite state. Run the commands on the worker
+(or in the image) where Airflow runs.
 
-dag = build_batch_dag(
-    "rivet_postgres",
-    config="/opt/pipelines/postgres.yaml",
-    state_dir="/var/lib/rivet/postgres",
-    exports=["users", "orders"],
-    operator_kwargs={"env_from_connections": {"RIVET_PG_URL": "rivet_postgres"}},
-)
-```
+1. **Generate the config** from the live database with `rivet init` (the `rivet` that `rivet-cli`
+   installed; 0.32.1 or newer for `RIVET_STATE_URL=sqlite:`), and keep its state in the directory
+   the DAG will use. The directory must exist, on persistent storage, at the same path on every
+   worker:
+
+   ```bash
+   mkdir -p /var/lib/rivet/postgres
+   export RIVET_PG_URL='postgresql://user:password@db-host:5432/app'
+   RIVET_STATE_URL=sqlite:/var/lib/rivet/postgres/.rivet_state.db \
+     rivet init --source-env RIVET_PG_URL --include 'users' 'orders' -o /opt/pipelines/postgres.yaml
+   ```
+
+   Review the file: one export per table, `mode`, `destination`. Without `RIVET_STATE_URL`, init
+   leaves `.rivet_state.db` beside the config and the operator refuses to start from another one
+   (`RIVET_AIRFLOW_STATE_BESIDE_CONFIG`).
+2. **Add the Connection** the task builds `RIVET_PG_URL` from (type `postgres`; `generic` is
+   refused):
+
+   ```bash
+   airflow connections add rivet_postgres --conn-uri 'postgres://user:password@db-host:5432/app'
+   ```
+3. **Write the DAG.** The builders default to `schedule=None` (manual runs); pass your own:
+
+   ```python
+   from datetime import datetime
+
+   from airflow_provider_rivet.dags import build_batch_dag
+
+   dag = build_batch_dag(
+       "rivet_postgres",
+       config="/opt/pipelines/postgres.yaml",
+       state_dir="/var/lib/rivet/postgres",
+       exports=["users", "orders"],
+       load=False,  # no warehouse yet: True adds load tasks, which need a `load:` block
+       schedule="@daily",
+       start_date=datetime(2026, 10, 1),
+       catchup=False,
+       operator_kwargs={"env_from_connections": {"RIVET_PG_URL": "rivet_postgres"}},
+   )
+   ```
+4. **Trigger it.** Each task logs one line, e.g.
+   `rivet apply users → OK: 300 rows, 1 file in 0.3 s (run users_20261020T165708.134_54927)`.
+   The Parquet lands in the config's `destination`; a relative `path` such as init's
+   `./output/users/` is resolved by rivet against the directory of the config it reads, which under
+   the operator is `state_dir`: `/var/lib/rivet/postgres/output/users/`. Write an absolute path to
+   put it elsewhere.
+
+If the worker has an older `rivet` on its `PATH`, the operator refuses it with both versions
+(`RIVET_AIRFLOW_BINARY_TOO_OLD`); remove it or pass `rivet_bin=`. Several workers, Kubernetes pods
+or a shared state: see [State](https://github.com/panchenkoai/airflow-provider-rivet/blob/main/docs/state.md).
 
 ## Documentation
 

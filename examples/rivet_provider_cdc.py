@@ -1,8 +1,9 @@
-"""Example: a CDC DAG built by `build_cdc_dag` against the repo's logical-replication fixture.
+"""Example: a CDC DAG built by `build_cdc_dag` against the rivet repo's logical-replication fixture.
 
 Set on the worker before the scheduler parses this file:
   RIVET_EXAMPLE_STATE_DIR  an existing directory on a host volume; state, the CDC checkpoint and stderr files live there
-  RIVET_EXAMPLE_OUT_DIR    an existing directory; Parquet lands in <dir>/orders_cdc/
+  (Parquet lands in $RIVET_EXAMPLE_STATE_DIR/orders_cdc/: rivet resolves the config's relative paths against the
+   copy of the config the operator puts in the state directory)
   RIVET_PG_CDC_URL         a source with wal_level=logical, e.g. postgresql://rivet:rivet@127.0.0.1:5434/rivet
   RIVET_BIN                optional path of the rivet binary (default: `rivet` on PATH)
   RIVET_EXAMPLE_LOAD=1     optional: add load and compact per table (the config then needs a `load:` block)
@@ -28,6 +29,5 @@ rivet_provider_cdc = build_cdc_dag(
     operator_kwargs={
         "rivet_bin": os.environ.get("RIVET_BIN", "rivet"),
         "env_passthrough": ["RIVET_PG_CDC_URL"],
-        "cwd": os.environ.get("RIVET_EXAMPLE_OUT_DIR"),
     },
 )

@@ -131,7 +131,8 @@ SQLite state in `state_dir`.
    |---|---|---|
    | `query_file` | the config's directory; an absolute path, `..` and a symlink out of it are refused by rivet | stays as written; the file is copied to the same relative path in the state directory before every task. Refused before rivet starts (`RIVET_AIRFLOW_QUERY_FILE`) when it is absolute, has `..`, leaves the directory through a symlink, is missing for the task's export, or when a config from ANOTHER directory already put a file at that relative path in this state directory |
    | `cdc.checkpoint` | the config's directory | resolves in the state directory; a file left beside the original is refused, see 3 |
-   | `destination.path` (and the other paths rivet opens as written, such as `tls.ca_file`) | the process's working directory | unchanged: the working directory defaults to the directory of your ORIGINAL config; set `cwd` to change it |
+   | a local `destination.path` (or `prefix`) | the config's directory (rivet 0.32+) | the state directory: init's `./output/orders/` lands in `<state_dir>/output/orders/`; `cwd` does not move it. Write an absolute path to put the files elsewhere |
+   | the other paths rivet opens as written, such as `tls.ca_file` | the process's working directory | unchanged: the working directory defaults to the directory of your ORIGINAL config; set `cwd` to change it |
    The preflight reads the config as rivet does: every `${name}` is taken from a `-p` /
    `--param` in `extra_args`, then from the task's environment, and spliced into the text before
    the YAML is parsed, with YAML 1.2 scalars (`017` and `name: 2024` stay the text written). A

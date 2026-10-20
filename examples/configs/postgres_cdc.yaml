@@ -1,4 +1,4 @@
-# CDC example for the repo's logical-replication fixture
+# CDC example for the rivet repo's logical-replication fixture
 # (docker compose --profile cdc up -d postgres-cdc; port 5434, wal_level=logical).
 source:
   type: postgres
