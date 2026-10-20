@@ -12,7 +12,7 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
 
@@ -38,11 +38,15 @@ class StandSecrets:
     mysql_root: str
     mssql: str
     mssql_root: str
+    mongodb: str
+    mongodb_root: str
+    oracle: str
     fernet: str
 
     @classmethod
     def generate(cls) -> StandSecrets:
-        return cls(*(secrets.token_hex(16) for _ in range(10)), fernet=base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())
+        hexes = {f.name: secrets.token_hex(16) for f in fields(cls) if f.name != "fernet"}
+        return cls(**hexes, fernet=base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())
 
 
 def write_private(path: Path, text: str) -> None:
@@ -225,7 +229,7 @@ class Stand:
                     "extra": {"rivet_params": "sslmode=require"},
                 }
                 for e in self.sources
-                for kind in ("batch", "cdc")
+                for kind in e.kinds
             },
             **self.extra_connections,
         }
