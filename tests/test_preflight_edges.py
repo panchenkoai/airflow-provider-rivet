@@ -197,6 +197,12 @@ def test_the_notifications_warning_reads_the_run_subcommands_flags(rig: Rig) -> 
     assert "notifications_block" not in dict(pre(rig).warnings)
 
 
+def test_rivet_notifications_kept_on_by_the_user_are_not_warned_about(rig: Rig) -> None:
+    rig.config.write_text(rig.config.read_text() + NOTIFYING)
+    rig.scenario(flags={"apply": ["--no-notify"]})
+    assert "notifications_block" not in dict(pre(rig, rivet_notifications=True).warnings)
+
+
 # --- behaviour ----------------------------------------------------------------------------------------------------------
 
 

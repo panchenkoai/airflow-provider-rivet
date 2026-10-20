@@ -85,6 +85,7 @@ class RivetBaseOperator(BaseOperator):
         deployment: str = "auto",
         extra_args: Sequence[str] | None = None,
         lock_wait: int = 600,
+        rivet_notifications: bool = False,
         crashed_retries: int = 1,
         stderr_dir: str | None = None,
         stream_stderr: bool = False,
@@ -113,6 +114,7 @@ class RivetBaseOperator(BaseOperator):
         self.single_host = single_host
         self.extra_args = extra_args
         self.lock_wait = lock_wait
+        self.rivet_notifications = rivet_notifications
         self.crashed_retries = crashed_retries
         self.stderr_dir = stderr_dir
         self.stream_stderr = stream_stderr
@@ -226,6 +228,7 @@ class RivetBaseOperator(BaseOperator):
             spreads_hosts=None if self.single_host else executor_spreading_hosts(),
             extra_args=list(self.extra_args or ()),
             lock_wait=self.lock_wait,
+            rivet_notifications=self.rivet_notifications,
             plan_file=self.plan_file,
             cwd=self.cwd,
             stderr_dir=self.stderr_dir,
