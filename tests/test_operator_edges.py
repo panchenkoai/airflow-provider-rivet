@@ -180,6 +180,16 @@ def test_rivet_notifications_true_keeps_rivets_own_notifications_and_records_no_
     assert "no_notify" not in payload["degraded"]
 
 
+def test_rivet_notifications_true_is_not_warned_about_a_notifications_block(rig: Rig) -> None:
+    rig.config.write_text(rig.config.read_text() + "notifications:\n  slack: {webhook_env: HOOK}\n")
+    rig.scenario(flags={"run": ["--lock-wait"]}, run={"summary": {"per_export": [entry()]}})
+    warned = lambda: [e["warning"] for e in rig.events("rivet.warning")].count("notifications_block")  # noqa: E731
+    payload_of(rig, rig.operator(RivetRunOperator, export="orders", rivet_notifications=True))
+    assert warned() == 0
+    payload_of(rig, rig.operator(RivetRunOperator, export="orders"))
+    assert warned() == 1, "the default warns: this binary cannot turn rivet's notifications off"
+
+
 def test_an_apply_summary_with_a_failed_export_gives_it_an_error(rig: Rig) -> None:
     """(apply 212)"""
     rig.scenario(flags=NEW_FLAGS, apply={"summary": {"per_export": [entry("failed")]}})
