@@ -119,3 +119,84 @@ for engine in filter(None, os.environ.get("GATE_SOURCES", "").split(",")):
             operator_kwargs=leg_kwargs(engine, "cdc"),
             tags=["rivet", "gate", "source", engine],
         )
+
+
+# The multi-host leg (gate/multihost.py, `--workers 2`): two Celery workers, each a host with its own disk at
+# /opt/rivet-host. The configs are the ones `rivet init` wrote, read as the shape the gate wrote beside them; each task
+# names a queue, and the gate moves the queues between the hosts, so tasks of one DAG run land on both.
+MULTIHOST_SHAPE = f"{ROOT}/configs/mh_shape.json"
+if os.environ.get("GATE_WORKERS", "1") != "1" and os.path.exists(MULTIHOST_SHAPE):
+    from datetime import timedelta
+
+    with open(MULTIHOST_SHAPE) as handle:
+        mh = json.load(handle)
+    HOST = "/opt/rivet-host"
+    # A retry in seconds, not the builders' five minutes: the gate waits for it.
+    quick = {"default_args": {"retry_delay": timedelta(seconds=5)}}
+
+    def mh_kwargs(state_conn: str | None) -> dict:
+        """The source from its Connection; PostgreSQL state from `state_conn`, or SQLite in the state_dir when None."""
+        if state_conn is None:
+            return {"env_from_connections": dict(SOURCE), "env": {"RIVET_STATE_URL": ""}}
+        return {"env_from_connections": {**SOURCE, "RIVET_STATE_URL": state_conn}}
+
+    def routed(dag, queues: dict) -> None:
+        """Each named task on its queue; the gate decides which host consumes each queue."""
+        for task in dag.tasks:
+            if task.task_id in queues:
+                task.queue = queues[task.task_id]
+
+    batch_exports = mh["batch"]["exports"]
+    by_host = {f"apply.{name}": ("gate_a", "gate_b")[i % 2] for i, name in enumerate(batch_exports)}
+    for dag_id, state_conn, state_dir in (
+        ("gate_mh_batch", "rivet_gate_state", "batch"),
+        ("gate_mh_sqlite", None, "sqlite"),
+    ):
+        kwargs = mh_kwargs(state_conn)
+        dag = build_batch_dag(
+            dag_id,
+            config=f"{ROOT}/configs/mh_batch/rivet.yaml",
+            state_dir=f"{HOST}/{state_dir}",
+            exports=batch_exports,
+            load=False,
+            operator_kwargs=kwargs,
+            tags=["rivet", "gate", "multihost"],
+            **quick,
+        )
+        routed(dag, by_host)
+        if dag_id == "gate_mh_batch":
+            # One apply pauses after its first fetch, announced by a marker the gate polls: the window in which the
+            # gate kills it to send its retry to the other host.
+            pause = {
+                "RIVET_TEST_PAUSE_AT": "pg_after_snapshot_open:15000",
+                "RIVET_TEST_PAUSE_MARKER": f"{ROOT}/markers/mh_{mh['paused']}",
+            }
+            dag.get_task(f"apply.{mh['paused']}").env = {**kwargs.get("env", {}), **pause}
+        globals()[dag_id] = dag
+
+    stream = mh["cdc"]["streams"][0]
+    gate_mh_cdc = build_cdc_dag(
+        "gate_mh_cdc",
+        config=f"{ROOT}/configs/mh_cdc/rivet.yaml",
+        export=stream["name"],
+        tables=stream["tables"],
+        state_dir=f"{HOST}/cdc",
+        load=False,
+        operator_kwargs=mh_kwargs("rivet_gate_state_mh_cdc"),
+        tags=["rivet", "gate", "multihost"],
+        **quick,
+    )
+    routed(gate_mh_cdc, {"run": "gate_cdc"})
+
+    # An extract and the load after it on two hosts, on PostgreSQL state: what the state-directory check does.
+    chain = mh["chain"]
+    gate_mh_chain = build_batch_dag(
+        "gate_mh_chain",
+        config=f"{ROOT}/configs/mh_batch/rivet.yaml",
+        state_dir=f"{HOST}/chain",
+        exports=[chain],
+        operator_kwargs=mh_kwargs("rivet_gate_state_mh_chain"),
+        tags=["rivet", "gate", "multihost"],
+        **quick,
+    )
+    routed(gate_mh_chain, {f"apply.{chain}": "gate_a", f"load.{chain}": "gate_b"})

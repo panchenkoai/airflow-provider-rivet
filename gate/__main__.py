@@ -1,4 +1,4 @@
-"""python -m gate --rivet-bin <linux rivet> [--airflow 2.10.5,3.3.2] [--sources mysql,mssql] [--verdicts out.jsonl] [--keep] [--sabotage drop-delta-file|warehouse-value]
+"""python -m gate --rivet-bin <linux rivet> [--airflow 2.10.5,3.3.2] [--workers 2] [--sources mysql,mssql] [--verdicts out.jsonl] [--keep] [--sabotage drop-delta-file|warehouse-value]
 
 With --warehouses: [--connections env|gsm] [--gcp-auth key|adc] choose where the stack's Connections live and how
 rivet authenticates to GCP; see docs/connections-and-secrets.md.
@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 
 from . import conns as proofs
-from . import sources
+from . import multihost, sources
 from .scenario import TABLES, Verdicts, play
 from .stand import FLAVORS, Stand
 from .warehouse import TAG_SHAPE, WAREHOUSES, Cloud, Leg, connections, delete_connections, publish_connections, sweep
@@ -37,6 +37,13 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         help=f"comma-separated source legs beside postgres ({','.join(sources.ENGINES)}): each to GCS and BigQuery on the "
         "configs `rivet init` writes; needs --warehouses",
+    )
+    ap.add_argument(
+        "--workers",
+        type=int,
+        choices=[1, 2],
+        default=1,
+        help="2: the multi-host leg (two Celery workers, a disk each, PostgreSQL state) instead of the base scenario",
     )
     ap.add_argument("--gcp-keyfile", type=Path, help="GCP credential JSON for the gate_gcp Connection (service account or ADC)")
     ap.add_argument("--gcs-bucket", default="rivet_data_test")
@@ -91,6 +98,8 @@ def main(argv: list[str] | None = None) -> int:
         ap.error(f"unknown source(s) {sorted(set(engines) - set(sources.ENGINES))}; known: {list(sources.ENGINES)}")
     if engines and "bigquery" not in warehouses:
         ap.error("--sources loads into BigQuery: pass --warehouses with bigquery")
+    if args.workers > 1 and (warehouses or engines or args.sabotage):
+        ap.error("--workers 2 is a leg of its own: no --warehouses, --sources or --sabotage beside it")
     tag = args.tag or time.strftime("%m%d%H%M") + secrets.token_hex(2)
     if not TAG_SHAPE.fullmatch(tag):
         ap.error(f"--tag {tag!r} is not 8 digits and 4 lower-case hex digits (the shape the cloud sweep recognises)")
@@ -133,6 +142,7 @@ def main(argv: list[str] | None = None) -> int:
             # The secrets backend and a keyless gate_gcp both run as the containers' identity: this file, read-only.
             adc=cloud.keyfile.resolve() if cloud and (gsm or cloud.gcp_auth == "adc") else None,
             sources=sources.engines(engines),
+            workers=args.workers,
         )
         leg = Leg(cloud, version, TABLES, warehouses) if cloud else None
         src_legs = sources.legs(cloud, version, engines)
@@ -145,7 +155,10 @@ def main(argv: list[str] | None = None) -> int:
             if not verdicts.rows:
                 verdicts.guard("stand-up", stand.up)
             if not verdicts.rows:
-                verdicts.guard("scenario", play, stand, verdicts, args.sabotage, leg, src_legs)
+                if args.workers > 1:
+                    verdicts.guard("multihost", multihost.play, stand, verdicts)
+                else:
+                    verdicts.guard("scenario", play, stand, verdicts, args.sabotage, leg, src_legs)
                 verdicts.guard("proofs", proofs.prove, stand, verdicts, cloud)
         finally:
             if not args.keep:

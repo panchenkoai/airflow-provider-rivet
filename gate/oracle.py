@@ -151,3 +151,40 @@ def inside(inner: Sequence[tuple[str, str]], outer: tuple[str, str], what: str) 
     o_start, o_end = (_instant(t) for t in outer)
     late = [(s, e) for s, e in inner if not (o_start <= _instant(s) and _instant(e) <= o_end)]
     return [f"{what}: {late} not inside {outer}"] if late or not inner else []
+
+
+def duplicates(con: duckdb.DuckDBPyConnection, files: Sequence[str], columns: Sequence[str], what: str) -> list[str]:
+    """No combination of `columns` occurs twice across the files: one version of a row, or one event, written once."""
+    if not files:
+        return []
+    cols = ", ".join(columns)
+    rows = con.execute(
+        f"SELECT {cols}, count(*) AS n FROM read_parquet({_files(files)}, union_by_name=true) GROUP BY ALL HAVING n > 1 "
+        f"ORDER BY n DESC LIMIT {SHOWN + 1}"
+    ).fetchall()
+    if not rows:
+        return []
+    total = con.execute(
+        f"SELECT count(*) FROM (SELECT {cols} FROM read_parquet({_files(files)}, union_by_name=true) GROUP BY ALL "
+        "HAVING count(*) > 1)"
+    ).fetchone()[0]
+    return [f"{what}: {total} ({cols}) written more than once, e.g. {rows[:SHOWN]}"]
+
+
+def not_regressed(before: Any, after: Any, what: str) -> list[str]:
+    """A stored position never moves back between two runs (`before` None: the first run, nothing to compare)."""
+    if before is None:
+        return []
+    if after is None:
+        return [f"{what}: stored {before} before, nothing now"]
+    return [] if _instant(after) >= _instant(before) else [f"{what}: stored {after} now, {before} before: moved back"]
+
+
+def hosts_as_routed(seen: Mapping[str, Sequence[str]], expected: Mapping[str, Sequence[str]], what: str) -> list[str]:
+    """Each task's tries ran on the hosts the gate routed them to, try by try (a hostname's domain is ignored)."""
+    problems = []
+    for task, want in expected.items():
+        got = [(h or "").split(".")[0] for h in seen.get(task, [])]
+        if got != list(want):
+            problems.append(f"{what}: {task} ran on {got}, routed to {list(want)}")
+    return problems
