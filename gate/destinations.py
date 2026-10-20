@@ -14,8 +14,11 @@ half run against two postgres servers: `gate-source` and `gate-source-s3`, which
 
 from __future__ import annotations
 
+import base64
 import json
 import time
+import urllib.error
+import urllib.request
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -166,6 +169,21 @@ def missing_bucket(states: Mapping[str, Mapping[str, Any]], payloads: Mapping[st
     if other:
         problems.append(f"tasks that did not stop: {other}")
     return problems
+
+
+def ch_exec(port: int, password: str, sql: str) -> None:
+    """A statement that changes ClickHouse, over HTTP POST (a GET is read-only)."""
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/",
+        data=sql.encode(),
+        method="POST",
+        headers={"Authorization": "Basic " + base64.b64encode(f"loader:{password}".encode()).decode()},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            r.read()
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(f"clickhouse {exc.code}: {exc.read().decode(errors='replace').strip()[:500]}") from None
 
 
 def _instant(value: Any) -> datetime:
