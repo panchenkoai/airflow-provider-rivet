@@ -167,6 +167,26 @@ def test_success_headlines_without_counts_or_a_reason_carry_no_empty_part() -> N
     assert render(log, {"decision": "success", "units": [unit]})[0] == (INFO, "rivet run orders → OK in 1.0 s")
 
 
+@pytest.mark.parametrize(
+    ("readings", "exit_status", "shown"),
+    [
+        ((0.0, 0.0, 3.0, 3.5), 0, False),  # the step is the task: the headline already says it
+        ((0.0, 0.0, 3.0, 4.0), 0, True),  # a second outside the step (a lock wait) is worth its line
+        ((0.0, 0.0, 3.0, 3.5), 2, True),  # a step that failed always says how
+    ],
+)
+def test_one_step_that_took_the_task_s_time_has_no_line_of_its_own(
+    monkeypatch: pytest.MonkeyPatch, readings: tuple[float, ...], exit_status: int, shown: bool
+) -> None:
+    """Owner, 2026-10-20: `load done in 11.9 s` under `OK: 50 rows in 12.0 s` repeats the headline."""
+    monkeypatch.setattr(tasklog, "clock", iter(readings).__next__)
+    log, _ = make("load", "cdc", "leads")
+    log.record({"event": "rivet.start", "step": "load"})
+    log.record({"event": "rivet.step", "exit_status": exit_status})
+    lines = render(log, {"decision": "success" if exit_status == 0 else "fail", "error": {"class": "generic"}, "units": []})
+    assert any(text.startswith("  load ") for _, text in lines) is shown
+
+
 def test_step_lines_of_a_step_that_did_not_end_an_unnamed_strategy_and_a_layout_plan() -> None:
     """_step_lines 41/51/62/63/64 (no end), 87/88 (sealed without a strategy), 90/91/92 (a plan task)."""
     log, _ = make("run")

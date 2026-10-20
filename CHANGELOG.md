@@ -3,6 +3,12 @@
 All notable changes to `airflow-provider-rivet`. The package is versioned independently of the
 rivet binary; its release tags will use the prefix `airflow-v`.
 
+## Unreleased
+
+- The task log is shorter: a one-step task whose step took the task's time has no step line, and
+  "this binary lacks" is written at DEBUG, not on every task (#62).
+- XCom `rivet_version` holds the whole version line (`0.32.1 (3f337e9e3)`), not only the number.
+
 ## 0.1.0 (2026-10-18)
 
 First release, against rivet 0.32.0 and the contract of ADR-0039; Python 3.12+, Airflow 2.10 and 3.x.

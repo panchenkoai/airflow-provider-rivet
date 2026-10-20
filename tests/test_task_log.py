@@ -114,9 +114,9 @@ def test_golden_apply_success_on_a_degraded_binary(rig: Rig, log: Recorder) -> N
         f"INFO rivet apply users → OK: 30 rows, 1 file in 5.0 s (run {run_id})",
         "INFO   plan     sealed, strategy incremental in 1.0 s",
         "INFO   apply    done in 1.0 s",
-        f"INFO {OLD_LACKS}",
         f"INFO {SQLITE}",
     ]
+    assert ("DEBUG", OLD_LACKS) in log.lines  # flags no release has yet: not on every task's INFO (#62)
 
 
 def test_golden_run_of_the_whole_config_lists_each_export(rig: Rig, log: Recorder) -> None:
@@ -253,7 +253,6 @@ def test_golden_stale_plan_refused_on_todays_binary(rig: Rig, log: Recorder) -> 
         "INFO   apply    exit 5 in 1.0 s",
         "INFO   export   users: failed [RIVET_PLAN_ARTIFACT_STALE] refusal",
         f"INFO   stderr   {payload['stderr_path']}",
-        f"INFO {OLD_LACKS}",
         f"INFO {SQLITE}",
         "INFO   note     rivet's failure line has no class or action: the class is read from its exit class",
     ]
