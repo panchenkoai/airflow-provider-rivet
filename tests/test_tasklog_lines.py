@@ -265,3 +265,35 @@ def test_several_units_each_name_their_table() -> None:
     assert lines[0][1].startswith("rivet load orders → OK: 2 tables")
     assert (INFO, "  table    orders.a → p.d.a: loaded, 1 row") in lines
     assert (INFO, "  table    orders.b → p.d.b (from config): loaded, 1 row") in lines
+
+
+@pytest.mark.parametrize(
+    ("row", "expected"),
+    [
+        ({"target": "r.t", "buffer": "r.t__changes"}, ("r.t", "r.t__changes", "rivet")),
+        ({"target": "r.t", "buffer": 5}, ("r.t", None, "rivet")),  # a buffer that is not a name is dropped
+        ({"target": ""}, ("p.d.t", None, "config")),  # an empty name is no name: the config's
+        ({"target": 7}, ("p.d.t", None, "config")),
+        ({}, ("p.d.t", None, "config")),  # `snap` is a full export: its load writes the table itself
+    ],
+)
+def test_a_unit_takes_rivets_names_else_the_configs(row: dict, expected: tuple) -> None:
+    from types import SimpleNamespace
+
+    from airflow_provider_rivet.invocation import _with_target
+    from airflow_provider_rivet.result import UnitResult
+
+    config = {"load": BQ, "exports": EXPORTS}
+    s = SimpleNamespace(pf=SimpleNamespace(config=config), req=SimpleNamespace(command="load"))
+    unit = _with_target(s, UnitResult("snap", "t"), row)  # type: ignore[arg-type]
+    assert (unit.target, unit.buffer, unit.target_from) == expected
+    s.pf.config = {"exports": EXPORTS}  # no `load:` block: nothing to name, and no source claimed
+    unit = _with_target(s, UnitResult("snap", "t"), {})  # type: ignore[arg-type]
+    assert (unit.target, unit.buffer, unit.target_from) == (None, None, None)
+
+
+def test_an_empty_container_key_is_left_out_like_an_absent_one() -> None:
+    from airflow_provider_rivet.invocation import config_target
+
+    load = {"target": "bigquery", "project": "", "dataset": "d"}
+    assert config_target({"load": load}, "load", "x", "t") == ("d.t__changes", None)
