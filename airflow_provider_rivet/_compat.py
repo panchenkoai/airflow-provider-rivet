@@ -26,7 +26,7 @@ def executor_spreading_hosts(value: str | None = None) -> str | None:
         from airflow.configuration import conf
 
         value = conf.get("core", "executor")
-    names = [part.split(":")[-1].strip().rsplit(".", 1)[-1] for part in value.split(",") if part.strip()]
+    names = [part.rpartition(":")[2].strip().rpartition(".")[2] for part in value.split(",") if part.strip()]
     return next((name for name in names if name not in SINGLE_HOST_EXECUTORS), None)
 
 

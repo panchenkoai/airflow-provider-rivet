@@ -1416,12 +1416,22 @@ def test_a_failed_table_row_without_its_error_takes_the_printed_process_error(ri
         ("KubernetesExecutor", "KubernetesExecutor"),
         ("LocalExecutor,my_celery:airflow.providers.celery.executors.celery_executor.CeleryExecutor", "CeleryExecutor"),
         ("LocalExecutor, DebugExecutor", None),
+        ("hybrid:LocalExecutor,", None),
     ],
 )
 def test_the_executors_that_may_run_one_dags_tasks_on_several_hosts(executor: str, expected: str | None) -> None:
     from airflow_provider_rivet._compat import executor_spreading_hosts
 
     assert executor_spreading_hosts(executor) == expected
+
+
+def test_the_executor_is_read_from_the_core_section_when_none_is_given(monkeypatch: pytest.MonkeyPatch) -> None:
+    from airflow.configuration import conf
+
+    from airflow_provider_rivet._compat import executor_spreading_hosts
+
+    monkeypatch.setattr(conf, "get", lambda section, key, *a, **kw: {("core", "executor"): "CeleryExecutor"}[(section, key)])
+    assert executor_spreading_hosts() == "CeleryExecutor"
 
 
 def test_sqlite_state_under_an_executor_of_several_hosts_is_refused_unless_one_host_is_declared(
@@ -1435,7 +1445,12 @@ def test_sqlite_state_under_an_executor_of_several_hosts_is_refused_unless_one_h
     rig.scenario(run={"summary": {"per_export": [entry("orders", rows=7, files=1)]}})
     exc, _ = rig.run(rig.operator(RivetRunOperator, export="orders"))
     assert isinstance(exc, AirflowFailException) and "RIVET_AIRFLOW_STATE_SQLITE_MULTI_HOST" in str(exc)
-    assert "CeleryExecutor" in rig.events("rivet.refused")[0]["text"] and not rig.calls(), "rivet was not started"
+    refused = rig.events("rivet.refused")[0]
+    assert refused["code"] == "RIVET_AIRFLOW_STATE_SQLITE_MULTI_HOST" and not rig.calls(), "rivet was not started"
+    assert (
+        "the CeleryExecutor may run this DAG's next task on another worker, whose empty state would re-read every "
+        "table and write it again; set RIVET_STATE_URL to a PostgreSQL state" in refused["text"]
+    )
     payload, _ = rig.run(rig.operator(RivetRunOperator, export="orders", single_host=True))
     assert payload["decision"] == "success"
     pg = {"RIVET_PG_URL": SECRET, "RIVET_STATE_URL": "postgresql://state:pw@state-db/rivet_state"}
