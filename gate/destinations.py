@@ -42,6 +42,9 @@ DELETED_BY_BATCH = {"initial": {}, "delta": {"gate_orders": 5}, "idle": {"gate_o
 #: a persistent 404 read as transient is retried for minutes (rivet #606, Azurite's `keep-alive: timeout=5`).
 MISSING_BUCKET_CODE = "RIVET_DEST_CONTAINER_NOT_FOUND"
 MISSING_BUCKET_SECONDS = 120
+#: rivet declares the code an `environment` error: exit "2 if transient, else 1" (src/error.rs); a missing bucket is not
+#: transient, so 1 (2 would be retried by Airflow).
+MISSING_BUCKET_EXIT = 1
 SERVICES = """\
   gate-minio:
     # Chainguard's build: `minio/minio` (Docker Hub) and `quay.io/minio/minio` answer "unauthorized" since 2026-09.
@@ -143,7 +146,7 @@ def table_parts(files: Sequence[str], root: str, table: str) -> dict[str, list[s
 
 
 def missing_bucket(states: Mapping[str, Mapping[str, Any]], payloads: Mapping[str, Any], seconds: float) -> list[str]:
-    """A run into a bucket that does not exist stops on rivet's coded refusal (exit 5), at once, and is not retried.
+    """A run into a bucket that does not exist stops on rivet's coded error (not transient), at once, not retried.
 
     `states`: the run's rivet task instances by task id; `payloads`: their XCom return values (None when absent)."""
     failed = {t: i for t, i in states.items() if i.get("state") == "failed"}
@@ -160,10 +163,11 @@ def missing_bucket(states: Mapping[str, Mapping[str, Any]], payloads: Mapping[st
             problems.append(f"{task}: took {took} s, more than {seconds} s (a persistent 404 retried as transient?)")
         payload = payloads.get(task) or {}
         error = payload.get("error") or {}
-        if payload.get("decision") != "fail" or error.get("code") != MISSING_BUCKET_CODE or payload.get("exit_status") != 5:
+        wrong = payload.get("decision") != "fail" or error.get("code") != MISSING_BUCKET_CODE
+        if wrong or payload.get("exit_status") != MISSING_BUCKET_EXIT:
             problems.append(
                 f"{task}: decision {payload.get('decision')!r}, code {error.get('code')!r}, exit {payload.get('exit_status')!r}; "
-                f"expected 'fail', {MISSING_BUCKET_CODE!r}, 5"
+                f"expected 'fail', {MISSING_BUCKET_CODE!r}, {MISSING_BUCKET_EXIT}"
             )
     other = sorted(t for t, i in states.items() if i.get("state") not in ("failed", "upstream_failed", "skipped"))
     if other:
@@ -462,7 +466,7 @@ class S3Leg:
         problems = missing_bucket(tasks, payloads, MISSING_BUCKET_SECONDS)
         if state != "failed":
             problems.insert(0, f"run {state}, expected failed")
-        v.grade("s3/missing-bucket/coded-refusal", problems, ok=f"{MISSING_BUCKET_CODE}, exit 5, one try")
+        v.grade("s3/missing-bucket/coded-final-stop", problems, ok=f"{MISSING_BUCKET_CODE}, exit {MISSING_BUCKET_EXIT}, one try")
 
 
 def legs(names: Sequence[str]) -> list[S3Leg]:

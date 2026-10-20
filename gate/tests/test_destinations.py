@@ -354,7 +354,7 @@ def test_the_clickhouse_oracle_fails_each_mutant(monkeypatch, db: str, change, c
 
 def stopped(**over) -> tuple[dict, dict]:
     inst = {"state": "failed", "try_number": 1, "start_date": "2026-10-20T12:00:00Z", "end_date": "2026-10-20T12:00:04Z"}
-    payload = {"decision": "fail", "error": {"code": MISSING_BUCKET_CODE}, "exit_status": 5}
+    payload = {"decision": "fail", "error": {"code": MISSING_BUCKET_CODE}, "exit_status": 1}
     inst.update(over.get("inst", {}))
     payload.update(over.get("payload", {}))
     states = {"apply.gate_customers": inst, "apply.gate_orders": {"state": "upstream_failed"}}
@@ -372,12 +372,13 @@ def test_a_coded_refusal_at_once_and_never_retried_passes() -> None:
         {"inst": {"state": "success"}},
         {"inst": {"try_number": 2}},
         {"inst": {"end_date": "2026-10-20T12:09:21Z"}},
-        {"payload": {"error": {"code": None}, "exit_status": 1}},
+        {"payload": {"error": {"code": None}}},
         {"payload": {"error": {"code": "RIVET_RUN_UNITS_FAILED"}}},
         {"payload": {"exit_status": 2, "decision": "retry"}},
+        {"payload": {"exit_status": 2}},
         {"states": {"apply.gate_orders": {"state": "success"}}},
     ],
-    ids=["no-stop", "retried", "nine-minutes", "uncoded", "other-code", "transient", "a-sibling-ran"],
+    ids=["no-stop", "retried", "nine-minutes", "uncoded", "other-code", "transient", "exit-transient", "a-sibling-ran"],
 )
 def test_the_missing_bucket_oracle_fails_each_mutant(over: dict) -> None:
     assert missing_bucket(*stopped(**over), 120)

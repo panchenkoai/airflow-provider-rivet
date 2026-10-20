@@ -157,7 +157,8 @@ replayed, exact operation counts, XCom rows, the stored cursor read by psql); ea
 over HTTP as JSON and compared value by value with `gate-source-s3` (warehouse.py's canonical forms: batch with
 exactly the keys the cycle deleted left over, CDC without the rows flagged `__is_deleted`). A third config names a
 bucket that is never made: its DAG (`gate_s3_missing`) runs once after the cycles and must stop on
-`RIVET_DEST_CONTAINER_NOT_FOUND`, exit 5, within 120 s, on Airflow's first try (`s3/missing-bucket/coded-refusal`).
+`RIVET_DEST_CONTAINER_NOT_FOUND` within 120 s with exit 1 (rivet declares the code an `environment` error: 2 only
+when transient), on Airflow's first try (`s3/missing-bucket/coded-final-stop`).
 Everything lives in the stack and goes with its `down -v`.
 
 There is no Azure leg: rivet 0.32's `init` has no Azure destination flag (only `--gcs-bucket` and `--s3-bucket`), and

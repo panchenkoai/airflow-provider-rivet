@@ -15,7 +15,7 @@ source:
 exports:
   - name: gate_customers
     table: gate_customers
-    # auto: ~0 rows below the 100K threshold, but pageable because chunk column 'id' is available.
+    # auto: ~1K rows below the 100K threshold, but pageable because chunk column 'id' is available.
     # NOTE: chunked re-reads the whole table each run — for scheduled re-runs, `mode: incremental`
     # on 'updated_at' pulls only changed rows
     mode: chunked
@@ -41,7 +41,7 @@ exports:
       region: us-east-1
   - name: gate_orders
     table: gate_orders
-    # auto: ~0 rows below the 100K threshold, but pageable because chunk column 'id' is available.
+    # auto: ~5K rows below the 100K threshold, but pageable because chunk column 'id' is available.
     # NOTE: chunked re-reads the whole table each run — for scheduled re-runs, `mode: incremental`
     # on 'updated_at' pulls only changed rows
     mode: chunked
@@ -98,7 +98,7 @@ exports:
 load:
   target: clickhouse
   url: http://gate-clickhouse:8123
-  database: gate
+  database: gate_s3_cdc
   user: loader
   password_env: CLICKHOUSE_PASSWORD
   pk: auto  # the source primary key `rivet run` recorded
