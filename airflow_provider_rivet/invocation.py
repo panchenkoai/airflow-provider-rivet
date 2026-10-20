@@ -425,7 +425,8 @@ class _Session:
         for unit in units:
             record = unit.to_xcom()
             record.update(record.pop("error") or {})
-            self.emit({"event": "rivet.unit", "skip_reason": unit.skip_reason, **record})
+            extra = {"skip_reason": unit.skip_reason, "target": unit.target, "target_from": unit.target_from}
+            self.emit({"event": "rivet.unit", **extra, **record})
         self.emit(
             {
                 "event": "rivet.result",
@@ -1000,6 +1001,32 @@ def _plan(s: _Session) -> Outcome:
     return s.outcome(step, [UnitResult(None, status="failed" if error else "success", error=error)], error)
 
 
+# The `load:` keys that hold where a warehouse's tables are created, outermost first (rivet's src/config/load.rs).
+TARGET_CONTAINER = {"bigquery": ("project", "dataset"), "snowflake": ("database", "schema"), "clickhouse": ("database",)}
+
+
+def config_target(config: Mapping[str, Any], table: str | None) -> str | None:
+    """`project.dataset.table` as the config's `load:` block names it; None when it names no warehouse or no table is
+    known. A part the block leaves to the warehouse's default (BigQuery's project) is left out."""
+    load = config.get("load")
+    if not table or not isinstance(load, Mapping):
+        return None
+    keys = TARGET_CONTAINER.get(_yaml.text_of(load.get("target")))
+    if keys is None:
+        return None
+    return ".".join([*(str(_yaml.text_of(load[k])) for k in keys if load.get(k) not in (None, "")), table])
+
+
+def _with_target(s: _Session, unit: UnitResult, named: Any) -> UnitResult:
+    """The unit with the table it wrote: rivet's own name when its result has one, else the config's."""
+    if isinstance(named, str) and named:
+        unit.target, unit.target_from = named, "rivet"
+    else:
+        unit.target = config_target(s.pf.config, unit.table)
+        unit.target_from = "config" if unit.target else None
+    return unit
+
+
 def _load(s: _Session) -> Outcome:
     """`rivet load` / `rivet compact` for one export and, where the binary can, one table."""
     cmd, export, table = s.req.command, s.req.export, s.req.table
@@ -1028,7 +1055,7 @@ def _load(s: _Session) -> Outcome:
     rows = _entries(s, doc, "per_table")
     if not rows:
         status = "failed" if error else DONE_WORD[cmd]
-        return s.outcome(step, [UnitResult(export, table, status=status, error=error)], error)
+        return s.outcome(step, [_with_target(s, UnitResult(export, table, status=status, error=error), None)], error)
     units = []
     for row in rows:
         if table and row.get("table") != table:
@@ -1049,6 +1076,7 @@ def _load(s: _Session) -> Outcome:
                 skip_reason=s.malformed(row.get("skip_reason"), str),
             )
         )
+        _with_target(s, units[-1], row.get("target"))
     if len([u for u in units if u.status == "failed"]) <= 1:
         s.degraded.discard("per_unit_error")
     return s.outcome(step, units, error)

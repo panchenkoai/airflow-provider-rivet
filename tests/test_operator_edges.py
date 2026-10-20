@@ -17,7 +17,19 @@ from airflow_provider_rivet.invocation import crashed_retry_allowed
 from airflow_provider_rivet.operators import RivetApplyOperator, RivetLoadOperator, RivetRunOperator
 
 RESULT_KEYS = {"event", "command", "decision", "degraded", "exit_status", "signal", "stderr_path"}
-UNIT_KEYS = {"event", "skip_reason", "export", "table", "status", "run_id", "rows", "files", "stop_reason"}
+UNIT_KEYS = {
+    "event",
+    "skip_reason",
+    "target",
+    "target_from",
+    "export",
+    "table",
+    "status",
+    "run_id",
+    "rows",
+    "files",
+    "stop_reason",
+}
 
 
 def entry(status: str = "success", **more: object) -> dict:

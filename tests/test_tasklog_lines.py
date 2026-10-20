@@ -226,3 +226,33 @@ def test_notes_sqlite_an_unknown_degradation_warnings_max_events_and_a_ledger_pr
         (INFO, "  note     stopped at max_events (a, b): a backlog remains; the next run goes on from here"),
         (WARNING, "  note     the ledger is unwritable"),
     ]
+
+
+@pytest.mark.parametrize(
+    ("load", "table", "expected"),
+    [
+        ({"target": "bigquery", "project": "p", "dataset": "d"}, "t", "p.d.t"),
+        ({"target": "bigquery", "dataset": "d"}, "t", "d.t"),  # the project left to the credentials' default
+        ({"target": "snowflake", "database": "DB", "schema": "S"}, "T", "DB.S.T"),
+        ({"target": "clickhouse", "database": "db"}, "t", "db.t"),
+        ({"target": "duckdb"}, "t", None),
+        ({"target": "bigquery", "dataset": "d"}, None, None),
+        ("bigquery", "t", None),
+    ],
+)
+def test_the_config_names_the_warehouse_table(load: Any, table: str | None, expected: str | None) -> None:
+    from airflow_provider_rivet.invocation import config_target
+
+    assert config_target({"load": load}, table) == expected
+    assert config_target({}, "t") is None
+
+
+def test_several_units_each_name_their_table() -> None:
+    log, _ = make("load", "orders")
+    for table, target, source in (("a", "p.d.a", "rivet"), ("b", "p.d.b", "config")):
+        log.record({"event": "rivet.unit", "export": "orders", "table": table, "target": target, "target_from": source})
+    units = [{"export": "orders", "table": t, "status": "loaded", "rows": 1} for t in "ab"]
+    lines = render(log, {"decision": "success", "units": units})
+    assert lines[0][1].startswith("rivet load orders → OK: 2 tables")
+    assert (INFO, "  table    orders.a → p.d.a: loaded, 1 row") in lines
+    assert (INFO, "  table    orders.b → p.d.b (from config): loaded, 1 row") in lines

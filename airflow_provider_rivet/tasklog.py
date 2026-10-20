@@ -59,6 +59,16 @@ def _counts(units: list[dict[str, Any]]) -> list[str]:
     return parts
 
 
+def _target(record: dict[str, Any], command: str) -> str | None:
+    """`p.d.orders`, or `p.d.orders__changes into p.d.orders (from config)` for a compact the config names."""
+    target = record.get("target")
+    if not isinstance(target, str):
+        return None
+    if record.get("target_from") != "config":
+        return target
+    return f"{target}__changes into {target} (from config)" if command == "compact" else f"{target} (from config)"
+
+
 def _unit_name(unit: dict[str, Any]) -> str:
     return ".".join(str(part) for part in (unit.get("export"), unit.get("table")) if part) or "(config)"
 
@@ -103,6 +113,9 @@ class TaskLog:
         seconds = clock() - self.started
         subject = " ".join(p for p in (self.command.replace("cdc_", ""), self.export, self.table and f"table {self.table}") if p)
         head = f"rivet {subject} →"
+        targets = [_target(e, self.command) for e in self.events if e.get("event") == "rivet.unit"]
+        if len(targets) == 1 and targets[0]:
+            head += f" {targets[0]}:"
         tries = f"try {try_number} of {max_tries + 1}"
         will_retry = try_number <= max_tries
         retry_text = f"Airflow retries it ({tries})" if will_retry else f"no try left ({tries})"
@@ -225,6 +238,9 @@ class TaskLog:
     def _unit_lines(self, units: list[dict[str, Any]]) -> list[tuple[int, str]]:
         """One line per unit of a task with several, and the failed unit of a failed task."""
         lines = []
+        targets = {
+            (e.get("export"), e.get("table")): _target(e, self.command) for e in self.events if e.get("event") == "rivet.unit"
+        }
         for unit in units:
             error = unit.get("error") or {}
             if unit.get("status") == "failed":
@@ -233,7 +249,9 @@ class TaskLog:
             else:
                 text = ", ".join([str(unit.get("status")), *_counts([unit])])
             run = f" (run {unit['run_id']})" if isinstance(unit.get("run_id"), str) else ""
-            lines.append((logging.INFO, f"  {UNIT_WORD.get(self.command, 'export'):<8} {_unit_name(unit)}: {text}{run}"))
+            target = targets.get((unit.get("export"), unit.get("table")))
+            name = f"{_unit_name(unit)}{f' → {target}' if target else ''}"
+            lines.append((logging.INFO, f"  {UNIT_WORD.get(self.command, 'export'):<8} {name}: {text}{run}"))
         return lines
 
     def _notes(self, payload: dict[str, Any]) -> list[tuple[int, str]]:

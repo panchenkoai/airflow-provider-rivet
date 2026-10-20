@@ -16,7 +16,7 @@ from typing import Any
 
 import pytest
 from airflow.exceptions import AirflowException, AirflowFailException, AirflowSkipException
-from conftest import NEW_FLAGS, SECRET, FakeTI, Rig, fixture
+from conftest import CONFIG, NEW_FLAGS, SECRET, FakeTI, Rig, fixture
 
 from airflow_provider_rivet import invocation
 from airflow_provider_rivet.capabilities import DEGRADATIONS
@@ -474,3 +474,31 @@ def test_the_readable_lines_hold_no_secret_and_no_rivet_text(rig: Rig, log: Reco
     rig.run(rig.operator(RivetRunOperator, export="orders"))
     blob = "\n".join(text for _, text in log.lines)
     assert SECRET not in blob and "4111-1111" not in blob and not re.search(r"connecting with", blob)
+
+
+LOAD_BLOCK = "load:\n  target: bigquery\n  project: rivet-data-tool\n  dataset: demo_cdc\n"
+
+
+def test_golden_load_names_the_warehouse_table_rivet_wrote(rig: Rig, log: Recorder) -> None:
+    """Owner, 2026-10-20: the headline names the table, fully qualified, for debugging; rivet's own name wins."""
+    rig.config.write_text(CONFIG + LOAD_BLOCK)
+    row = {"export": "orders", "table": "t", "status": "loaded", "rows": 50, "target": "rivet-data-tool.demo_cdc_1432.t"}
+    rig.scenario(flags=NEW_FLAGS, load={"summary": {"run_id": "l1", "per_table": [row]}})
+    rig.run(rig.operator(RivetLoadOperator, export="orders", table="t"))
+    assert log.shown()[0] == "INFO rivet load orders table t → rivet-data-tool.demo_cdc_1432.t: OK: 50 rows in 3.0 s (run l1)"
+    unit = next(json.loads(t) for lvl, t in log.lines if lvl == "DEBUG" and '"rivet.unit"' in t)
+    assert (unit["target"], unit["target_from"]) == ("rivet-data-tool.demo_cdc_1432.t", "rivet")
+
+
+def test_golden_compact_names_the_buffer_and_base_the_config_names(rig: Rig, log: Recorder) -> None:
+    """A binary whose result has no `target`: the config's `load:` names it, marked as such."""
+    rig.config.write_text(CONFIG + LOAD_BLOCK)
+    rig.scenario(
+        flags=NEW_FLAGS,
+        compact={"summary": {"run_id": "c1", "per_table": [{"export": "orders", "table": "t", "status": "compacted"}]}},
+    )
+    rig.run(rig.operator(RivetCompactOperator, export="orders", table="t"))
+    assert log.shown()[0] == (
+        "INFO rivet compact orders table t → rivet-data-tool.demo_cdc.t__changes into rivet-data-tool.demo_cdc.t "
+        "(from config): OK in 3.0 s (run c1)"
+    )
