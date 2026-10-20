@@ -22,7 +22,7 @@ import yaml
 from . import oracle
 from .scenario import CHANGED_OPS, CHANGES, NO_OPS, SEED, Verdicts, grade_runs, wait_file, wait_runs
 from .sources import read_config
-from .stand import MULTIHOST_STATE, Stand, worker_service
+from .stand import MULTIHOST_STATE, Stand, worker_hostname, worker_service
 
 TABLES = {
     "gate_customers": ["id", "name", "tier", "updated_at"],
@@ -163,11 +163,14 @@ class MultiHost:
                 self.stand.psql("gate-source", "rivet", changes)
             self.route(routes)
             self.marker().unlink(missing_ok=True)
-            for dag in PIPELINES:
+            # SQLite state on two hosts is measured over the first three cycles; in `retry` its extract would race the
+            # queue move the kill makes.
+            dags = [d for d in PIPELINES if not (name == "retry" and d == "gate_mh_sqlite")]
+            for dag in dags:
                 self.stand.trigger(dag, run_id)
             if name == "retry":
                 self.paused_then_killed(f"multihost/{name}", "a", "b")
-            states = wait_runs(self.stand, list(PIPELINES), run_id)
+            states = wait_runs(self.stand, dags, run_id)
             after = self.everything()
             new = after - files
             history.append(sorted(f for f in new if "/cdc/output/cdc/" in f))
@@ -196,19 +199,22 @@ class MultiHost:
     ) -> None:
         v, cell = self.v, f"multihost/{name}"
         apply_tasks = [f"apply.{e}" for e in self.shape["batch"]["exports"]]
-        tasks = {"gate_mh_batch": apply_tasks, "gate_mh_sqlite": apply_tasks, "gate_mh_cdc": ["run"]}
+        tasks = {d: (["run"] if d == "gate_mh_cdc" else apply_tasks) for d in states}
         grade_runs(self.stand, v, cell, run_id, states, tasks)
         routes = dict(next(r for c, _, _, r in CYCLES if c == name))
         for dag, wanted in tasks.items():
             expected = {t: [routes[QUEUE_OF[t.split(".", 1)[1]]] if t != "run" else routes["gate_cdc"]] for t in wanted}
             if name == "retry" and dag == "gate_mh_batch":
-                expected[f"apply.{PAUSED}"] = ["a", "b"]
+                expected[f"apply.{PAUSED}"] = ["a", "b"]  # killed on a, retried on b
+            expected = {t: [worker_hostname(h) for h in hosts] for t, hosts in expected.items()}
             seen = v.guard(f"{cell}/{dag}/hosts", self.hostnames, dag, run_id, wanted)
             if seen is not None:
                 v.check(f"{cell}/{dag}/hosts", oracle.hosts_as_routed, seen, expected, dag, ok=str(seen))
         con = oracle.connect(self.stand.source_dsn)
         try:
             for pipeline, dag, db in (("batch", "gate_mh_batch", "rivet_state"), ("sqlite", "gate_mh_sqlite", None)):
+                if dag not in states:
+                    continue
                 self.grade_batch(con, f"{cell}/{pipeline}", dag, run_id, pipeline, db, new, marks, name)
             self.grade_cdc(con, cell, run_id, ops, new, history)
         finally:
