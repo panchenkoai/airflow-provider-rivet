@@ -298,3 +298,13 @@ def test_entries_that_are_not_a_list_are_dropped_and_recorded() -> None:
     s = SimpleNamespace(degraded=set())
     assert invocation._entries(s, {"per_export": 5}, "per_export") == []
     assert s.degraded == {"result_malformed"}
+
+
+def test_tightening_a_file_rivet_did_not_write_is_left_to_the_step_that_reads_it(tmp_path: Path) -> None:
+    """A missing artifact is not an error here: the step that reads it reports it."""
+    from airflow_provider_rivet.invocation import _tighten
+
+    _tighten(tmp_path / "absent.json")
+    (tmp_path / "plan.json").write_text("{}")
+    _tighten(tmp_path / "plan.json")
+    assert (tmp_path / "plan.json").stat().st_mode & 0o777 == 0o600
