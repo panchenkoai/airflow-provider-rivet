@@ -61,12 +61,23 @@ def test_d30_every_builder_parameter_is_named_in_its_doc_section() -> None:
     assert not missing, f"the builder sections of docs/dag-builders.md do not name {missing}"
 
 
-def test_d39_the_operator_parameter_list_names_every_init_parameter() -> None:
-    """D39: the README's "All of them take" list left out `connections`, `table` and `plan_file`."""
-    text = doc_section("## Operators")
-    listed = text[text.index("All of them take") : text.index("Templated:")]
-    missing = [p for p in keyword_parameters(RivetBaseOperator.__init__) if not named(listed, p)]
-    assert not missing, f"the parameter list of docs/operators.md does not name {missing}"
+def test_d39_the_operator_parameter_table_has_every_init_parameter_its_default_and_templating() -> None:
+    """D39: the README's "All of them take" list left out `connections`, `table` and `plan_file`. The table in
+    docs/operators.md has one row per parameter, with the signature's default and the class's template fields."""
+    rows = {}
+    for line in doc_section("## Operators").splitlines():
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        if len(cells) == 4 and re.fullmatch(r"`\w+`", cells[0]):
+            rows[cells[0].strip("`")] = cells
+    signature = inspect.signature(RivetBaseOperator.__init__).parameters
+    for name in keyword_parameters(RivetBaseOperator.__init__):
+        assert name in rows, f"docs/operators.md has no row for `{name}`"
+        default = signature[name].default
+        expected = "required" if default is inspect.Parameter.empty else f"`{default!r}`".replace("'", '"')
+        assert rows[name][1] == expected, f"`{name}`: the table says {rows[name][1]}, the signature {expected}"
+        templated = "yes" if name in RivetBaseOperator.template_fields else "no"
+        assert rows[name][2] == templated, f"`{name}`: templated is {templated}"
+    assert set(rows) == set(keyword_parameters(RivetBaseOperator.__init__)), "a row names no parameter"
 
 
 def test_d39_the_changelog_names_connections_and_every_connection_kind() -> None:
