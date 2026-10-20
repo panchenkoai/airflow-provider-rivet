@@ -43,7 +43,7 @@ Every task returns (and, on failure, pushes before raising) one XCom value under
                "rows": 2500, "files": 1, "stop_reason": null, "error": null } ],
   "error": null, "degraded": ["lock_wait", "no_notify", "state_url_sqlite"],
   "exit_status": 0, "signal": null, "stderr_path": "/var/lib/rivet/postgres/logs/...",
-  "skip_reason": null, "state_marker": "1d86...", "rivet_version": "0.32.0" }
+  "skip_reason": null, "state_marker": "1d86...", "rivet_version": "0.32.0 (8afde974)" }
 ```
 
 A unit has exactly the shape of `tests/fixtures/scheduler/xcom_unit*.json`; a package test
@@ -58,7 +58,6 @@ step, and indented `note` lines. A successful apply on rivet 0.32.0 with SQLite 
 rivet apply users → OK: 30 rows, 1 file in 4.1 s (run users_20261016T092509.120_4242)
   plan     sealed, strategy incremental in 0.8 s
   apply    done in 2.9 s
-  note     this binary lacks: lock_wait, no_notify (the operator works around them)
   note     SQLite state is single-host — see https://github.com/panchenkoai/airflow-provider-rivet/blob/main/docs/state.md#local-worker-setup-guide
 ```
 
@@ -70,10 +69,14 @@ rivet apply users → REFUSED [RIVET_PLAN_ARTIFACT_STALE], final
   apply    exit 5 in 0.6 s
   export   users: failed [RIVET_PLAN_ARTIFACT_STALE] refusal
   stderr   <state_dir>/logs/<dag_id>/<task_id>-<hash>/<run_id>__try2.apply.stderr.log
-  note     this binary lacks: lock_wait, no_notify (the operator works around them)
   note     SQLite state is single-host — see https://github.com/panchenkoai/airflow-provider-rivet/blob/main/docs/state.md#local-worker-setup-guide
   note     rivet's failure line has no class or action: the class is read from its exit class
 ```
+
+A task of one step that took the task's time (a load, a compact, a run) has no step line: the
+headline says it. The step line stays when the step failed or the task spent a second or more
+outside it (a lock wait). Flags the binary lacks are noted at DEBUG only. `rivet_version` is the
+whole `rivet --version` line after `rivet`, so a branch build is told apart from the release.
 
 - The headline's outcome is `OK`, `SKIPPED` (nothing to do: rivet's `skip_reason`, or an earlier
   try already applied the plan), `REFUSED` (class `refusal`, or a preflight refusal before rivet

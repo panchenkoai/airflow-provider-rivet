@@ -35,6 +35,8 @@ NOTES = {
     "exit_zero_failed_unit": "rivet exited 0 while its summary reports a failed unit",
 }
 LACKS = sorted(key for key, d in DEGRADATIONS.items() if d.detect == "flag")
+# A single step's line is shown only when the task took this much longer than the step (a lock wait, a slow preflight).
+STEP_SLACK = 1.0
 UNIT_WORD = {"load": "table", "compact": "table"}
 STOP_WORD = {"refusal": "REFUSED", "crashed": "CRASHED"}
 
@@ -129,7 +131,7 @@ class TaskLog:
             lines.append((logging.INFO, self._success(head, units, payload, seconds)))
         else:
             lines.append(self._failure(head, error, payload, units, retry_text, retry_level, stop_requested))
-        lines += self._step_lines()
+        lines += self._step_lines(seconds)
         if len(units) > 1 or (payload.get("decision") != "success" and units and units[0].get("status") == "failed"):
             lines += self._unit_lines(units)
         if payload.get("decision") not in (None, "success") and payload.get("stderr_path"):
@@ -188,8 +190,9 @@ class TaskLog:
         run = f" (run {runs[0]})" if len(runs) == 1 else ""
         return (retry_level if retried else logging.ERROR), f"{head} {', '.join(parts)}{run}"
 
-    def _step_lines(self) -> list[tuple[int, str]]:
-        """One line per rivet process the task started, and one for a sealed plan an earlier try made."""
+    def _step_lines(self, seconds: float) -> list[tuple[int, str]]:
+        """One line per rivet process the task started, and one for a sealed plan an earlier try made; none for a task
+        whose one step just ended `done` in about the headline's time, which the headline already says."""
         lines = []
         names = [s["step"] for s in self.steps]
         replayed = self.command == "apply" and "plan" not in names and "apply" in names
@@ -214,6 +217,9 @@ class TaskLog:
             else:
                 text = f"done{took}"
             lines.append((logging.INFO, f"  {name:<8} {text}"))
+        quiet = len(lines) == 1 and len(self.steps) == 1 and lines[0][1].split()[1] == "done"
+        if quiet and seconds - (self.steps[0]["end"] - self.steps[0]["start"]) < STEP_SLACK:
+            return []
         return lines
 
     def _unit_lines(self, units: list[dict[str, Any]]) -> list[tuple[int, str]]:
@@ -237,7 +243,8 @@ class TaskLog:
         notes: list[tuple[int, str]] = []
         lacks = [d for d in degraded if d in LACKS]
         if lacks:
-            notes.append((logging.INFO, f"this binary lacks: {', '.join(lacks)} (the operator works around them)"))
+            # Flags no released rivet may have yet: nothing for the operator to do, so not on every task's INFO (#62).
+            notes.append((logging.DEBUG, f"this binary lacks: {', '.join(lacks)} (the operator works around them)"))
         if "state_url_sqlite" in degraded or any(w.get("warning") == "sqlite_single_host" for w in warnings):
             notes.append((logging.INFO, f"SQLite state is single-host — see {SETUP_GUIDE}"))
         for key in degraded:
