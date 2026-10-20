@@ -22,6 +22,14 @@ PACKAGE_FILES = ("airflow_provider_rivet", "pyproject.toml", "README.md", "LICEN
 SOURCE_DSN = "host=127.0.0.1 port={port} dbname=rivet user=rivet password={password}"
 #: Where a mounted credential sits in the containers: the path Google's default chain (and rivet's) reads under HOME.
 ADC_IN_CONTAINER = "/home/airflow/.config/gcloud/application_default_credentials.json"
+#: The multi-host leg (`--workers 2`): each Celery worker is a host of its own, with a disk of its own mounted at this
+#: one absolute path (two hosts share no disk); `HOST_DIRS` are the state directories on it, one per pipeline.
+HOST_DISK = "/opt/rivet-host"
+HOST_DIRS = ("batch", "cdc", "sqlite", "local", "chain")
+#: The Celery app every Airflow worker runs (the provider's; the official healthcheck names the same).
+CELERY_APP = "airflow.providers.celery.executors.celery_executor.app"
+#: The queues of the multi-host leg; each task of its DAGs names one, and the gate moves a queue between the workers.
+GATE_QUEUES = ("gate_a", "gate_b", "gate_cdc")
 
 
 @dataclass(frozen=True)
@@ -117,6 +125,7 @@ x-rivet: &rivet
     AIRFLOW__API_AUTH__JWT_SECRET: '{jwt}'
     GATE_WAREHOUSES: '{warehouses}'
     GATE_SOURCES: '{sources}'
+    GATE_WORKERS: '{workers}'
     GATE_DESTINATIONS: '{destinations}'
 {backend}  env_file: [gate-connections.env]
   volumes:
@@ -165,6 +174,22 @@ def state_conn_id(engine: str, kind: str) -> str:
     return f"rivet_gate_state_{engine}_{kind}"
 
 
+#: The multi-host leg's state databases beside `rivet_state` (its batch pipeline's), each behind a Connection
+#: `rivet_gate_state_mh_<name>`: a config's exports share their names with another's (init names the CDC config's
+#: baseline exports after their tables, as the batch ones).
+MULTIHOST_STATE = ("cdc", "local", "chain")
+
+
+def worker_service(name: str) -> str:
+    """The compose service of one host of the multi-host leg (`a` is the official `airflow-worker`)."""
+    return "airflow-worker" if name == "a" else f"airflow-worker-{name}"
+
+
+def worker_hostname(name: str) -> str:
+    """The container hostname of a host, which Celery names `celery@<it>` and Airflow records on each task instance."""
+    return f"gate-host-{name}"
+
+
 class Stand:
     """A compose project under `work/<version>`: Airflow from the official compose plus the gate overlay."""
 
@@ -178,9 +203,12 @@ class Stand:
         secrets_backend: dict[str, str] | None = None,
         adc: Path | None = None,
         sources: tuple[Any, ...] = (),
+        workers: int = 1,
         destinations: tuple[Any, ...] = (),
     ) -> None:
         self.flavor = FLAVORS[version]
+        #: 1: one Celery worker on the shared volume; 2: the multi-host leg, two workers with a disk each.
+        self.workers = workers
         # The run tag keeps two gate runs of one Airflow version apart: each `down -v` and image build is its own.
         self.tag = tag or secrets.token_hex(4)
         self.rivet_bin = rivet_bin
@@ -240,6 +268,22 @@ class Stand:
                 for e in self.sources
                 for kind in e.kinds
             },
+            **(
+                {
+                    f"rivet_gate_state_mh_{kind}": {
+                        "conn_type": "postgres",
+                        "host": "gate-state",
+                        "port": 5432,
+                        "login": "rivet",
+                        "password": self.secrets.state,
+                        "schema": f"rivet_state_mh_{kind}",
+                        "extra": {"rivet_params": "sslmode=require"},
+                    }
+                    for kind in MULTIHOST_STATE
+                }
+                if self.workers > 1
+                else {}
+            ),
             **{conn_id: conn for d in self.destinations for conn_id, conn in d.connections(self.secrets).items()},
             **{
                 state_conn_id(d.name, kind): {
@@ -256,6 +300,15 @@ class Stand:
             },
             **self.extra_connections,
         }
+
+    @property
+    def hosts(self) -> tuple[str, ...]:
+        """The hosts of the stack: `a` alone, or `a` and `b` in the multi-host leg."""
+        return ("a", "b")[: self.workers]
+
+    def host_disk(self, name: str) -> Path:
+        """The directory on the docker host that is host `name`'s own disk (mounted at HOST_DISK in its worker only)."""
+        return self.dir / "hosts" / name
 
     def connection_variables(self) -> dict[str, str]:
         """The AIRFLOW_CONN_* variables of the stack: none when a secrets backend holds the Connections."""
@@ -320,6 +373,9 @@ class Stand:
             (self.dir / sub).mkdir(parents=True)
         shutil.copy2(HERE / "stand" / f"airflow-{self.flavor.version}.yaml", self.dir / "docker-compose.yaml")
         (self.dir / ".env").write_text("")
+        for host in self.hosts if self.workers > 1 else ():
+            for sub in HOST_DIRS:
+                (self.host_disk(host) / sub).mkdir(parents=True)
         shutil.copy2(HERE / "stand" / "dags" / "rivet_gate.py", self.dir / "dags" / "rivet_gate.py")
         services = "\n".join(
             f"  {s}:\n    <<: *rivet"
@@ -332,9 +388,25 @@ class Stand:
                 else ""
             )
             for s in self.flavor.services
+            if not (self.workers > 1 and s == "airflow-worker")
         )
+        if self.workers > 1:
+            services += "".join(self.worker_yaml(host) for host in self.hosts)
         write_private(self.dir / "docker-compose.gate.yaml", self.overlay(services))
         write_env_file(self.dir / "gate-connections.env", self.connection_variables())
+
+    def worker_yaml(self, host: str) -> str:
+        """One host of the multi-host leg: a Celery worker with its own hostname, its own disk at HOST_DISK, and the
+        queues it consumes at the start (the gate moves them with `route`)."""
+        queues = ",".join(["default", *(q for q in GATE_QUEUES if q == f"gate_{host}" or (q == "gate_cdc" and host == "a"))])
+        extends = (
+            "" if host == "a" else "\n    extends: { file: docker-compose.yaml, service: airflow-worker }"
+        )  # the official worker, once more
+        return (
+            f"\n  {worker_service(host)}:\n    <<: *rivet{extends}\n    hostname: {worker_hostname(host)}\n"
+            f"    command: celery worker -q {queues}\n    volumes:\n      - {self.rivet_dir}:/opt/rivet\n"
+            f"      - {self.host_disk(host)}:{HOST_DISK}\n"
+        )
 
     def overlay(self, services: str) -> str:
         """The gate's compose overlay: the image, this stack's own passwords and keys, where Connections come from."""
@@ -352,6 +424,7 @@ class Stand:
             backend=backend,
             adc=adc,
             result_backend=self.flavor.result_backend,
+            workers=self.workers,
             **vars(self.secrets),
         )
 
@@ -447,6 +520,46 @@ class Stand:
     def run_state(self, dag: str, run_id: str) -> str:
         """The DAG run's state."""
         return self._call("GET", f"/dags/{dag}/dagRuns/{run_id}")["state"]
+
+    def tries(self, dag: str, run_id: str, task: str) -> list[dict[str, Any]]:
+        """Every try of one task instance (hostname, state, try_number), oldest first."""
+        found = self._call("GET", f"/dags/{dag}/dagRuns/{run_id}/taskInstances/{task}/tries")["task_instances"]
+        return sorted(found, key=lambda t: t["try_number"])
+
+    def celery(self, *args: str) -> str:
+        """A Celery control or inspect command against the stack's broker, run in the first worker."""
+        # `--timeout`: a worker on a busy docker host answers after celery's default second
+        return self.compose(
+            "exec", "-T", "airflow-worker", "celery", "--app", CELERY_APP, *args, "--timeout", "20", timeout=180
+        ).stdout
+
+    def queues(self) -> dict[str, set[str]]:
+        """The queues each host's worker consumes now, by host (`celery inspect active_queues`)."""
+        found: dict[str, set[str]] = {}
+        for host in self.hosts:
+            text = self.celery("inspect", "active_queues", "-j", "-d", f"celery@{worker_hostname(host)}")
+            reply = json.loads(text[text.index("{") :])
+            found[host] = {q["name"] for qs in reply.values() for q in qs}
+        return found
+
+    def route(self, queue: str, host: str, timeout: float = 300) -> None:
+        """Make `host` the only worker that consumes `queue`; a task already running stays where it runs. Asked again
+        until the workers' answer shows it: a worker still starting, or busy, answers no control command."""
+        deadline = time.monotonic() + timeout
+        now: dict[str, set[str]] | str = {}
+        while time.monotonic() < deadline:
+            try:
+                now = self.queues()
+                if {h for h, qs in now.items() if queue in qs} == {host}:
+                    return
+                for other in self.hosts:
+                    verb = "add_consumer" if other == host else "cancel_consumer"
+                    if (queue in now.get(other, set())) != (other == host):
+                        self.celery("control", verb, queue, "-d", f"celery@{worker_hostname(other)}")
+            except (RuntimeError, ValueError, subprocess.TimeoutExpired) as exc:
+                now = str(exc)[-300:]
+            time.sleep(2)
+        raise TimeoutError(f"queue {queue} is consumed as {now}, not by {host} alone, after {timeout:.0f} s")
 
     def tasks(self, dag: str, run_id: str) -> dict[str, dict[str, Any]]:
         """Task instances of a run by task id: state, start, end."""

@@ -266,7 +266,10 @@ class RivetBaseOperator(BaseOperator):
         text = outcome.error.describe(failed[0] if len(failed) == 1 else self.export)
         if decision == "retry_crashed":
             ledger = None
-            if outcome.marker is not None and self.state_dir:
+            # The ledger is a file on this worker's disk: it counts every crash only while every try runs here, which
+            # SQLite state guarantees and PostgreSQL state does not (a retry on another host saw an empty ledger and
+            # granted the budget again). Elsewhere the budget is the first `crashed_retries` tries, as on a pod.
+            if outcome.marker is not None and self.state_dir and outcome.state_kind == "sqlite":
                 name = f"{path_name(run_id, task_part)}.json"
                 ledger = Path(self.state_dir) / "airflow" / path_name(ti.dag_id) / "crashed" / name
             allowed, problem = crashed_retry_allowed(ledger, ti.try_number, ti.max_tries, self.crashed_retries)

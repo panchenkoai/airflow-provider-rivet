@@ -1,4 +1,4 @@
-"""python -m gate --rivet-bin <linux rivet> [--airflow 2.10.5,3.3.2] [--sources mysql,mssql,mongodb,oracle] [--destinations s3] [--verdicts out.jsonl] [--keep] [--sabotage drop-delta-file|warehouse-value]
+"""python -m gate --rivet-bin <linux rivet> [--airflow 2.10.5,3.3.2] [--sources mysql,mssql,mongodb,oracle] [--destinations s3] [--workers 2] [--verdicts out.jsonl] [--keep] [--sabotage drop-delta-file|warehouse-value]
 
 With --warehouses: [--connections env|gsm] [--gcp-auth key|adc] choose where the stack's Connections live and how
 rivet authenticates to GCP; see docs/connections-and-secrets.md.
@@ -18,10 +18,20 @@ import time
 from pathlib import Path
 
 from . import conns as proofs
-from . import destinations, sources
+from . import destinations, multihost, sources
 from .scenario import TABLES, Verdicts, play
 from .stand import FLAVORS, Stand
-from .warehouse import TAG_SHAPE, WAREHOUSES, Cloud, Leg, connections, delete_connections, publish_connections, sweep
+from .warehouse import (
+    TAG_SHAPE,
+    WAREHOUSES,
+    Cloud,
+    Leg,
+    connections,
+    delete_connections,
+    gcp_connection,
+    publish_connections,
+    sweep,
+)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -43,6 +53,13 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         help=f"comma-separated destination legs ({','.join(destinations.DESTINATIONS)}): MinIO in the stack, the configs "
         "`rivet init --s3-bucket` writes, extract-only and loaded into the stack's ClickHouse",
+    )
+    ap.add_argument(
+        "--workers",
+        type=int,
+        choices=[1, 2],
+        default=1,
+        help="2: the multi-host leg (two Celery workers, a disk each, PostgreSQL state) instead of the base scenario",
     )
     ap.add_argument("--gcp-keyfile", type=Path, help="GCP credential JSON for the gate_gcp Connection (service account or ADC)")
     ap.add_argument("--gcs-bucket", default="rivet_data_test")
@@ -102,13 +119,15 @@ def main(argv: list[str] | None = None) -> int:
         ap.error(
             f"unknown destination(s) {sorted(set(dests) - set(destinations.DESTINATIONS))}; known: {list(destinations.DESTINATIONS)}"
         )
+    if args.workers > 1 and (warehouses or engines or args.destinations or args.sabotage):
+        ap.error("--workers 2 is a leg of its own: no --warehouses, --sources, --destinations or --sabotage beside it")
     tag = args.tag or time.strftime("%m%d%H%M") + secrets.token_hex(2)
     if not TAG_SHAPE.fullmatch(tag):
         ap.error(f"--tag {tag!r} is not 8 digits and 4 lower-case hex digits (the shape the cloud sweep recognises)")
     if not warehouses and (args.connections != "env" or args.gcp_auth != "key"):
         ap.error("--connections gsm and --gcp-auth adc are legs of the warehouse leg: pass --warehouses")
     cloud = None
-    if warehouses:
+    if warehouses or args.workers > 1:
         keyfile = args.gcp_keyfile or Path.home() / ".config/gcloud/application_default_credentials.json"
         cloud = Cloud(
             keyfile,
@@ -125,8 +144,8 @@ def main(argv: list[str] | None = None) -> int:
             gsm_reader=args.gsm_reader.format(project=args.bq_project),
         )
         print(
-            f"warehouse leg {list(warehouses)}, tag {tag}, connections {args.connections}, gcp auth {args.gcp_auth}; "
-            f"swept: {sweep(cloud) + sources.sweep(cloud)}",
+            f"{'warehouse leg ' + str(list(warehouses)) if warehouses else 'multi-host leg'}, tag {tag}, connections {args.connections}, gcp auth {args.gcp_auth}; "
+            f"swept: {(sweep(cloud) if warehouses else []) + sources.sweep(cloud)}",
             flush=True,
         )
     work = args.work or Path(tempfile.mkdtemp(prefix="rivet-airflow-gate-"))
@@ -145,26 +164,35 @@ def main(argv: list[str] | None = None) -> int:
             adc=cloud.keyfile.resolve() if cloud and (gsm or cloud.gcp_auth == "adc") else None,
             sources=sources.engines(engines),
             destinations=tuple(destinations.legs(dests)),
+            workers=args.workers,
         )
-        leg = Leg(cloud, version, TABLES, warehouses) if cloud else None
+        leg = Leg(cloud, version, TABLES, warehouses) if cloud and warehouses else None
+        hosts = multihost.MultiHost(stand, Verdicts(version), cloud) if cloud and args.workers > 1 else None
         src_legs = sources.legs(cloud, version, engines)
         dest_legs = list(stand.destinations)
-        verdicts = Verdicts(version)
+        verdicts = hosts.v if hosts else Verdicts(version)
         try:
-            if cloud:
+            if hosts:
+                stand.extra_connections = {"gate_gcp": gcp_connection(cloud)}
+            elif cloud:
                 stand.extra_connections = verdicts.guard("connections", connections, cloud, stand.secrets.clickhouse) or {}
             if gsm:
                 verdicts.guard("gsm-publish", publish_connections, cloud, version, stand.connections())
             if not verdicts.rows:
                 verdicts.guard("stand-up", stand.up)
             if not verdicts.rows:
-                verdicts.guard("scenario", play, stand, verdicts, args.sabotage, leg, src_legs, dest_legs)
-                verdicts.guard("proofs", proofs.prove, stand, verdicts, cloud)
+                if hosts:
+                    verdicts.guard("multihost", hosts.play)
+                else:
+                    verdicts.guard("scenario", play, stand, verdicts, args.sabotage, leg, src_legs, dest_legs)
+                verdicts.guard("proofs", proofs.prove, stand, verdicts, cloud if warehouses else None)
         finally:
             if not args.keep:
                 verdicts.guard("teardown", stand.down)
                 if leg:
                     verdicts.guard("cloud-cleanup", leg.cleanup)
+                if hosts:
+                    verdicts.guard("cloud-cleanup/multihost", hosts.cleanup)
                 for src in src_legs:
                     verdicts.guard(f"cloud-cleanup/{src.engine.name}", src.cleanup)
                 if gsm:

@@ -259,7 +259,9 @@ def run_preflight(
     elif kind == "sqlite" or is_cdc or state_dir:
         result.state_dir = check_state_dir(state_dir)
         result.marker = ensure_marker(result.state_dir)
-        others = sorted({m for m in upstream_markers if m and m != result.marker})
+        # Only SQLite state is read from the directory by the next task: on PostgreSQL state each host of several keeps
+        # its own directory (locks, plans, logs), and a task on another host than its upstream is the deployment.
+        others = sorted({m for m in upstream_markers if m and m != result.marker}) if kind == "sqlite" else []
         if others:
             raise PreflightRefusal(
                 "RIVET_AIRFLOW_STATE_DIR_DIFFERS",

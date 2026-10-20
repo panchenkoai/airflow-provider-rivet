@@ -160,3 +160,46 @@ if "s3" in os.environ.get("GATE_DESTINATIONS", "").split(",") and os.path.exists
                 operator_kwargs=kwargs,
                 tags=tags,
             )
+
+
+# The multi-host leg (gate/multihost.py, `--workers 2`): two Celery workers, each a host with its own disk at
+# /opt/rivet-host. The configs are the ones `rivet init` wrote, read as the shape the gate wrote beside them, with the
+# queue of each task; the gate moves the queues between the hosts, so tasks of one DAG run land on both.
+MULTIHOST_SHAPE = f"{ROOT}/configs/mh_shape.json"
+if os.environ.get("GATE_WORKERS", "1") != "1" and os.path.exists(MULTIHOST_SHAPE):
+    from datetime import timedelta
+
+    with open(MULTIHOST_SHAPE) as handle:
+        mh = json.load(handle)
+    # The retry waits long enough for the gate to move the killed task's queue to the other host.
+    retry_after = {"default_args": {"retry_delay": timedelta(seconds=90)}}
+    for name, p in mh["pipelines"].items():
+        if p["state_conn"] is None:  # SQLite in the state_dir
+            kwargs = {"env_from_connections": dict(SOURCE), "env": {"RIVET_STATE_URL": ""}}
+        else:
+            kwargs = {"env_from_connections": {**SOURCE, "RIVET_STATE_URL": p["state_conn"]}}
+        if p["gcs"]:
+            kwargs["connections"] = ["gate_gcp"]
+        common = {
+            "config": f"{ROOT}/configs/mh_{name}/rivet.yaml",
+            "state_dir": f"/opt/rivet-host/{name}",
+            "operator_kwargs": kwargs,
+            "tags": ["rivet", "gate", "multihost"],
+            **retry_after,
+        }
+        if p["kind"] == "cdc":
+            dag = build_cdc_dag(f"gate_mh_{name}", export=p["stream"]["name"], tables=p["stream"]["tables"], load=False, **common)
+        else:
+            exports = p["exports"][:1] if p["load"] else p["exports"]
+            dag = build_batch_dag(f"gate_mh_{name}", exports=exports, load=p["load"], **common)
+        for task in dag.tasks:
+            if task.task_id in p["queues"]:
+                task.queue = p["queues"][task.task_id]
+        if p["pause"]:
+            # One apply pauses after its first fetch, announced by a marker the gate polls: the window in which the
+            # gate kills it and sends its retry to the other host.
+            dag.get_task(f"apply.{mh['paused']}").env = {
+                "RIVET_TEST_PAUSE_AT": "pg_after_snapshot_open:15000",
+                "RIVET_TEST_PAUSE_MARKER": f"{ROOT}/markers/mh_{mh['paused']}",
+            }
+        globals()[f"gate_mh_{name}"] = dag

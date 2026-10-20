@@ -128,7 +128,7 @@ def test_init_and_the_dags_of_each_config_share_a_postgresql_state_of_its_own(tm
             dbs.add(conn["schema"])
     assert len(dbs) == 4, "a config's export names may repeat another's (SQL Server: CDC exports named after tables)"
     dag = (Path(sources.__file__).parent / "stand" / "dags" / "rivet_gate.py").read_text()
-    block = dag[dag.index("def leg_kwargs") :]
+    block = dag[dag.index("def leg_kwargs") : dag.index("# The multi-host leg")]
     assert '"RIVET_STATE_URL": f"rivet_gate_state_{engine}_{kind}"' in block and '"RIVET_STATE_URL": ""' not in block
     assert 'leg_kwargs(engine, "batch")' in block and 'leg_kwargs(engine, "cdc")' in block
 

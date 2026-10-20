@@ -148,3 +148,48 @@ def test_counts_cursor_and_overlap() -> None:
     assert oracle.inside([("2026-10-15T12:00:05Z", "2026-10-15T12:00:10Z")], outer, "o") == []
     assert oracle.inside([("2026-10-15T12:00:05Z", "2026-10-15T12:00:31Z")], outer, "o")
     assert oracle.inside([], outer, "o"), "nothing ran inside the window"
+
+
+# --- The multi-host leg: each version once across both hosts, no cursor moved back, every try where it was routed ----
+
+
+def test_duplicates_passes_once_and_catches_a_version_or_event_written_on_both_hosts(con, tmp_path: Path) -> None:
+    a = initial(con, tmp_path)
+    change(con)
+    b = write(con, tmp_path / "b.parquet", DELTA)
+    assert oracle.duplicates(con, [a, b], ["id", "updated_at"], "x") == [], "an update is a new version, not a repeat"
+    assert oracle.duplicates(con, [], ["id"], "x") == []
+    mutants = {
+        "the delta extracted again on the other host": [a, b, write(con, tmp_path / "again.parquet", DELTA)],
+        "the whole table re-read by a host with an empty state": [
+            a,
+            b,
+            write(con, tmp_path / "full.parquet", "SELECT * FROM src.public.orders WHERE id = 3"),
+        ],
+    }
+    for name, files in mutants.items():
+        assert oracle.duplicates(con, files, ["id", "updated_at"], "x"), name
+    assert oracle.duplicates(con, [a, b], ["id"], "a baseline"), "a key in two baselines"
+
+
+def test_not_regressed_allows_equal_and_forward_and_catches_a_cursor_moved_back() -> None:
+    assert oracle.not_regressed(None, "2026-10-15T12:00:00Z", "c") == []
+    assert oracle.not_regressed("2026-10-15T12:00:00Z", "2026-10-15T12:00:00+00:00", "c") == []
+    assert oracle.not_regressed("2026-10-15T12:00:00Z", "2026-10-15T12:00:01Z", "c") == []
+    assert oracle.not_regressed("2026-10-15T12:00:01Z", "2026-10-15T12:00:00.999999Z", "c")
+    assert oracle.not_regressed("2026-10-15T12:00:01Z", None, "c"), "a stored cursor that disappeared"
+
+
+def test_hosts_as_routed_reads_each_try_and_catches_a_task_on_the_wrong_host() -> None:
+    expected = {"apply.a": ["a"], "apply.b": ["a", "b"]}
+    seen = {"apply.a": ["gate-host-a"], "apply.b": ["gate-host-a.local", "gate-host-b"]}
+    assert oracle.hosts_as_routed(seen, {k: [f"gate-host-{h}" for h in v] for k, v in expected.items()}, "r") == []
+    mutants = {
+        "the retry stayed on its host": {"apply.a": ["gate-host-a"], "apply.b": ["gate-host-a", "gate-host-a"]},
+        "one try missing": {"apply.a": ["gate-host-a"], "apply.b": ["gate-host-b"]},
+        "a third try": {"apply.a": ["gate-host-a"], "apply.b": ["gate-host-a", "gate-host-b", "gate-host-b"]},
+        "no hostname recorded": {"apply.a": [""], "apply.b": ["gate-host-a", "gate-host-b"]},
+        "a task never ran": {"apply.b": ["gate-host-a", "gate-host-b"]},
+    }
+    for name, got in mutants.items():
+        assert oracle.hosts_as_routed(got, {k: [f"gate-host-{h}" for h in v] for k, v in expected.items()}, "r"), name

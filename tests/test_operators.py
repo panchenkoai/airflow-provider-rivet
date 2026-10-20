@@ -252,6 +252,20 @@ def test_a_crash_on_a_worker_without_a_state_directory_says_the_budget_is_not_tr
     assert "crashed_ledger" in ti.store[("task", "return_value")]["degraded"]
 
 
+def test_on_postgresql_state_the_crashed_budget_is_the_first_tries_not_a_ledger_on_one_host(rig: Rig) -> None:
+    """Multi-host gate, 2026-10-20: with `crashed_retries=1` a crash on host a was retried on host b, whose empty ledger
+    granted the budget again, so a third try ran. PostgreSQL state lets tries land on any host: no ledger is kept, and
+    only the first `crashed_retries` tries are retried after a crash."""
+    pg = {"RIVET_PG_URL": SECRET, "RIVET_STATE_URL": "postgresql://state:pw@state-db/rivet_state"}
+    op = rig.operator(RivetApplyOperator, export="orders", env=pg)
+    rig.scenario(apply={"signal": "SIGKILL"})
+    first, ti = rig.run(op, FakeTI(try_number=1, max_tries=3))
+    second, _ = rig.run(op, FakeTI(try_number=2, max_tries=3))
+    assert type(first) is AirflowException and isinstance(second, AirflowFailException)
+    assert "crashed_ledger" in ti.store[("task", "return_value")]["degraded"]
+    assert not list(rig.state_dir.glob("airflow/*/crashed/*")), "no ledger on this host's disk"
+
+
 def test_exit_137_reported_as_a_number_is_crashed(rig: Rig) -> None:
     rig.scenario(apply={"exit": 137})
     exc, ti = rig.run(rig.operator(RivetApplyOperator, export="orders"))

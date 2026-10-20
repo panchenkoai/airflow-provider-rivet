@@ -23,7 +23,7 @@ How rivet's exit and error object become an Airflow success, retry or stop.
 The exception text is `[code] class: action (export)`. It never contains rivet's error message.
 
 **The crashed budget across tries.** Airflow clears a task instance's XCom at the start of every
-try, so the count cannot live there. On a local worker the operator keeps a small ledger file,
+try, so the count cannot live there. On a local worker with SQLite state the operator keeps a small ledger file,
 `<state_dir>/airflow/<dag_id>/crashed/<run_id>__<task_id>-<hash>.json`, holding `[try, max_tries]` for
 every try that ended in a crash. A crash is retried when fewer than `crashed_retries` earlier
 crashes carry the task instance's current `max_tries`. Airflow moves `max_tries` when a task is
@@ -36,6 +36,8 @@ written, and a file that is not the ledger's JSON, which is left as it is until 
 it. On a worker with no state directory (a pod) there is no file: a crash is retried only within
 the first `crashed_retries` tries of the task instance, so neither a crash after a transient
 failure nor a crash after a manual clear is retried.
+The same holds on PostgreSQL state, where tries may run on different hosts and a ledger on one
+host's disk would grant the budget again on the next (`crashed_ledger` in `degraded`).
 
 Limit: the crashed budget can only shorten Airflow's own budget, never extend it. With
 `retries=0` Airflow retries nothing, a crash included. The builders default to `retries=2`.

@@ -164,6 +164,9 @@ class Outcome:
     degraded: list[str] = field(default_factory=list)
     stderr_path: str | None = None
     marker: str | None = None
+    # `sqlite` or `postgres`: where rivet's state lives, so the operator knows whether this worker's disk is the only
+    # one its tries run on (not in XCom).
+    state_kind: str | None = field(default=None, compare=False)
     rivet_version: str | None = None
     skip_reason: str | None = None
 
@@ -418,6 +421,7 @@ class _Session:
             degraded=sorted(self.degraded),
             stderr_path=self.stderr_path,
             marker=self.pf.marker,
+            state_kind=self.pf.state_kind,
             rivet_version=self.pf.caps.version_text,
         )
         if len(units) == 1:

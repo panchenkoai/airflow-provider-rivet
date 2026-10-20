@@ -54,8 +54,7 @@ SQLite state in `state_dir`.
    - a relative `cdc.checkpoint`, which resolves beside the copied config, that is, here.
    - `airflow/<dag_id>/`: sealed plan artifacts
      (`plans/<run_id>/<export>__<task_id>__s<max_tries>__<inputs>-<hash>.json`), the crashed ledger, scratch
-     files; `airflow/<dag_id>/plans/<run_id>/<artifact>.apply.json` (the record of an apply a try
-     started, [Retries](retries.md)); `airflow/locks/run/<export>.lock` (run, apply, cdc_run),
+     files; `airflow/locks/run/<export>.lock` (run, apply, cdc_run),
      `airflow/locks/<export>.lock` (load and compact of a whole export) and
      `airflow/locks/table/<export>__<table>-<hash>.lock` (load and compact of one table) ([Overlap](limits.md#overlap)).
    - `logs/<dag_id>/<task_id>-<hash>/`: rivet's stdout and stderr, one file per step and try.
@@ -121,9 +120,12 @@ SQLite state in `state_dir`.
    from the start, a CDC stream re-anchors and the changes between the lost position and the new
    anchor are gone, with no error. What the operator can check without rivet's state identity:
    the directory exists, is absolute and writable, and its marker equals the marker of each
-   direct upstream rivet task of the same DAG run (taken from their XCom); a difference is
-   refused with `RIVET_AIRFLOW_STATE_DIR_DIFFERS`. It cannot see a directory that was emptied
-   between two DAG runs, or two hosts that each have their own copy.
+   direct upstream rivet task of the same DAG run (taken from their XCom); on SQLite state a
+   difference is refused with `RIVET_AIRFLOW_STATE_DIR_DIFFERS`. On PostgreSQL state it is not:
+   no task reads what another left in the directory, and several hosts, each with its own
+   directory at one path, are the deployment that state is for (an extract on one host and its
+   load on the other, measured by the live gate's multi-host leg). It cannot see a directory that
+   was emptied between two DAG runs, or two hosts that each have their own copy.
 5. **Relative paths in the config.** The copy changes the directory rivet takes as the
    config's, and nothing else:
 
@@ -140,7 +142,28 @@ SQLite state in `state_dir`.
    `cdc.checkpoint` no variable resolves is refused (`RIVET_AIRFLOW_CONFIG_UNRESOLVED`), as rivet
    refuses the config.
 6. **Single host.** SQLite state and the lock files are visible to one host only. Two workers
-   on two hosts need PostgreSQL state.
+   on two hosts need PostgreSQL state and a destination both reach (an object store). Measured
+   with two Celery workers on two hosts, each with its own state_dir at one path (the live
+   gate's `--workers 2`):
+   - On PostgreSQL state with a GCS destination, extracts of one DAG run on both hosts, each
+     export moving host every run, and the CDC stream moving host, deliver every row once
+     and never move the stored cursor back. A retry of `RivetApplyOperator` on the other host
+     finds no sealed plan there and plans again from the stored cursor: the delta is extracted
+     once (the killed try on the first host wrote nothing and kept its artifact, pruned after
+     24 h). Not measured, by the same construction: a plan an earlier try on the first host
+     already applied is not answered `already_applied` on the other host but planned again, which
+     for an incremental export reads only the rows past the moved cursor.
+   - SQLite state: each host has its own `.rivet_state.db`. An export that runs on the other
+     host reads from the start, exit 0: the whole table again, and on the way back the rows
+     the other host already took. The task only warns (`sqlite_single_host`).
+   - A local destination (`rivet init`'s default `./output/`, which lands in the state_dir):
+     the files are split between the hosts; the first run on the other host writes there
+     without complaint, and a later run on a host whose manifest is behind the stored cursor is
+     refused `RIVET_STATE_CURSOR_PAST_MANIFEST` by rivet.
+   - The lock files guard one host (by construction, not measured): a zombie try on one host and
+     its retry on another are kept apart only by rivet's own run lease ([Overlap](limits.md#overlap)).
+   - The crashed ledger is per host, so `crashed_retries` counts per host: with the default 1, a
+     crash on one host and a crash of the retry on the other are both retried.
 7. **Moving to PostgreSQL state.** Stop the DAGs; create a database; set `RIVET_STATE_URL` to
    its `postgresql://` URL for every task (the worker's environment, or
    `env_from_connections`). This package does not copy the SQLite state into PostgreSQL: the

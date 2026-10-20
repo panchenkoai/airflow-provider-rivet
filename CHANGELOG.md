@@ -5,6 +5,10 @@ rivet binary; its release tags will use the prefix `airflow-v`.
 
 ## Unreleased
 
+- On PostgreSQL state, a task whose upstream rivet task ran on another host (another state_dir marker) is no longer
+  refused `RIVET_AIRFLOW_STATE_DIR_DIFFERS`: with two Celery workers, each with its own state_dir, a load landing on
+  the other host than its extract failed without a retry, in the deployment docs/state.md recommends for several
+  workers (measured by the live gate's new multi-host leg). SQLite state is still refused.
 - README Quickstart: `rivet init` with `RIVET_STATE_URL=sqlite:` into the state directory, the
   Connection, a scheduled DAG, where the Parquet lands. The docs now say that a relative local
   `destination.path` lands under `state_dir` (rivet 0.32 anchors it to the config's directory),
