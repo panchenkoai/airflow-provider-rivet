@@ -94,7 +94,8 @@ compose project and the image carry the run tag (`--tag`, default `%m%d%H%M` + 4
 
 Options: `--rivet-bin` (required), `--airflow` (comma-separated versions, default both), `--work` (working
 directory, default a fresh temporary one), `--verdicts <file>` (one JSON line per graded cell), `--keep`,
-`--sabotage drop-delta-file` or `warehouse-value`, `--tag` (the run tag), `--workers 2` (the multi-host leg below).
+`--sabotage drop-delta-file` or `warehouse-value`, `--tag` (the run tag), `--destinations s3` (below), `--workers 2`
+(the multi-host leg below).
 
 **Multi-host leg.** `--workers 2` runs, instead of the scenario above, a stack with two Celery workers, each a host
 with a disk of its own (`hosts/a` and `hosts/b` of the stack's directory, each mounted at `/opt/rivet-host` in one
@@ -163,6 +164,30 @@ base, read by google-cloud-bigquery, equals the source value by value (read by D
 through `sqlcmd`, an instant cut to the microseconds rivet keeps; batch: with exactly the keys the cycle deleted left
 over; CDC: without the rows flagged `__is_deleted`), and no `__changes` buffer is left. The cleanup deletes both buckets
 and both datasets and looks again; the sweep drops gate-shaped buckets older than a day.
+
+**Destination legs.** `--destinations s3` (needs no cloud) adds a MinIO container to the stack and runs the postgres
+scenario to S3 on the configs `rivet init --s3-bucket <bucket> --s3-region us-east-1` writes, used as written: an
+extract-only half (incremental batch and the CDC stream, `gate_s3_batch` / `gate_s3_cdc`) and a load half that adds
+`--clickhouse-url http://gate-clickhouse:8123 --clickhouse-database gate_s3_<batch|cdc> --clickhouse-user loader` and
+runs `load` and `compact` into the stack's ClickHouse from the S3-staged parts (`gate_s3_ch_batch` / `gate_s3_ch_cdc`).
+init writes one replication slot per schema (`rivet_public_cdc`) and `cleanup_source: true` in every `load:` block (the
+staged parts are deleted once loaded), so the load half reads a second postgres server (`gate-source-s3`) that plays the
+same scenario, and only the extract-only half's Parquet is left to read. The S3 credential and the endpoint reach rivet
+only through an Airflow `aws` Connection (`rivet_gate_s3`: login and password, extras `region_name` and `endpoint_url`
+`http://gate-minio:9000`, as `AWS_ENDPOINT_URL`, which rivet's S3 client reads when the config names no `endpoint`);
+init writes neither an endpoint nor a key variable. Each config has a TLS PostgreSQL state of its own
+(`rivet_gate_state_s3_<kind>`). Oracles: the Parquet in MinIO read by DuckDB's httpfs (path-style, the stack's own
+MinIO password) and graded as the local Parquet is (each delta, the newest version per key, the CDC snapshot + changes
+replayed, exact operation counts, XCom rows, the stored cursor read by psql); each ClickHouse current-state view read
+over HTTP as JSON and compared value by value with `gate-source-s3` (warehouse.py's canonical forms: batch with
+exactly the keys the cycle deleted left over, CDC without the rows flagged `__is_deleted`). A third config names a
+bucket that is never made: its DAG (`gate_s3_missing`) runs once after the cycles and must stop on
+`RIVET_DEST_CONTAINER_NOT_FOUND` within 120 s with exit 1 (rivet declares the code an `environment` error: 2 only
+when transient), on Airflow's first try (`s3/missing-bucket/coded-final-stop`).
+Everything lives in the stack and goes with its `down -v`.
+
+There is no Azure leg: rivet 0.32's `init` has no Azure destination flag (only `--gcs-bucket` and `--s3-bucket`), and
+the gate's configs come only from `rivet init`.
 
 **Connection legs.** Each stack runs with passwords made for it (32 random hex digits for the source, state,
 ClickHouse and metastore databases and the admin user) and a generated Fernet key, so no task log masks a word it

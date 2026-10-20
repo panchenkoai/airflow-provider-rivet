@@ -12,7 +12,7 @@ import subprocess
 import time
 import urllib.error
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
 
@@ -46,11 +46,17 @@ class StandSecrets:
     mysql_root: str
     mssql: str
     mssql_root: str
+    minio: str
+    source_s3: str
     fernet: str
 
     @classmethod
     def generate(cls) -> StandSecrets:
-        return cls(*(secrets.token_hex(16) for _ in range(10)), fernet=base64.urlsafe_b64encode(secrets.token_bytes(32)).decode())
+        hex_fields = [f.name for f in fields(cls) if f.name != "fernet"]
+        return cls(
+            **{name: secrets.token_hex(16) for name in hex_fields},
+            fernet=base64.urlsafe_b64encode(secrets.token_bytes(32)).decode(),
+        )
 
 
 def write_private(path: Path, text: str) -> None:
@@ -117,6 +123,7 @@ x-rivet: &rivet
     GATE_WAREHOUSES: '{warehouses}'
     GATE_SOURCES: '{sources}'
     GATE_WORKERS: '{workers}'
+    GATE_DESTINATIONS: '{destinations}'
 {backend}  env_file: [gate-connections.env]
   volumes:
     - {rivet_dir}:/opt/rivet
@@ -142,7 +149,7 @@ x-rivet: &rivet
     environment: {{ CLICKHOUSE_USER: loader, CLICKHOUSE_PASSWORD: {clickhouse}, CLICKHOUSE_DB: gate, CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1" }}
     ulimits: {{ nofile: {{ soft: 262144, hard: 262144 }} }}
     ports: ["127.0.0.1::8123"]
-{source_services}"""
+{source_services}{destination_services}"""
 
 
 def sh(
@@ -194,6 +201,7 @@ class Stand:
         adc: Path | None = None,
         sources: tuple[Any, ...] = (),
         workers: int = 1,
+        destinations: tuple[Any, ...] = (),
     ) -> None:
         self.flavor = FLAVORS[version]
         #: 1: one Celery worker on the shared volume; 2: the multi-host leg, two workers with a disk each.
@@ -217,6 +225,8 @@ class Stand:
         self.adc = adc
         #: Source engines beside the postgres source (gate.sources.Engine): their containers and Connections.
         self.sources = sources
+        #: Destination legs (gate.destinations): their containers, Connections and the states of their configs.
+        self.destinations = destinations
         self._token: str | None = None
 
     def connections(self) -> dict[str, dict[str, Any]]:
@@ -271,6 +281,20 @@ class Stand:
                 if self.workers > 1
                 else {}
             ),
+            **{conn_id: conn for d in self.destinations for conn_id, conn in d.connections(self.secrets).items()},
+            **{
+                state_conn_id(d.name, kind): {
+                    "conn_type": "postgres",
+                    "host": "gate-state",
+                    "port": 5432,
+                    "login": "rivet",
+                    "password": self.secrets.state,
+                    "schema": state_db(d.name, kind),
+                    "extra": {"rivet_params": "sslmode=require"},
+                }
+                for d in self.destinations
+                for kind in d.configs
+            },
             **self.extra_connections,
         }
 
@@ -353,8 +377,10 @@ class Stand:
         services = "\n".join(
             f"  {s}:\n    <<: *rivet"
             + (
-                # The official 2.5 min of health checks lose to a docker host busy with other stacks; the workers wait on it.
-                '\n    ports: !override ["127.0.0.1::8080"]\n    healthcheck: { retries: 40 }'
+                '\n    ports: !override ["127.0.0.1::8080"]'
+                # The official 30 s + 5 x 30 s lose to an API server's first start on a docker host busy with other
+                # stacks; the workers wait for it healthy, so `up` fails with "dependency failed to start".
+                "\n    healthcheck: { retries: 30, start_period: 120s }"
                 if s == self.flavor.ui_service
                 else ""
             )
@@ -390,6 +416,8 @@ class Stand:
             warehouses=",".join(self.warehouses),
             sources=",".join(e.name for e in self.sources),
             source_services="".join(e.service_yaml.format(**vars(self.secrets)) for e in self.sources),
+            destinations=",".join(d.name for d in self.destinations),
+            destination_services="".join(d.service_yaml.format(**vars(self.secrets)) for d in self.destinations),
             backend=backend,
             adc=adc,
             result_backend=self.flavor.result_backend,
