@@ -425,7 +425,13 @@ class _Session:
         for unit in units:
             record = unit.to_xcom()
             record.update(record.pop("error") or {})
-            self.emit({"event": "rivet.unit", "skip_reason": unit.skip_reason, **record})
+            extra = {
+                "skip_reason": unit.skip_reason,
+                "target": unit.target,
+                "buffer": unit.buffer,
+                "target_from": unit.target_from,
+            }
+            self.emit({"event": "rivet.unit", **extra, **record})
         self.emit(
             {
                 "event": "rivet.result",
@@ -1000,6 +1006,42 @@ def _plan(s: _Session) -> Outcome:
     return s.outcome(step, [UnitResult(None, status="failed" if error else "success", error=error)], error)
 
 
+# The `load:` keys that hold where a warehouse's tables are created, outermost first (rivet's src/config/load.rs).
+TARGET_CONTAINER = {"bigquery": ("project", "dataset"), "snowflake": ("database", "schema"), "clickhouse": ("database",)}
+
+
+def config_target(config: Mapping[str, Any], cmd: str, export: str | None, table: str | None) -> tuple[str | None, str | None]:
+    """`(target, buffer)` as the config's `load:` block names them, in rivet's terms: a load writes the table of a `full`
+    export and the `<table>__changes` log of any other; a compact merges that log (buffer) into the base (target).
+    `(None, None)` when the block names no warehouse or no table is known; a part the block leaves to the warehouse's
+    default (BigQuery's project) is left out."""
+    load = config.get("load")
+    if not table or not isinstance(load, Mapping):
+        return None, None
+    keys = TARGET_CONTAINER.get(_yaml.text_of(load.get("target")))
+    if keys is None:
+        return None, None
+    base = ".".join([*(str(_yaml.text_of(load[k])) for k in keys if load.get(k) not in (None, "")), table])
+    if cmd == "compact":
+        return base, f"{base}__changes"
+    entry = next(
+        (e for e in config.get("exports") or [] if isinstance(e, Mapping) and _yaml.text_of(e.get("name")) == export), {}
+    )
+    return (base if _yaml.text_of(entry.get("mode")) == "full" else f"{base}__changes"), None
+
+
+def _with_target(s: _Session, unit: UnitResult, row: Mapping[str, Any]) -> UnitResult:
+    """The unit with the warehouse objects it touched: rivet's own names when its result has them, else the config's."""
+    named = row.get("target")
+    if isinstance(named, str) and named:
+        buffer = row.get("buffer")
+        unit.target, unit.buffer, unit.target_from = named, buffer if isinstance(buffer, str) else None, "rivet"
+    else:
+        unit.target, unit.buffer = config_target(s.pf.config, s.req.command, unit.export, unit.table)
+        unit.target_from = "config" if unit.target else None
+    return unit
+
+
 def _load(s: _Session) -> Outcome:
     """`rivet load` / `rivet compact` for one export and, where the binary can, one table."""
     cmd, export, table = s.req.command, s.req.export, s.req.table
@@ -1028,7 +1070,7 @@ def _load(s: _Session) -> Outcome:
     rows = _entries(s, doc, "per_table")
     if not rows:
         status = "failed" if error else DONE_WORD[cmd]
-        return s.outcome(step, [UnitResult(export, table, status=status, error=error)], error)
+        return s.outcome(step, [_with_target(s, UnitResult(export, table, status=status, error=error), {})], error)
     units = []
     for row in rows:
         if table and row.get("table") != table:
@@ -1049,6 +1091,7 @@ def _load(s: _Session) -> Outcome:
                 skip_reason=s.malformed(row.get("skip_reason"), str),
             )
         )
+        _with_target(s, units[-1], row)
     if len([u for u in units if u.status == "failed"]) <= 1:
         s.degraded.discard("per_unit_error")
     return s.outcome(step, units, error)

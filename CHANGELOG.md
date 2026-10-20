@@ -11,6 +11,8 @@ rivet binary; its release tags will use the prefix `airflow-v`.
   not under `cwd`.
 - The task log is shorter: a one-step task whose step took the task's time has no step line, and
   "this binary lacks" is written at DEBUG, not on every task (#62).
+- A load / compact task's headline names the warehouse table (`project.dataset.table`): rivet's own
+  name when its result has one, else the config's `load:` block, marked `(from config)`.
 - XCom `rivet_version` holds the whole version line (`0.32.1 (3f337e9e3)`), not only the number.
 
 ## 0.1.0 (2026-10-18)

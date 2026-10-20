@@ -226,3 +226,74 @@ def test_notes_sqlite_an_unknown_degradation_warnings_max_events_and_a_ledger_pr
         (INFO, "  note     stopped at max_events (a, b): a backlog remains; the next run goes on from here"),
         (WARNING, "  note     the ledger is unwritable"),
     ]
+
+
+BQ = {"target": "bigquery", "project": "p", "dataset": "d"}
+EXPORTS = [{"name": "snap", "mode": "full"}, {"name": "inc", "mode": "incremental"}, {"name": "cdc", "mode": "cdc"}]
+
+
+@pytest.mark.parametrize(
+    ("load", "cmd", "export", "table", "expected"),
+    [
+        (BQ, "load", "snap", "t", ("p.d.t", None)),  # a full export's load replaces the table itself
+        (BQ, "load", "inc", "t", ("p.d.t__changes", None)),  # any other appends to its log
+        (BQ, "load", "cdc", "t", ("p.d.t__changes", None)),
+        (BQ, "load", "unknown", "t", ("p.d.t__changes", None)),
+        (BQ, "compact", "cdc", "t", ("p.d.t", "p.d.t__changes")),  # the buffer merged into the base
+        ({"target": "bigquery", "dataset": "d"}, "load", "snap", "t", ("d.t", None)),  # project from the credentials
+        ({"target": "snowflake", "database": "DB", "schema": "S"}, "load", "snap", "T", ("DB.S.T", None)),
+        ({"target": "clickhouse", "database": "db"}, "load", "snap", "t", ("db.t", None)),
+        ({"target": "duckdb"}, "load", "snap", "t", (None, None)),
+        (BQ, "load", "snap", None, (None, None)),
+        ("bigquery", "load", "snap", "t", (None, None)),
+    ],
+)
+def test_the_config_names_the_warehouse_objects(load: Any, cmd: str, export: str, table: str | None, expected: tuple) -> None:
+    from airflow_provider_rivet.invocation import config_target
+
+    assert config_target({"load": load, "exports": EXPORTS}, cmd, export, table) == expected
+    assert config_target({"exports": EXPORTS}, cmd, export, "t") == (None, None)
+
+
+def test_several_units_each_name_their_table() -> None:
+    log, _ = make("load", "orders")
+    for table, target, source in (("a", "p.d.a", "rivet"), ("b", "p.d.b", "config")):
+        record = {"export": "orders", "table": table, "target": target, "buffer": None, "target_from": source}
+        log.record({"event": "rivet.unit", **record})
+    units = [{"export": "orders", "table": t, "status": "loaded", "rows": 1} for t in "ab"]
+    lines = render(log, {"decision": "success", "units": units})
+    assert lines[0][1].startswith("rivet load orders → OK: 2 tables")
+    assert (INFO, "  table    orders.a → p.d.a: loaded, 1 row") in lines
+    assert (INFO, "  table    orders.b → p.d.b (from config): loaded, 1 row") in lines
+
+
+@pytest.mark.parametrize(
+    ("row", "expected"),
+    [
+        ({"target": "r.t", "buffer": "r.t__changes"}, ("r.t", "r.t__changes", "rivet")),
+        ({"target": "r.t", "buffer": 5}, ("r.t", None, "rivet")),  # a buffer that is not a name is dropped
+        ({"target": ""}, ("p.d.t", None, "config")),  # an empty name is no name: the config's
+        ({"target": 7}, ("p.d.t", None, "config")),
+        ({}, ("p.d.t", None, "config")),  # `snap` is a full export: its load writes the table itself
+    ],
+)
+def test_a_unit_takes_rivets_names_else_the_configs(row: dict, expected: tuple) -> None:
+    from types import SimpleNamespace
+
+    from airflow_provider_rivet.invocation import _with_target
+    from airflow_provider_rivet.result import UnitResult
+
+    config = {"load": BQ, "exports": EXPORTS}
+    s = SimpleNamespace(pf=SimpleNamespace(config=config), req=SimpleNamespace(command="load"))
+    unit = _with_target(s, UnitResult("snap", "t"), row)  # type: ignore[arg-type]
+    assert (unit.target, unit.buffer, unit.target_from) == expected
+    s.pf.config = {"exports": EXPORTS}  # no `load:` block: nothing to name, and no source claimed
+    unit = _with_target(s, UnitResult("snap", "t"), {})  # type: ignore[arg-type]
+    assert (unit.target, unit.buffer, unit.target_from) == (None, None, None)
+
+
+def test_an_empty_container_key_is_left_out_like_an_absent_one() -> None:
+    from airflow_provider_rivet.invocation import config_target
+
+    load = {"target": "bigquery", "project": "", "dataset": "d"}
+    assert config_target({"load": load}, "load", "x", "t") == ("d.t__changes", None)
