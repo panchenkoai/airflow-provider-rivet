@@ -94,7 +94,18 @@ compose project and the image carry the run tag (`--tag`, default `%m%d%H%M` + 4
 
 Options: `--rivet-bin` (required), `--airflow` (comma-separated versions, default both), `--work` (working
 directory, default a fresh temporary one), `--verdicts <file>` (one JSON line per graded cell), `--keep`,
-`--sabotage drop-delta-file` or `warehouse-value`, `--tag` (the run tag).
+`--sabotage drop-delta-file` or `warehouse-value`, `--tag` (the run tag), `--workers 2` (the multi-host leg below).
+
+**Multi-host leg.** `--workers 2` runs, instead of the scenario above, a stack with two Celery workers, each a host
+with a disk of its own (`hosts/a` and `hosts/b` of the stack's directory, each mounted at `/opt/rivet-host` in one
+worker only): every `state_dir` (the config copy, sealed plans, locks, crashed ledger, logs, marker) and init's
+relative `./output/` destination are on the host that ran the task. Its configs are the ones `rivet init` writes
+against the live source (`--mode incremental` and `--mode cdc`, `--include` the two tables), used as written, and
+rivet's state is the stack's TLS PostgreSQL (`RIVET_STATE_URL` from the `rivet_gate_state` Connection; the CDC
+config's from `rivet_gate_state_mh_cdc`, since init names its baseline exports after the tables, as the batch ones).
+Every task names a queue (`gate_a`, `gate_b`, `gate_cdc`) and the gate moves each queue to one worker per cycle with
+Celery's `add_consumer` / `cancel_consumer`, so the two extracts of one batch run land on both hosts and every
+export changes host between cycles; each try's `hostname` from the REST API proves it (`.../hosts`).
 
 **Warehouse leg.** `--warehouses bigquery,snowflake,clickhouse` (any subset) also extracts to GCS and runs
 `load` and `compact` into those warehouses from Airflow Connections (`connections=`). It needs a GCP credential
