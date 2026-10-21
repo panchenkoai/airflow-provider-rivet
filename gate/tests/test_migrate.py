@@ -70,17 +70,17 @@ def test_the_checkpoint_file_is_where_the_position_is_and_nothing_moves_it(tmp_p
 
 
 def test_the_stream_equals_the_source_with_its_deletes_applied() -> None:
-    source = {"gate_orders": [{"id": 1, "status": "moved"}]}
-    cols = {"gate_orders": ["id", "status"]}
+    source = {"mig_orders": [{"id": 1, "status": "moved"}]}
+    cols = {"mig_orders": ["id", "status"]}
     ok = {
-        "gate_orders": [{"id": 1, "status": "moved", "__is_deleted": False}, {"id": 4997, "status": "new", "__is_deleted": True}]
+        "mig_orders": [{"id": 1, "status": "moved", "__is_deleted": False}, {"id": 4997, "status": "new", "__is_deleted": True}]
     }
     assert stream_equals(ok, source, cols) == []
     # Mutant: a delete not applied passes (the key the source lacks, not flagged).
-    unflagged = {"gate_orders": [ok["gate_orders"][0], {**ok["gate_orders"][1], "__is_deleted": False}]}
+    unflagged = {"mig_orders": [ok["mig_orders"][0], {**ok["mig_orders"][1], "__is_deleted": False}]}
     assert any("absent at the source" in p for p in stream_equals(unflagged, source, cols))
     # Mutant: a duplicate of a live key passes (the current-state view holds a key twice).
-    twice = {"gate_orders": [ok["gate_orders"][0], ok["gate_orders"][0]]}
+    twice = {"mig_orders": [ok["mig_orders"][0], ok["mig_orders"][0]]}
     assert any("unexpected" in p for p in stream_equals(twice, source, cols))
 
 
@@ -119,3 +119,12 @@ def test_the_migration_needs_the_mysql_leg(capsys) -> None:
     with pytest.raises(SystemExit):
         gate_main.main(["--rivet-bin", "x", "--migrate-from", "y", "--warehouses", "bigquery", "--sources", "mssql"])
     assert "pass --sources with mysql" in capsys.readouterr().err
+
+
+def test_the_migration_tables_share_no_name_with_the_legs() -> None:
+    # Mutant: the leg's own names (rivet refuses an unqualified CDC table another database holds, live: the leg's stream
+    # stopped RIVET_SOURCE_CDC_TABLE_UNRESOLVED once `rivet_mig` held gate_customers too).
+    assert not set(migrate.TABLES) & set(MYSQL.tables)
+    assert sorted(migrate.TABLES) == ["mig_customers", "mig_orders"]
+    assert "gate_" not in MYSQL.seed.replace("gate_", "mig_")
+    assert all("gate_" not in sql and set(ops) <= set(migrate.TABLES) for sql, ops in migrate.STEPS.values())

@@ -28,6 +28,7 @@ from typing import Any
 import duckdb
 
 from . import warehouse
+from .sources import MYSQL
 from .stand import sh, state_conn_id, state_db
 
 ENGINE = "mysql"
@@ -41,33 +42,37 @@ CONFIG_DIR = "/opt/rivet/configs/mysql_mig"
 INIT_DIR = "/opt/rivet/configs/mysql_mig_init"
 STATE_DIR = "/opt/rivet/state/mysql_mig"
 DAGS = {"sqlite": "gate_mig_mysql_sqlite", "pg": "gate_mig_mysql_pg", "back": "gate_mig_mysql_back"}
+#: The stream's tables: the scenario's under names of their own. rivet refuses an unqualified CDC table another database
+#: of the server also holds (`RIVET_SOURCE_CDC_TABLE_UNRESOLVED`, the binlog is server-wide), and init writes them
+#: unqualified, so the migration database may not reuse the leg's names.
+TABLES = {name.replace("gate_", "mig_"): cols for name, cols in MYSQL.tables.items()}
 #: State tables not compared by count: schema bookkeeping (the copy brings the rows to this release's schema) and leases.
 UNCOMPARED = frozenset({"schema_version", "rivet_schema_version", "state_lease"})
 #: The changes of each step, and the change events they make (every update changes a value; deletes are by key).
 STEPS: dict[str, tuple[str, dict[str, dict[str, int]]]] = {
     "sqlite-2": (
-        "UPDATE gate_orders SET status = 'paid' WHERE id BETWEEN 1 AND 3;\n"
-        "INSERT INTO gate_orders (customer_id, amount, status) VALUES (1, 5.55, 'new'), (2, 6.66, 'new');\n"
-        "DELETE FROM gate_orders WHERE id = 4999;",
-        {"gate_orders": {"update": 3, "insert": 2, "delete": 1}},
+        "UPDATE mig_orders SET status = 'paid' WHERE id BETWEEN 1 AND 3;\n"
+        "INSERT INTO mig_orders (customer_id, amount, status) VALUES (1, 5.55, 'new'), (2, 6.66, 'new');\n"
+        "DELETE FROM mig_orders WHERE id = 4999;",
+        {"mig_orders": {"update": 3, "insert": 2, "delete": 1}},
     ),
     "before-switch": (
-        "UPDATE gate_customers SET tier = 'moving' WHERE id IN (7, 8);\nDELETE FROM gate_orders WHERE id = 4998;",
-        {"gate_customers": {"update": 2}, "gate_orders": {"delete": 1}},
+        "UPDATE mig_customers SET tier = 'moving' WHERE id IN (7, 8);\nDELETE FROM mig_orders WHERE id = 4998;",
+        {"mig_customers": {"update": 2}, "mig_orders": {"delete": 1}},
     ),
     "after-switch": (
-        "INSERT INTO gate_orders (customer_id, amount, status) VALUES (3, 7.77, 'new');\n"
-        "UPDATE gate_orders SET status = 'moved' WHERE id = 10;\nDELETE FROM gate_orders WHERE id = 4997;",
-        {"gate_orders": {"insert": 1, "update": 1, "delete": 1}},
+        "INSERT INTO mig_orders (customer_id, amount, status) VALUES (3, 7.77, 'new');\n"
+        "UPDATE mig_orders SET status = 'moved' WHERE id = 10;\nDELETE FROM mig_orders WHERE id = 4997;",
+        {"mig_orders": {"insert": 1, "update": 1, "delete": 1}},
     ),
     "pg-2": (
-        "UPDATE gate_customers SET tier = 'settled' WHERE id = 9;\nDELETE FROM gate_orders WHERE id = 4996;",
-        {"gate_customers": {"update": 1}, "gate_orders": {"delete": 1}},
+        "UPDATE mig_customers SET tier = 'settled' WHERE id = 9;\nDELETE FROM mig_orders WHERE id = 4996;",
+        {"mig_customers": {"update": 1}, "mig_orders": {"delete": 1}},
     ),
     "back": (
-        "UPDATE gate_customers SET tier = 'back' WHERE id = 11;\nINSERT INTO gate_orders (customer_id, amount, status) "
+        "UPDATE mig_customers SET tier = 'back' WHERE id = 11;\nINSERT INTO mig_orders (customer_id, amount, status) "
         "VALUES (4, 8.88, 'new');",
-        {"gate_customers": {"update": 1}, "gate_orders": {"insert": 1}},
+        {"mig_customers": {"update": 1}, "mig_orders": {"insert": 1}},
     ),
 }
 
@@ -178,7 +183,7 @@ class Migration:
         shown = stand.compose("exec", "-T", "airflow-worker", OLD_BIN, "--version").stdout.strip()
         print(f"MIGRATE old binary in the image: {shown}", flush=True)
         self.src.sql(stand, f"CREATE DATABASE {DATABASE};\nGRANT ALL ON {DATABASE}.* TO 'rivet'@'%';")
-        self.sql(stand, self.src.engine.seed)
+        self.sql(stand, self.src.engine.seed.replace("gate_", "mig_"))
         sh(["gcloud", "storage", "buckets", "create", f"gs://{self.bucket}", f"--project={self.src.cloud.project}",
             f"--location={self.src.cloud.location}", "--uniform-bucket-level-access"], timeout=300)  # fmt: skip
         warehouse._bq(
@@ -190,7 +195,7 @@ class Migration:
         argv = [
             OLD_BIN, "init", "--source-env", URL_ENV, "--tls", "disable", "--mode", "cdc", "--gcs-bucket", self.bucket,
             "--bigquery-project", self.src.cloud.project, "--bigquery-dataset", self.dataset,
-            "--include", *self.src.engine.tables, "-o", f"{INIT_DIR}/rivet.yaml",
+            "--include", *TABLES, "-o", f"{INIT_DIR}/rivet.yaml",
         ]  # fmt: skip
         self.command(f"{URL_ENV}=<mysql url> " + " ".join(argv))
         stand.compose("exec", "-T", "-e", URL_ENV, "-e", "RIVET_STATE_URL", "airflow-worker", *argv,
@@ -202,7 +207,7 @@ class Migration:
             stand.rivet_dir / "configs" / "mysql_mig_init" / "rivet.yaml",
             stand.rivet_dir / "configs" / "mysql_mig" / "rivet.yaml",
         )
-        streams = read_config(text, list(self.src.engine.tables))["streams"]
+        streams = read_config(text, list(TABLES))["streams"]
         if len(streams) != 1:
             raise ValueError(f"rivet 0.32.1's init wrote streams {streams}, expected one")
         self.stream = streams[0]
@@ -234,7 +239,7 @@ class Migration:
             )
             con.execute(f"ATTACH '{dsn}' AS src (TYPE mysql, READ_ONLY)")
             out = {}
-            for table, cols in self.src.engine.tables.items():
+            for table, cols in TABLES.items():
                 cur = con.execute(f"SELECT {', '.join(cols)} FROM src.{table}")
                 names = [d[0] for d in cur.description]
                 out[table] = [dict(zip(names, row, strict=True)) for row in cur.fetchall()]
@@ -246,7 +251,7 @@ class Migration:
         client = self.src._client()
         return {
             t: [dict(r.items()) for r in client.query(f"SELECT * FROM `{self.src.cloud.project}.{self.dataset}.{t}`").result()]
-            for t in self.src.engine.tables
+            for t in TABLES
         }
 
     def sqlite_state(self, stand: Any) -> dict[str, Any]:
@@ -287,7 +292,7 @@ class Migration:
         print(f"MIGRATE {step} {dag}: run {state}, {json.dumps({t: i.get('state') for t, i in tasks.items()})} "
               f"{json.dumps(payload, default=str)}", flush=True)  # fmt: skip
         source = v.guard(f"migrate/{step}/source", self.source_rows, stand)
-        cols = dict(self.src.engine.tables)
+        cols = dict(TABLES)
         problems = run_problems(state, tasks, payload, rows)
         if not grade:
             got = self.warehouse_rows()
