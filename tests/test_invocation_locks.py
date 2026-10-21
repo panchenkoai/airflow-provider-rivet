@@ -59,6 +59,15 @@ def test_each_command_locks_its_own_file_and_names_what_it_covers(tmp_path: Path
         assert invocation._lock_path(lock_session(tmp_path, command, export, table, flag)) == want, (command, export, table)
 
 
+def test_a_config_reached_through_a_symlink_locks_by_the_path_the_dag_gave(tmp_path: Path) -> None:
+    """_lock_path: git-sync swaps `repo -> rev-<sha>`; the lock of a task without an export stays one file across syncs."""
+    s = lock_session(tmp_path, "apply", None)
+    (tmp_path / "repo").symlink_to(tmp_path)
+    s.req.config = str(tmp_path / "repo" / "rivet.yaml")
+    want = tmp_path / "state" / "airflow" / "locks" / "run" / f"{hashed_name('config', s.req.config)}.lock"
+    assert invocation._lock_path(s) == (want, "the config")
+
+
 class Clock:
     """`time` for the lock wait: monotonic stands still unless `sleep` moves it."""
 

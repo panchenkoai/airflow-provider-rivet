@@ -1468,3 +1468,25 @@ def test_sqlite_state_under_an_executor_of_several_hosts_is_refused_unless_one_h
     pg = {"RIVET_PG_URL": SECRET, "RIVET_STATE_URL": "postgresql://state:pw@state-db/rivet_state"}
     payload, _ = rig.run(rig.operator(RivetRunOperator, export="orders", env=pg))
     assert payload["decision"] == "success", "PostgreSQL state may run on any host"
+
+
+def test_under_git_sync_a_flipped_revision_keeps_one_copy_of_the_config(rig: Rig) -> None:
+    """git-sync swaps `repo -> rev-<sha>`: the copy is named by the path the DAG gave, so a sync does not leave a second
+    copy in state_dir naming the same CDC checkpoint (rivet 0.32.2 refuses that as RIVET_SOURCE_CDC_CHECKPOINT_SHARED)."""
+    root = rig.state_dir.parent / "dags"
+    for rev in ("rev-a", "rev-b"):
+        (root / rev).mkdir(parents=True)
+        (root / rev / "pipe.yaml").write_text(rig.config.read_text())
+    repo = root / "repo"
+    repo.symlink_to("rev-a")
+    rig.scenario(run={"summary": {"per_export": [entry("orders", rows=1, files=1)]}})
+    copies = []
+    for rev in ("rev-a", "rev-b"):
+        tmp = root / "repo.tmp"
+        tmp.symlink_to(rev)
+        tmp.replace(repo)  # the atomic swap git-sync makes
+        rig.run(rig.operator(RivetRunOperator, export="orders", config=str(repo / "pipe.yaml")))
+        argv = rig.argv("run")
+        copies.append(argv[argv.index("--config") + 1])
+    assert copies[0] == copies[1]
+    assert sorted(p.name for p in rig.state_dir.glob("pipe.*.yaml")) == [Path(copies[0]).name]

@@ -274,8 +274,13 @@ class _Session:
     def config_for(self, only_export: str | None) -> str:
         """The config path rivet reads: a copy in the state directory, narrowed to one export when asked. rivet resolves
         the config's relative paths (its SQLite state, a `cdc.checkpoint`, a `query_file`, a local destination) against
-        the config's directory, so the copy puts all of them in the state directory (docs/state.md)."""
+        the config's directory, so the copy puts all of them in the state directory (docs/state.md).
+
+        The copy is named by the path the DAG gave, symlinks kept: git-sync swaps `repo -> rev-<sha>` on every sync, and a
+        copy named by the resolved path would leave the previous copy behind, still naming the CDC checkpoint, which
+        rivet 0.32.2 then refuses as another config's (`RIVET_SOURCE_CDC_CHECKPOINT_SHARED`)."""
         source = Path(self.req.config).resolve()
+        named = Path(os.path.abspath(self.req.config))
         target_dir = self.pf.state_dir
         if only_export is None and (target_dir is None or source.parent == target_dir.resolve()):
             return str(source)
@@ -283,8 +288,8 @@ class _Session:
         if folder.resolve() != source.parent:
             _copy_query_files(self.pf.config, source, folder, self.req.export)
         if only_export is None:
-            return _write_atomic(folder / copy_name(source), source.read_bytes())
-        return _write_atomic(folder / copy_name(source, only_export), narrowed_config(self.pf, str(source), only_export).encode())
+            return _write_atomic(folder / copy_name(named), source.read_bytes())
+        return _write_atomic(folder / copy_name(named, only_export), narrowed_config(self.pf, str(source), only_export).encode())
 
     def malformed(self, value: Any, kind: type) -> Any:
         """A value of a result file when it has the type the contract gives it, else `None`, recorded."""
@@ -694,7 +699,7 @@ def _lock_path(s: _Session) -> tuple[Path, str] | None:
         return None
     cmd, export, table = s.req.command, s.req.export, s.req.table
     locks = _private_dir(s.pf.state_dir, "airflow", "locks")
-    whole = hashed_name("config", str(Path(s.req.config).resolve()))
+    whole = hashed_name("config", os.path.abspath(s.req.config))
     if cmd in ("load", "compact"):
         if table and s.pf.caps.has_flag(cmd, "--table"):
             return _private_dir(locks, "table") / f"{hashed_name(export or '', table)}.lock", f"table `{table}` of `{export}`"
