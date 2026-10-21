@@ -95,7 +95,7 @@ compose project and the image carry the run tag (`--tag`, default `%m%d%H%M` + 4
 Options: `--rivet-bin` (required), `--airflow` (comma-separated versions, default both), `--work` (working
 directory, default a fresh temporary one), `--verdicts <file>` (one JSON line per graded cell), `--keep`,
 `--sabotage drop-delta-file` or `warehouse-value`, `--tag` (the run tag), `--destinations s3` (below), `--workers 2`
-(the multi-host leg below).
+(the multi-host leg below), `--state compose-postgres` and `--migrate-from <rivet 0.32.1>` (the client stack, below).
 
 **Known reds.** A cell red by a confirmed product defect is listed in `gate/scenario.py` `KNOWN` with its issue: it
 grades `XFAIL` (counted apart, the run still passes) while red and `XPASS` once it passes, which fails the run until the
@@ -199,6 +199,33 @@ publishes a new revision as git-sync does (the config copied unchanged into `rev
 succeed and the run moved those rows) and `git-sync/mysql/cdc/current-equals-source` (every table's base equals the
 source value by value). The config's copy in the `state_dir` must not change its name with the revision: a copy named by
 the resolved path leaves the old copy owning the checkpoint, and the run is refused `RIVET_SOURCE_CDC_CHECKPOINT_SHARED`.
+The cell `git-sync/mysql/cdc/stale-copy-of-old-provider-not-refused` puts, before the first cycle, the copy the previous
+provider made (named by the sha256 of the resolved `rev-A` path, the same text, no `.owner` record) in the `state_dir`,
+and requires the first stream run through `repo/` to succeed. Before the git-sync flip, `recreate/mysql/cdc/continues-
+after-worker-recreate` runs `docker compose up -d --force-recreate airflow-worker` (under Celery the tasks run only in
+the worker; the `state_dir` is the bind mount `<stack>/rivet:/opt/rivet`, so it outlives the container), makes seven
+changes and requires the stream's next run to move exactly those (no gap, no duplicate) and its base to equal the source.
+
+**The client stack.** `--state compose-postgres` keeps the source legs' state where the client does: in a database of
+its own (`rivet_state_<engine>_<kind>`), owned by a role of its own (`rivet_state`, LOGIN, its own password), on the
+compose file's `postgres` server beside Airflow's metadata database `airflow`, reached through a Connection
+(`postgresql://rivet_state:…@postgres:5432/<db>`) the DAGs read with `env_from_connections={"RIVET_STATE_URL": …}`; init
+runs with that `RIVET_STATE_URL`. `compose-pg/mysql/state-in-own-database` reads the server as its superuser: each state
+database is owned by `rivet_state` and holds tables owned by it, and `airflow` holds none of rivet's tables (none of
+their names, none owned by the role). The default (`--state gate`, the gate's TLS `gate-state`) is unchanged.
+
+**The migration leg.** `--migrate-from <rivet 0.32.1>` (beside `--sources mysql`) mounts that binary at
+`/opt/rivet/bin/rivet-0.32.1` and runs a MySQL CDC stream over a database of its own (`rivet_mig`) into a bucket and a
+dataset of its own: its config is rivet 0.32.1's init (0.32.1 keeps SQLite beside `-o`, so init writes into a scratch
+folder and the DAG reads the file copied unchanged). `gate_mig_mysql_sqlite` (0.32.1, SQLite at `<state_dir>/.rivet_state.db`,
+`single_host`) runs the baseline and a delta; then, with changes made before the switch, `rivet state copy -c
+<state_dir>/<config copy> ` (the target from `RIVET_STATE_URL`) fills the empty PostgreSQL state; `gate_mig_mysql_pg`
+(this binary, the state Connection) runs after more changes, twice. Cells `migrate/mysql/cdc/*`: each run succeeded and
+moved exactly the changes made since the run before (fewer is a gap, more a duplicate), BigQuery equals the source value
+by value with the deletes applied, the PostgreSQL state holds the SQLite state's rows (per table) and cursors, and the
+checkpoint file is byte for byte what 0.32.1 left, through the copy and the switch. The way back (`gate_mig_mysql_back`:
+this binary on the SQLite file the copy left) is measured, not graded (`MEASURE migrate/mysql/cdc/way-back`). Every
+command a client runs is printed as a `COMMAND` line.
 
 `--sources mongodb` and `--sources oracle` (together: `--sources mongodb,oracle`) are the same leg where rivet can run
 it, and a known-limit cell where it cannot. **MongoDB 7** runs as a one-member replica set (a change stream needs one)
