@@ -353,7 +353,7 @@ def play(
     stand.wait_dags(
         DAGS
         + (leg.dags if leg else [])
-        + [d for src in src_legs for d in [*src.dags, *filter(None, [src.hot_dag])]]
+        + [d for src in src_legs for d in [*src.dags, *filter(None, [src.hot_dag, src.shared_dag])]]
         + [d for x in dest_legs for d in [*x.dags, *x.probe_dags]]
     )
     files: set[str] = set()
@@ -366,6 +366,8 @@ def play(
     for src in src_legs:
         if src.hot_dag:
             src.hot_phase(stand, v, wait_runs, grade_runs)
+        if src.engine.shared is not None and src.shared:
+            src.shared_phase(stand, v, wait_runs, grade_runs)
     for dest in dest_legs:
         dest.missing_bucket_probe(stand, v, wait_runs)
         dest.cleanup_probe(stand, v, wait_runs)

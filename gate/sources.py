@@ -116,6 +116,9 @@ class Engine:
     cursor: str = "updated_at"
     #: A column added mid-stream, after the cycles (the MySQL client stack's schema change).
     hot: HotDdl | None = None
+    #: After the hot ALTER: a second CDC config on the first stream's checkpoint must be refused, and these changes
+    #: (with their events) must then reach the first stream intact.
+    shared: tuple[str, dict[str, dict[str, int]]] | None = None
 
     @property
     def service(self) -> str:
@@ -215,6 +218,7 @@ DELETE FROM gate_orders WHERE id = 100;
         ops_after={"gate_customers": {}, "gate_orders": {"update": 11, "insert": 2, "delete": 1}},
         deleted=1,
     ),
+    shared=("UPDATE gate_customers SET tier = 'gold' WHERE id <= 3;", {"gate_customers": {"update": 3}, "gate_orders": {}}),
 )
 MSSQL = Engine(
     name="mssql",
@@ -533,6 +537,9 @@ class SourceLeg:
         self.high_water: dict[str, Any] = {}
         #: The DAG of the stream whose run pauses after it opened (the hot ALTER), when the engine has one.
         self.hot_dag = ""
+        #: The second CDC config on the first stream's checkpoint: init's answer, and its DAG when init wrote it.
+        self.shared: dict[str, Any] = {}
+        self.shared_dag = ""
         self._bq: Any = None
 
     def _env(self, stand: Any) -> tuple[list[str], dict[str, str]]:
@@ -645,10 +652,43 @@ class SourceLeg:
                 "pause": f"cdc_after_open:{self.engine.hot.pause_ms}",
                 "marker": f"/opt/rivet/markers/{self.engine.name}_hot",
             }
+            if self.engine.shared is not None:
+                self.prepare_shared(stand, f"{prefix}_cdc_shared")
         # A compaction with nothing to merge skips; the `compacted` cell holds every cycle to "no buffer left".
         self.may_skip = {dag: ("compact.",) for dag in self.tasks}
         # The DAG file reads which exports and stream to build from here (the names are init's, not the gate's).
         (stand.rivet_dir / "configs" / f"{self.engine.name}_shape.json").write_text(json.dumps(self.shape))
+
+    def prepare_shared(self, stand: Any, dag: str) -> None:
+        """A second CDC config of the same source, written by init in a directory of its own (so no sibling names its
+        checkpoint), whose DAG runs in the first stream's `state_dir`: the operator copies each config there, so init's
+        relative `cdc.checkpoint` of both resolves to one file. init may refuse it (`RIVET_INIT_CDC_NAME_TAKEN`)."""
+        eng = self.engine.name
+        host = stand.rivet_dir / "configs" / f"{eng}_cdc_shared"
+        host.mkdir(parents=True, exist_ok=True)
+        out = f"/opt/rivet/configs/{eng}_cdc_shared/rivet.yaml"
+        argv = init_argv("cdc", self.engine, self.buckets["cdc"], self.cloud.project, self.datasets["cdc"], out)
+        done = stand.compose(
+            "exec", "-T", "-e", self.engine.url_env, "-e", "RIVET_STATE_URL", "airflow-worker", *argv,
+            extra_env={
+                self.engine.url_env: self.engine.url(stand.secrets),
+                "RIVET_STATE_URL": stand.state_url(state_db(eng, "cdc")),
+            },
+            check=False,
+        )  # fmt: skip
+        said = ((done.stdout or "") + (done.stderr or "")).strip()
+        written = host / "rivet.yaml"
+        text = written.read_text() if written.exists() else None
+        print(f"INIT {eng} cdc (second config): {' '.join(argv)} -> exit {done.returncode}\n{said}\n{text or ''}", flush=True)
+        self.shared = {"exit": done.returncode, "said": said, "text": text}
+        if done.returncode != 0 or text is None:
+            return
+        streams = read_config(text, list(self.engine.tables))["streams"]
+        if len(streams) != 1:
+            raise ValueError(f"the second CDC config holds streams {streams}, expected one")
+        self.shared_dag = dag
+        self.tasks[dag] = ["run", *(f"{g}.{t}" for t in streams[0]["tables"] for g in ("load", "compact"))]
+        self.shape["shared"] = {"dag": dag, "config": out, "stream": streams[0]}
 
     def cycle_tasks(self) -> dict[str, list[str]]:
         """The rivet tasks of the DAGs every cycle runs (not the hot-ALTER DAG, which runs once after the cycles)."""
@@ -838,6 +878,8 @@ class SourceLeg:
                 kind = "batch" if dag.endswith("_batch") else "cdc"
                 rows = self.expected_rows(kind, task, source, ops, baseline)
                 v.check(cell + "/xcom-unit", xcom_problems, payload, rows, ok=f"{unit_rows(payload)} row(s)")
+                if xcom_problems(payload, rows):
+                    print(f"STDERR {name} {dag} {task}:\n{stderr_tail(stand, payload)}", flush=True)
                 text = task_log(stand, dag, run_id, task)
                 v.check(cell + "/task-log", log_problems, text, payload, ok=headline(text))
 
@@ -913,8 +955,54 @@ class SourceLeg:
         )
         self.grade_tasks(stand, v, name, run_id, dags, old, hot.ops_after, baseline=False)
         self.grade_staged(v, name, self.engine.kinds)
-        for item in PENDING.get(eng, []):
-            print(f"PENDING airflow-{self.stack} {eng}/{item}", flush=True)
+
+    def shared_phase(self, stand: Any, v: Any, wait_runs: Callable[..., dict[str, str]], grade_runs: Callable[..., Any]) -> None:
+        """A second CDC config on the first stream's checkpoint (rivet #664), after the hot ALTER: init refuses to write
+        it (`RIVET_INIT_CDC_NAME_TAKEN`), or its run is refused `RIVET_SOURCE_CDC_CHECKPOINT_SHARED` (exit 5) on
+        Airflow's first try, retried by nobody. Then the first stream delivers the next changes intact."""
+        assert self.engine.shared is not None and self.engine.hot is not None
+        name, eng, hot = "shared-checkpoint", self.engine.name, self.engine.hot
+        cell = f"{name}/{eng}/cdc/refused-by-code"
+        if not self.shared_dag:
+            v.check(cell, init_refused, self.shared, ok=f"init refused [{NAME_TAKEN}], exit {REFUSED_EXIT}, wrote nothing")
+        else:
+            v.check(
+                f"{name}/{eng}/cdc/one-checkpoint",
+                same_checkpoint,
+                self.texts["cdc"],
+                self.shared["text"],
+                ok="both configs name one checkpoint in the shared state_dir",
+            )
+            run_id = f"gate_{eng}_shared"
+            stand.trigger(self.shared_dag, run_id)
+            state = wait_runs(stand, [self.shared_dag], run_id).get(self.shared_dag)
+            tasks = v.guard(f"{name}/{eng}/cdc/task-states", stand.tasks, self.shared_dag, run_id) or {}
+            payload = None
+            if tasks.get("run", {}).get("state") == "failed":
+                payload = v.guard(cell + "/xcom", stand.xcom, self.shared_dag, run_id, "run")
+            print(
+                f"SHARED run {state}: {json.dumps({t: i.get('state') for t, i in tasks.items()})} {json.dumps(payload)}",
+                flush=True,
+            )
+            v.check(
+                cell,
+                lambda: ([] if state == "failed" else [f"run {state}, expected failed"]) + shared_refused(tasks, payload),
+                ok=f"[{SHARED_CODE}], exit {REFUSED_EXIT}, one try",
+            )
+        changes, ops = self.engine.shared
+        self.sql(stand, changes)
+        name, run_id = "shared-checkpoint-after", f"gate_{eng}_shared_after"
+        dag = next(d for d in self.dags if d.endswith("_cdc"))
+        stand.trigger(dag, run_id)
+        states = wait_runs(stand, [dag], run_id)
+        grade_runs(stand, v, name, run_id, states, {dag: self.tasks[dag]}, may_skip=self.may_skip)
+        source = v.guard(f"{name}/{eng}/source", self.source_rows, stand, {hot.table: [hot.column]})
+        if source is None:
+            return
+        self.grade_targets(v, name, source, ("cdc",), {}, added={hot.table: [hot.column]})
+        old = {t: [{c: r[c] for c in cols} for r in source[t]] for t, cols in self.engine.tables.items()}
+        self.grade_tasks(stand, v, name, run_id, [dag], old, ops, baseline=False)
+        self.grade_staged(v, name, ("cdc",))
 
     def _compare(
         self, kind: str, table: str, source: list[dict[str, Any]], cols: list[str], deleted: int
@@ -926,13 +1014,59 @@ class SourceLeg:
         )
 
 
-#: Cells that wait on a rivet change not on main yet; printed on every stack, never graded.
-PENDING = {
-    "mysql": [
-        "cdc/shared-checkpoint-refusal: rivet #664 (init's CDC checkpoint and destination naming) is not merged; "
-        "two configs sharing one checkpoint must be refused by code - the cell lands with it",
+#: rivet #664: a checkpoint is read by one config; init refuses a name another config in its directory takes.
+SHARED_CODE = "RIVET_SOURCE_CDC_CHECKPOINT_SHARED"
+NAME_TAKEN = "RIVET_INIT_CDC_NAME_TAKEN"
+REFUSED_EXIT = 5
+
+
+def checkpoint_of(text: str | None) -> str | None:
+    """The `cdc.checkpoint` of a config's one CDC export."""
+    found = [
+        e.get("cdc", {}).get("checkpoint")
+        for e in (yaml.safe_load(text or "") or {}).get("exports") or []
+        if e.get("mode") == "cdc"
     ]
-}
+    return found[0] if len(found) == 1 else None
+
+
+def same_checkpoint(first: str, second: str | None) -> list[str]:
+    """Both configs name one relative checkpoint, so in one `state_dir` they read one file (else nothing is shared)."""
+    a, b = checkpoint_of(first), checkpoint_of(second)
+    if a is None or a != b or a.startswith("/"):
+        return [f"the first config's checkpoint is {a!r}, the second's {b!r}: no shared checkpoint in one state_dir"]
+    return []
+
+
+def shared_refused(tasks: dict[str, dict[str, Any]], payload: dict[str, Any] | None) -> list[str]:
+    """The second config's run stopped on the coded refusal, on Airflow's first try (a refusal is never retried), and
+    nothing after it ran."""
+    run = tasks.get("run") or {}
+    problems = []
+    if run.get("state") != "failed":
+        problems.append(f"run task {run.get('state')!r}, expected failed")
+    if run.get("try_number") != 1:
+        problems.append(f"run task try {run.get('try_number')!r}: a refusal is never retried by Airflow")
+    error = (payload or {}).get("error") or {}
+    got = ((payload or {}).get("decision"), error.get("code"), (payload or {}).get("exit_status"))
+    if got != ("fail", SHARED_CODE, REFUSED_EXIT):
+        problems.append(f"decision, code, exit {got}; expected ('fail', {SHARED_CODE!r}, {REFUSED_EXIT})")
+    ran = sorted(t for t, i in tasks.items() if t != "run" and i.get("state") == "success")
+    if ran:
+        problems.append(f"tasks ran after the refusal: {ran}")
+    return problems
+
+
+def init_refused(answer: dict[str, Any]) -> list[str]:
+    """init refused to write the second config: exit 5, the code, nothing written."""
+    problems = []
+    if answer.get("exit") != REFUSED_EXIT:
+        problems.append(f"init exited {answer.get('exit')!r}, expected {REFUSED_EXIT}")
+    if f"[{NAME_TAKEN}]" not in (answer.get("said") or ""):
+        problems.append(f"init's answer does not carry [{NAME_TAKEN}]: {(answer.get('said') or '')[-1500:]}")
+    if answer.get("text") is not None:
+        problems.append("init wrote a config although it refused")
+    return problems
 
 
 def wait_marker(path: Any, timeout: float = 300) -> float | None:
@@ -950,6 +1084,15 @@ def task_log(stand: Any, dag: str, run_id: str, task: str) -> str | None:
     root = Path(stand.dir) / "logs" / f"dag_id={dag}" / f"run_id={run_id}" / f"task_id={task}"
     found = sorted(root.glob("attempt=*.log"), key=lambda p: int(re.sub(r"\D", "", p.stem) or 0))
     return found[-1].read_text(errors="replace") if found else None
+
+
+def stderr_tail(stand: Any, payload: dict[str, Any], lines: int = 40) -> str:
+    """The end of rivet's stderr log of a task (the operator keeps it in the state_dir, on the stand's volume)."""
+    path = str(payload.get("stderr_path") or "")
+    if not path.startswith("/opt/rivet/"):
+        return f"(no stderr log: {path!r})"
+    host = stand.rivet_dir / path.removeprefix("/opt/rivet/")
+    return "\n".join(host.read_text(errors="replace").splitlines()[-lines:]) if host.exists() else f"(no file {host})"
 
 
 def headline(text: str | None) -> str:
@@ -1091,7 +1234,9 @@ def log_problems(text: str | None, payload: dict[str, Any] | None) -> list[str]:
     problems = [] if head["status"] in want else [f"headline {head.group(0).strip()!r}, expected {' or '.join(want)}"]
     said = re.search(r"\b(\d+) rows?\b", head["tail"])
     reported = unit_rows(payload or {})
-    if (int(said.group(1)) if said else None) != reported:
+    # `SKIPPED: nothing to do` names no count: right for units that moved nothing.
+    quiet = head["status"] == "SKIPPED" and said is None and reported in (None, 0)
+    if not quiet and (int(said.group(1)) if said else None) != reported:
         problems.append(f"headline says {said.group(0) if said else 'no rows'}, the XCom units {reported}")
     return problems
 

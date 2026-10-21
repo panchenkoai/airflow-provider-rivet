@@ -180,8 +180,14 @@ writes rows that use it (`alter-inside-the-open-run` fails if the pause ended fi
 (`until_current: true`), so that run delivers the writes before the ALTER, compared with the source as read in the
 window; `hot-ddl-after` runs the stream and the batch export again: the CDC base equals the source value by value with
 `note` (rows nobody changed after the ALTER read NULL, as at the source; `note-reached` fails when the source holds no
-value of it), the batch base, whose `query:` init wrote with the columns of its day, equals the source on those. The
-shared-checkpoint refusal (rivet #664) is printed as `PENDING` until it is on main.
+value of it), the batch base, whose `query:` init wrote with the columns of its day, equals the source on those. Then a
+second CDC config on the first stream's checkpoint (rivet #664): init writes it in a directory of its own (so no sibling
+names its checkpoint), and its DAG (`gate_src_mysql_cdc_shared`) runs in the first stream's `state_dir`, where the
+operator's copies of both configs resolve init's relative `cdc.checkpoint` to one file (`one-checkpoint`). Its run must
+stop on `RIVET_SOURCE_CDC_CHECKPOINT_SHARED`, exit 5, on Airflow's first try, nothing after it running
+(`shared-checkpoint/mysql/cdc/refused-by-code`; when init refuses the config instead, that cell is init's
+`RIVET_INIT_CDC_NAME_TAKEN`, exit 5, nothing written). `shared-checkpoint-after` then runs the first stream over three
+more updates: its base equals the source value by value and its tasks moved those three rows.
 
 `--sources mongodb` and `--sources oracle` (together: `--sources mongodb,oracle`) are the same leg where rivet can run
 it, and a known-limit cell where it cannot. **MongoDB 7** runs as a one-member replica set (a change stream needs one)

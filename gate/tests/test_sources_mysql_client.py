@@ -89,6 +89,10 @@ def test_the_task_log_headline_says_what_the_xcom_says() -> None:
     skipped = LOG.replace("OK: 165 rows, 1 file", "SKIPPED: nothing to do")
     assert log_problems(skipped, payload(None, status="skipped")) == []
     assert log_problems(skipped, payload(None))[0].endswith("expected OK")
+    # A skip names no count; units that moved nothing (0, or no count) agree with it. Mutant: the `quiet` exception
+    # dropped (red on every skipped load), or widened to any count (a skip that hid moved rows passes).
+    assert log_problems(skipped, payload(0, status="skipped")) == []
+    assert log_problems(skipped, payload(5, status="skipped")) == ["headline says no rows, the XCom units 5"]
     assert log_problems(None, payload(1)) == ["no task log"]
     assert log_problems("nothing here", payload(1)) == ["no `rivet ... →` headline in the task log"]
 
@@ -138,14 +142,27 @@ def test_no_staged_parquet_may_be_left_after_the_load() -> None:
     ]
 
 
-def prepared(tmp_path: Path, monkeypatch) -> tuple[SourceLeg, object]:
+class Done:
+    def __init__(self, code: int = 0, said: str = "") -> None:
+        self.returncode, self.stdout, self.stderr = code, said, ""
+
+
+TAKEN = "Error: [RIVET_INIT_CDC_NAME_TAKEN] init: ./cdc/rivet_cdc.ckpt is named by ...; pick another -o name"
+
+
+def prepared(tmp_path: Path, monkeypatch, refuse_second: bool = False, leave: bool = False) -> tuple[SourceLeg, object]:
     stand = laid_out(tmp_path, sources=(MYSQL,))
     leg = SourceLeg(CLOUD, "3.3.2", MYSQL)
 
     def compose(*args, extra_env=None, **kw):
         if "airflow-worker" in args:
             out = Path(str(stand.rivet_dir) + args[-1].removeprefix("/opt/rivet")).parent
+            if refuse_second and out.name.endswith("_shared"):
+                if leave:
+                    (out / "rivet.yaml").write_text(CDC)
+                return Done(5, TAKEN)
             (out / "rivet.yaml").write_text(CDC if "cdc" in args[args.index("--mode") + 1] else BATCH)
+        return Done()
 
     monkeypatch.setattr(stand, "compose", compose)
     monkeypatch.setattr(stand, "psql", lambda *a: "")
@@ -174,9 +191,18 @@ def test_the_hot_dag_runs_the_streams_tasks_on_its_config_and_state(tmp_path: Pa
         "marker": "/opt/rivet/markers/mysql_hot",
     }
     assert leg.texts == {"batch": BATCH, "cdc": CDC}
+    # The second CDC config: init's, in a directory of its own, its DAG in the first stream's state_dir (the DAG file).
+    assert shape["shared"] == {
+        "dag": "gate_src_mysql_cdc_shared",
+        "config": "/opt/rivet/configs/mysql_cdc_shared/rivet.yaml",
+        "stream": {"name": "cdc", "tables": ["gate_customers", "gate_orders"], "dag": "_cdc"},
+    }
+    assert leg.shared_dag == "gate_src_mysql_cdc_shared" and "gate_src_mysql_cdc_shared" not in leg.cycle_tasks()
     dag = (Path(sources.__file__).parent / "stand" / "dags" / "rivet_gate.py").read_text()
     block = dag[dag.index('hot = shape.get("hot")') : dag.index("# Destination legs")]
     assert '"RIVET_TEST_PAUSE_AT": hot["pause"]' in block and 'state_dir=f"{ROOT}/state/{engine}_cdc"' in block
+    shared = dag[dag.index('shared = shape.get("shared")') : dag.index("# Destination legs")]
+    assert 'state_dir=f"{ROOT}/state/{engine}_cdc"' in shared and 'config=shared["config"]' in shared
 
 
 def test_the_rows_each_task_moved_come_from_what_the_gate_did(tmp_path: Path, monkeypatch) -> None:
@@ -222,3 +248,50 @@ def test_the_counted_changes_are_the_ones_the_engine_makes(cycle: str) -> None:
     assert "BETWEEN 31 AND 40" in hot.before and hot.ops_before["gate_orders"] == {"update": 10}
     assert hot.after.count("DELETE") == hot.deleted == hot.ops_after["gate_orders"]["delete"]
     assert hot.column in hot.alter and "NULL" in hot.alter.split(hot.column, 1)[1]
+
+
+def test_init_refusing_the_second_config_leaves_no_dag_and_is_the_cell(tmp_path: Path, monkeypatch) -> None:
+    leg, stand = prepared(tmp_path, monkeypatch, refuse_second=True)
+    # Mutant: a DAG made for a config init refused to write.
+    assert leg.shared_dag == "" and "shared" not in json.loads((stand.rivet_dir / "configs" / "mysql_shape.json").read_text())
+    assert sources.init_refused(leg.shared) == []
+    # Mutant: the exit or the code not compared.
+    assert sources.init_refused({**leg.shared, "exit": 1}) == ["init exited 1, expected 5"]
+    assert sources.init_refused({**leg.shared, "said": "Error: no"})[0].startswith("init's answer does not carry")
+    assert sources.init_refused({**leg.shared, "text": "x"}) == ["init wrote a config although it refused"]
+
+
+def test_a_config_init_left_while_refusing_gets_no_dag(tmp_path: Path, monkeypatch) -> None:
+    # Mutant: the DAG made whenever a file is there, whatever init's exit said.
+    leg, _ = prepared(tmp_path, monkeypatch, refuse_second=True, leave=True)
+    assert leg.shared_dag == "" and sources.init_refused(leg.shared) == ["init wrote a config although it refused"]
+
+
+def refusal(code: str = "RIVET_SOURCE_CDC_CHECKPOINT_SHARED", exit_status: int = 5) -> dict:
+    return {"decision": "fail", "error": {"code": code}, "exit_status": exit_status, "units": []}
+
+
+def test_the_second_configs_run_is_refused_by_code_on_its_first_try() -> None:
+    tasks = {"run": {"state": "failed", "try_number": 1}, "load.gate_orders": {"state": "upstream_failed"}}
+    assert sources.shared_refused(tasks, refusal()) == []
+    # Mutant: the code not compared (any failure passes, e.g. a lease refusal or a source error).
+    assert sources.shared_refused(tasks, refusal("RIVET_STATE_RUN_IN_PROGRESS"))[0].startswith("decision, code, exit")
+    assert sources.shared_refused(tasks, refusal(exit_status=1))[0].startswith("decision, code, exit")
+    # Mutant: the try not checked (a refusal Airflow retried passes).
+    assert sources.shared_refused({**tasks, "run": {"state": "failed", "try_number": 3}}, refusal()) == [
+        "run task try 3: a refusal is never retried by Airflow"
+    ]
+    # Mutant: the state not checked (a run that read the other stream's position passes).
+    ok = {"run": {"state": "success", "try_number": 1}, "load.gate_orders": {"state": "success"}}
+    assert len(sources.shared_refused(ok, None)) == 3
+
+
+def test_the_two_configs_must_name_one_checkpoint_for_the_cell_to_mean_anything() -> None:
+    assert sources.checkpoint_of(CDC) == "./cdc/cdc.ckpt" and sources.same_checkpoint(CDC, CDC) == []
+    other = CDC.replace("./cdc/cdc.ckpt", "./cdc/other_cdc.ckpt")
+    # Mutant: `a != b` dropped (two configs on different files graded as sharing one).
+    assert sources.same_checkpoint(CDC, other)[0].startswith("the first config's checkpoint is './cdc/cdc.ckpt'")
+    # An absolute checkpoint is one file wherever the copy sits, but then init chose it, not the state_dir.
+    absolute = CDC.replace("./cdc/cdc.ckpt", "/data/cdc.ckpt")
+    assert sources.same_checkpoint(absolute, absolute) != []
+    assert sources.same_checkpoint(CDC, None) != []

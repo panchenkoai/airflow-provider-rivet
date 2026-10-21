@@ -142,6 +142,19 @@ for engine in filter(None, os.environ.get("GATE_SOURCES", "").split(",")):
             operator_kwargs=hot_kwargs,
             tags=["rivet", "gate", "source", engine],
         )
+    # A second CDC config init wrote in a directory of its own, run in the first stream's state_dir: its copy there
+    # names the same checkpoint file, which another config owns (rivet #664 refuses the run by code).
+    shared = shape.get("shared")
+    if shared:
+        globals()[shared["dag"]] = build_cdc_dag(
+            shared["dag"],
+            config=shared["config"],
+            export=shared["stream"]["name"],
+            tables=shared["stream"]["tables"],
+            state_dir=f"{ROOT}/state/{engine}_cdc",
+            operator_kwargs=leg_kwargs(engine, "cdc"),
+            tags=["rivet", "gate", "source", engine],
+        )
 
 
 # Destination legs (gate/destinations.py): the postgres scenario to S3 (MinIO in the stack), extract-only and loaded
