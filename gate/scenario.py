@@ -365,7 +365,7 @@ def play(
         [d for mig in mig_legs for d in mig.dags]
         + DAGS
         + (leg.dags if leg else [])
-        + [d for src in src_legs for d in [*src.dags, *filter(None, [src.hot_dag, src.shared_dag])]]
+        + [d for src in src_legs for d in [*src.dags, *filter(None, [src.hot_dag, src.shared_dag, src.overlap_dag])]]
         + [d for x in dest_legs for d in [*x.dags, *x.probe_dags]]
     )
     files: set[str] = set()
@@ -380,6 +380,8 @@ def play(
             src.hot_phase(stand, v, wait_runs, grade_runs)
         if src.engine.shared is not None and src.shared:
             src.shared_phase(stand, v, wait_runs, grade_runs)
+        if src.engine.overlap is not None and src.overlap_dag:
+            src.overlap_phase(stand, v, wait_runs)
         if src.engine.recreate is not None:
             src.recreate_phase(stand, v, wait_runs)
         if src.engine.git_sync is not None:

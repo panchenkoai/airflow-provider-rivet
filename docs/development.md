@@ -205,6 +205,12 @@ and requires the first stream run through `repo/` to succeed. Before the git-syn
 after-worker-recreate` runs `docker compose up -d --force-recreate airflow-worker` (under Celery the tasks run only in
 the worker; the `state_dir` is the bind mount `<stack>/rivet:/opt/rivet`, so it outlives the container), makes seven
 changes and requires the stream's next run to move exactly those (no gap, no duplicate) and its base to equal the source.
+Before that, two overlapping runs of the stream: the hot DAG's run held inside rivet (its 45 s pause after it opened)
+and a run of `gate_src_mysql_cdc_second` (the same config and state_dir, `lock_wait` 30 s, one retry after 60 s)
+started beside it. `overlap/mysql/cdc/second-run-busy`: the held run goes through, the second's first try ends on a busy
+code (`RIVET_AIRFLOW_EXPORT_BUSY`, the provider's export lock, or rivet's `RIVET_STATE_RUN_IN_PROGRESS` /
+`RIVET_STATE_LOCK_TIMEOUT`, read from that try's task log) and its retry goes through, and the two moved each change once;
+`overlap/mysql/cdc/current-equals-source`: BigQuery equals the source value by value.
 
 **The client stack.** `--state compose-postgres` keeps the source legs' state where the client does: in a database of
 its own (`rivet_state_<engine>_<kind>`), owned by a role of its own (`rivet_state`, LOGIN, its own password), on the

@@ -127,6 +127,8 @@ class Engine:
     git_sync: tuple[str, dict[str, dict[str, int]]] | None = None
     #: After the worker container is recreated: these changes (with their events) must reach the stream intact.
     recreate: tuple[str, dict[str, dict[str, int]]] | None = None
+    #: Two overlapping runs of the stream (one held inside rivet, one started beside it): these changes, once.
+    overlap: tuple[str, dict[str, dict[str, int]]] | None = None
 
     @property
     def service(self) -> str:
@@ -228,6 +230,10 @@ DELETE FROM gate_orders WHERE id = 100;
     ),
     shared=("UPDATE gate_customers SET tier = 'gold' WHERE id <= 3;", {"gate_customers": {"update": 3}, "gate_orders": {}}),
     git_sync=("UPDATE gate_customers SET tier = 'synced' WHERE id BETWEEN 4 AND 6;", {"gate_customers": {"update": 3}}),
+    overlap=(
+        "UPDATE gate_customers SET tier = 'overlap' WHERE id IN (12, 13);\nDELETE FROM gate_orders WHERE id = 103;",
+        {"gate_customers": {"update": 2}, "gate_orders": {"delete": 1}},
+    ),
     recreate=(
         "UPDATE gate_orders SET status = 'recreated' WHERE id BETWEEN 51 AND 55;\n"
         "INSERT INTO gate_orders (customer_id, amount, status, note) VALUES (3, 1.23, 'new', 'після');\n"
@@ -552,6 +558,8 @@ class SourceLeg:
         self.high_water: dict[str, Any] = {}
         #: The DAG of the stream whose run pauses after it opened (the hot ALTER), when the engine has one.
         self.hot_dag = ""
+        #: The DAG of the second of two overlapping stream runs.
+        self.overlap_dag = ""
         #: The config copy a previous provider left in the stream's state_dir (git-sync leg), placed before the cycles.
         self.stale_copy: Path | None = None
         #: The second CDC config on the first stream's checkpoint: init's answer, and its DAG when init wrote it.
@@ -669,6 +677,12 @@ class SourceLeg:
                 "pause": f"cdc_after_open:{self.engine.hot.pause_ms}",
                 "marker": f"/opt/rivet/markers/{self.engine.name}_hot",
             }
+            if self.engine.overlap is not None:
+                # The second of two overlapping runs: the stream's config and state, a short wait for the export lock,
+                # one retry a minute later (the hot DAG's run, held inside rivet, is the first).
+                self.overlap_dag = f"{prefix}{stream['dag']}_second"
+                self.tasks[self.overlap_dag] = self.tasks[prefix + stream["dag"]]
+                self.shape["overlap"] = {"dag": self.overlap_dag, "stream": stream, "lock_wait": OVERLAP_LOCK_WAIT}
             if self.engine.shared is not None:
                 self.prepare_shared(stand, f"{prefix}_cdc_shared")
         if self.engine.git_sync is not None:
@@ -1059,6 +1073,66 @@ class SourceLeg:
             tables[db] = _rows(stand.metastore_sql(db, USER_TABLES))
         return owners, tables, _rows(stand.metastore_sql(METASTORE_DB, USER_TABLES)), COMPOSE_STATE_ROLE
 
+    def overlap_phase(self, stand: Any, v: Any, wait_runs: Callable[..., dict[str, str]]) -> None:
+        """Two runs of the stream at once: the hot DAG's run, held inside rivet after it opened (its pause), and a run of
+        the second DAG started beside it (`lock_wait` 30 s, one retry after 60 s). One goes through, the other ends its
+        first try busy (retryable) and its retry goes through; BigQuery then equals the source."""
+        assert self.engine.overlap is not None and self.engine.hot is not None
+        name, eng, hot = "overlap", self.engine.name, self.engine.hot
+        changes, ops = self.engine.overlap
+        self.sql(stand, changes)
+        marker = stand.rivet_dir / "markers" / f"{eng}_hot"
+        marker.unlink(missing_ok=True)
+        held_id, second_id = f"gate_{eng}_overlap_held", f"gate_{eng}_overlap_second"
+        stand.trigger(self.hot_dag, held_id)
+        opened = wait_marker(marker)
+        if opened is not None:
+            stand.trigger(self.overlap_dag, second_id)
+        held = wait_runs(stand, [self.hot_dag], held_id, timeout=900).get(self.hot_dag)
+        second = (
+            wait_runs(stand, [self.overlap_dag], second_id, timeout=900).get(self.overlap_dag)
+            if opened is not None
+            else "not started"
+        )
+        tries = (
+            v.guard(f"{name}/{eng}/cdc/tries", stand.tries, self.overlap_dag, second_id, "run") or []
+            if opened is not None
+            else []
+        )
+        first = task_log(stand, self.overlap_dag, second_id, "run", attempt=1)
+        codes = codes_in(first)
+        moved = 0
+        for dag, run_id in ((self.hot_dag, held_id), (self.overlap_dag, second_id)):
+            try:
+                moved += unit_rows(stand.xcom(dag, run_id, "run")) or 0
+            except Exception as exc:  # no XCom: the count says so
+                print(f"OVERLAP no XCom of {dag} {run_id}: {exc}", flush=True)
+        print(f"OVERLAP held {held}, second {second}, tries {[t.get('state') for t in tries]}, first-try codes {codes}; "
+              f"first try headline: {headline(first)}", flush=True)  # fmt: skip
+        events = sum(n for per in ops.values() for n in per.values())
+        v.check(
+            f"{name}/{eng}/cdc/second-run-busy",
+            overlap_problems,
+            held,
+            second,
+            tries,
+            codes,
+            moved,
+            events,
+            ok=f"first try {[c for c in codes if c in BUSY_CODES][:1]}, retried; {events} change(s) moved once",
+        )
+        source = v.guard(f"{name}/{eng}/source", self.source_rows, stand, {hot.table: [hot.column]})
+        if source is None:
+            return
+        cols = {t: [*c, *([hot.column] if t == hot.table else [])] for t, c in self.engine.tables.items()}
+        v.check(
+            f"{name}/{eng}/cdc/current-equals-source",
+            lambda: stream_equals_source(
+                {t: self.read("cdc", self.targets["cdc"][t]) for t in self.engine.tables}, source, cols, self.engine.key
+            ),
+            ok=", ".join(f"{t} {len(r)} row(s)" for t, r in sorted(source.items())),
+        )
+
     def recreate_phase(self, stand: Any, v: Any, wait_runs: Callable[..., dict[str, str]]) -> None:
         """The worker container is recreated (`docker compose up -d --force-recreate airflow-worker`; under Celery the
         tasks run only there). The state_dir is the bind mount `<stack>/rivet:/opt/rivet`, so it outlives the container;
@@ -1155,6 +1229,9 @@ def git_sync_layout(root: Path, text: str, name: str = "rivet.yaml") -> str:
     (root / "repo").symlink_to("rev-A")
     return f"/opt/rivet/{root.relative_to(root.parents[1])}/repo/{name}"
 
+
+#: The second overlapping run's wait for the provider's export lock: shorter than the held run's pause.
+OVERLAP_LOCK_WAIT = 30
 
 USER_TABLES = (
     "SELECT tablename, tableowner FROM pg_tables WHERE schemaname NOT IN ('pg_catalog', 'information_schema') ORDER BY 1;"
@@ -1316,11 +1393,45 @@ def wait_marker(path: Any, timeout: float = 300) -> float | None:
     return time.monotonic()
 
 
-def task_log(stand: Any, dag: str, run_id: str, task: str) -> str | None:
-    """The newest attempt's log of one task instance (`dag_id=/run_id=/task_id=/attempt=N.log`), or None."""
+def task_log(stand: Any, dag: str, run_id: str, task: str, attempt: int | None = None) -> str | None:
+    """The log of one try of a task instance (`dag_id=/run_id=/task_id=/attempt=N.log`), the newest by default; None."""
     root = Path(stand.dir) / "logs" / f"dag_id={dag}" / f"run_id={run_id}" / f"task_id={task}"
     found = sorted(root.glob("attempt=*.log"), key=lambda p: int(re.sub(r"\D", "", p.stem) or 0))
+    if attempt is not None:
+        found = [p for p in found if p.name == f"attempt={attempt}.log"]
     return found[-1].read_text(errors="replace") if found else None
+
+
+#: What the second of two overlapping runs of one export may end on, retryable: the provider's own export lock after
+#: `lock_wait`, or, once inside rivet, its run lease (rivet's `--lock-wait`).
+BUSY_CODES = ("RIVET_AIRFLOW_EXPORT_BUSY", "RIVET_STATE_RUN_IN_PROGRESS", "RIVET_STATE_LOCK_TIMEOUT")
+
+
+def codes_in(text: str | None) -> list[str]:
+    """The `[RIVET_…]` codes a task log names, in order."""
+    return re.findall(r"\[(RIVET_[A-Z0-9_]+)\]", text or "")
+
+
+def overlap_problems(
+    held: str | None, second: str | None, tries: list[dict[str, Any]], first_try_codes: list[str], moved: int | None, events: int
+) -> list[str]:
+    """The held run went through; the run started beside it ended its first try busy (a retryable code, no other), was
+    retried and then went through; together they moved each change once."""
+    problems = [] if held == "success" else [f"the held run {held}"]
+    if second != "success":
+        problems.append(f"the second run {second}")
+    states = [t.get("state") for t in tries]
+    if len(tries) < 2 or states[0] == "success":
+        problems.append(f"the second run's `run` tries {states}: its first try must end busy and be retried")
+    busy = [c for c in first_try_codes if c in BUSY_CODES]
+    if not busy:
+        problems.append(f"its first try names no busy code ({first_try_codes or 'none'}), expected one of {list(BUSY_CODES)}")
+    others = sorted(set(first_try_codes) - set(BUSY_CODES))
+    if others:
+        problems.append(f"its first try names other codes {others}")
+    if moved != events:
+        problems.append(f"the two runs moved {moved} row(s) together, the source changed {events}")
+    return problems
 
 
 def stderr_tail(stand: Any, payload: dict[str, Any], lines: int = 40) -> str:

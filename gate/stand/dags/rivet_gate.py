@@ -144,6 +144,22 @@ for engine in filter(None, os.environ.get("GATE_SOURCES", "").split(",")):
             operator_kwargs=hot_kwargs,
             tags=["rivet", "gate", "source", engine],
         )
+    # The second of two overlapping runs of the stream (the hot DAG's held run is the first): a short wait for the
+    # provider's export lock, then one retry a minute later.
+    overlap = shape.get("overlap")
+    if overlap:
+        from datetime import timedelta
+
+        globals()[overlap["dag"]] = build_cdc_dag(
+            overlap["dag"],
+            config=cdc_config,
+            export=overlap["stream"]["name"],
+            tables=overlap["stream"]["tables"],
+            state_dir=f"{ROOT}/state/{engine}_cdc",
+            operator_kwargs={**leg_kwargs(engine, "cdc"), "lock_wait": overlap["lock_wait"]},
+            default_args={"retries": 1, "retry_delay": timedelta(seconds=60)},
+            tags=["rivet", "gate", "source", engine],
+        )
     # A second CDC config init wrote in a directory of its own, run in the first stream's state_dir: its copy there
     # names the same checkpoint file, which another config owns (rivet #664 refuses the run by code).
     shared = shape.get("shared")

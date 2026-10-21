@@ -91,3 +91,55 @@ def test_mysql_carries_the_recreate_changes_it_counts() -> None:
     assert sql.count("BETWEEN 51 AND 55") == 1 and ops["gate_orders"]["update"] == 5
     assert sql.count("INSERT") == ops["gate_orders"]["insert"] and sql.count("DELETE") == ops["gate_orders"]["delete"]
     assert sources.recreated is recreated
+
+
+# --- Two overlapping runs of one stream ---------------------------------------------------------------------------------
+
+BUSY_LOG = (
+    "[2026-10-21, 22:00:31 UTC] {tasklog.py:90} WARNING - rivet run cdc → BUSY [RIVET_AIRFLOW_EXPORT_BUSY]: the lock of "
+    "cdc stayed held for 30 s; rivet was not started, Airflow retries it (try 1 of 2)\n"
+)
+TRIES = [{"try_number": 1, "state": "up_for_retry"}, {"try_number": 2, "state": "success"}]
+
+
+def test_the_second_run_ends_its_first_try_busy_and_its_retry_goes_through() -> None:
+    codes = sources.codes_in(BUSY_LOG)
+    assert codes == ["RIVET_AIRFLOW_EXPORT_BUSY"]
+    assert sources.overlap_problems("success", "success", TRIES, codes, 3, 3) == []
+    # Rivet's own run lease, reached when the provider's lock is not the one held, is as good.
+    assert sources.overlap_problems("success", "success", TRIES, ["RIVET_STATE_RUN_IN_PROGRESS"], 3, 3) == []
+    # Mutant: the first try's code not read (a run that failed for another cause passes).
+    assert sources.overlap_problems("success", "success", TRIES, ["RIVET_SOURCE_CDC_CHECKPOINT_SHARED"], 3, 3) == [
+        "its first try names no busy code (['RIVET_SOURCE_CDC_CHECKPOINT_SHARED']), expected one of "
+        "['RIVET_AIRFLOW_EXPORT_BUSY', 'RIVET_STATE_RUN_IN_PROGRESS', 'RIVET_STATE_LOCK_TIMEOUT']",
+        "its first try names other codes ['RIVET_SOURCE_CDC_CHECKPOINT_SHARED']",
+    ]
+    # Mutant: the tries not read (two runs that both went through at once, no overlap, pass).
+    assert sources.overlap_problems("success", "success", [{"state": "success"}], codes, 3, 3) == [
+        "its second run's `run` tries ['success']: its first try must end busy and be retried".replace("its second", "the second")
+    ]
+    # Mutant: the rows not summed over both runs (a change moved twice, or by neither).
+    assert sources.overlap_problems("success", "success", TRIES, codes, 6, 3) == [
+        "the two runs moved 6 row(s) together, the source changed 3"
+    ]
+    assert sources.overlap_problems("failed", "success", TRIES, codes, 3, 3) == ["the held run failed"]
+
+
+def test_the_second_dag_waits_briefly_and_retries_once() -> None:
+    dag = (Path(sources.__file__).parent / "stand" / "dags" / "rivet_gate.py").read_text()
+    block = dag[dag.index('overlap = shape.get("overlap")') : dag.index("# A second CDC config")]
+    # Mutant: the default lock_wait (600 s: the held run ends first and nothing is busy) or no retry.
+    assert '"lock_wait": overlap["lock_wait"]' in block and '"retries": 1' in block
+    assert 0 < sources.OVERLAP_LOCK_WAIT < MYSQL.hot.pause_ms / 1000, "the wait must end inside the held run's pause"
+
+
+def test_a_try_log_is_read_by_its_number(tmp_path: Path) -> None:
+    stand = type("S", (), {"dir": tmp_path})()
+    root = tmp_path / "logs" / "dag_id=d" / "run_id=r" / "task_id=run"
+    root.mkdir(parents=True)
+    (root / "attempt=1.log").write_text("first")
+    (root / "attempt=2.log").write_text("second")
+    # Mutant: the attempt ignored (the retry's log read for the first try's code).
+    assert sources.task_log(stand, "d", "r", "run", attempt=1) == "first"
+    assert sources.task_log(stand, "d", "r", "run") == "second"
+    assert sources.task_log(stand, "d", "r", "run", attempt=3) is None
