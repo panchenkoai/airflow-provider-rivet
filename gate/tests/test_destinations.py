@@ -68,10 +68,23 @@ def test_init_gets_the_bucket_and_region_and_no_url_and_clickhouse_only_for_the_
         assert ("--clickhouse-url" in argv) == bool(cfg.clickhouse_db), kind
         assert not [a for a in argv if "://" in a and "clickhouse" not in a], "no source URL on init's command line"
         assert argv[argv.index("--include") + 1 : argv.index("-o")] == TABLES
-    # The extract-only half and the load half read different servers: init's slot `rivet_public_cdc` is one per server.
-    assert CONFIGS["cdc"].service != CONFIGS["ch_cdc"].service
+    # The extract-only half and the load half read one server: init names each slot after the `-o` file's stem (rivet
+    # #639), so each config is written to a file of its own name. Mutant: one file name for every config (one slot).
+    assert CONFIGS["cdc"].service == CONFIGS["ch_cdc"].service == "gate-source"
+    stems = {Path(destinations.config_path(k)).stem for k in CONFIGS}
+    assert len(stems) == len(CONFIGS) and destinations.config_path("ch_cdc") == "/opt/rivet/configs/s3_ch_cdc/s3_ch_cdc.yaml"
     assert len({c.bucket for c in CONFIGS.values()}) == len(CONFIGS)
     assert len({c.clickhouse_db for c in CONFIGS.values() if c.clickhouse_db}) == 3
+
+
+def test_the_cdc_parts_are_read_under_the_prefix_init_wrote() -> None:
+    # rivet 0.32.1: `cdc/`; rivet #664: `<stem>/cdc/`. Mutant: the root read as a fixed "" (the parts of a #664 config
+    # are not found, so every CDC cell grades nothing).
+    assert destinations.cdc_root((FIXTURES / "init_s3_cdc_0.32.1.yaml").read_text()) == ""
+    text = (FIXTURES / "init_s3_cdc_0.32.1.yaml").read_text().replace("prefix: cdc/", "prefix: s3_cdc/cdc/")
+    assert destinations.cdc_root(text) == "s3_cdc/"
+    with pytest.raises(ValueError, match="ending in `cdc/`"):
+        destinations.cdc_root(text.replace("prefix: s3_cdc/cdc/", "prefix: changes/"))
 
 
 # --- The stand -----------------------------------------------------------------------------------------------------------
@@ -82,7 +95,7 @@ def test_the_stand_runs_minio_and_hands_rivet_its_endpoint_through_an_aws_connec
     overlay = yaml.load((stand.dir / "docker-compose.gate.yaml").read_text(), Loader=Loader)
     minio = overlay["services"]["gate-minio"]
     assert minio["environment"]["MINIO_ROOT_PASSWORD"] == stand.secrets.minio
-    assert overlay["services"]["gate-source-s3"]["environment"]["POSTGRES_PASSWORD"] == stand.secrets.source_s3
+    assert "gate-source-s3" not in overlay["services"], "one postgres source: init names each CDC slot after -o"
     worker = compose_view(stand)["airflow-worker"]["environment"]
     s3 = json.loads(worker["AIRFLOW_CONN_RIVET_GATE_S3"])
     assert s3["conn_type"] == "aws" and s3["password"] == stand.secrets.minio
@@ -170,7 +183,7 @@ def snapshot_and_batch(con, root: Path) -> dict[tuple[str, str], int]:
         reported[("gate_s3_batch", f"apply.{t}")] = put(
             con, root / "gate-s3-batch" / "exports" / t / "run1" / "part-0.parquet", f"SELECT * FROM src.public.{t}"
         )
-        put(con, root / "gate-s3-cdc" / "cdc" / t / "snapshot" / "part-0.parquet", f"SELECT * FROM src.public.{t}")
+        put(con, root / "gate-s3-cdc" / CDC_ROOT / "cdc" / t / "snapshot" / "part-0.parquet", f"SELECT * FROM src.public.{t}")
     reported[("gate_s3_cdc", "run")] = sum(con.execute(f"SELECT count(*) FROM src.public.{t}").fetchone()[0] for t in TABLES)
     return reported
 
@@ -199,13 +212,18 @@ OPS = {"gate_customers": {}, "gate_orders": {"insert": 1, "update": 1, "delete":
 def delta(con, root: Path, batch_sql: str = DELTA, events: str = GOOD_EVENTS) -> dict[tuple[str, str], int]:
     """The delta cycle's parts: the new orders rows in the batch bucket, their events in the stream's."""
     n = put(con, root / "gate-s3-batch" / "exports" / "gate_orders" / "run2" / "part-0.parquet", batch_sql)
-    e = put(con, root / "gate-s3-cdc" / "cdc" / "gate_orders" / "part-1.parquet", EVENTS.replace("{rows}", events))
+    e = put(con, root / "gate-s3-cdc" / CDC_ROOT / "cdc" / "gate_orders" / "part-1.parquet", EVENTS.replace("{rows}", events))
     return {("gate_s3_batch", "apply.gate_orders"): n, ("gate_s3_cdc", "run"): e}
+
+
+#: Where init puts a CDC config's `cdc/` since rivet #664: under its `-o` stem.
+CDC_ROOT = "s3_cdc/"
 
 
 def leg_on(root: Path) -> S3Leg:
     leg = S3Leg()
     leg.root = lambda bucket: f"{root}/{bucket}/"  # type: ignore[method-assign]
+    leg.shape = {"cdc": {"cdc_root": CDC_ROOT}}
     return leg
 
 
@@ -313,7 +331,7 @@ def grade_clickhouse(monkeypatch, rows: dict) -> dict[str, str]:
     monkeypatch.setattr(S3Leg, "source_rows", lambda self, dsn: copy.deepcopy(SOURCE))
     monkeypatch.setattr(S3Leg, "read_clickhouse", lambda self, stand, db, t: copy.deepcopy(rows[(db, t)]))
     v = Verdicts("3.3.2")
-    S3Leg().grade_clickhouse(SimpleNamespace(), v, "delta")
+    S3Leg().grade_clickhouse(SimpleNamespace(source_dsn=""), v, "delta")
     assert len(v.rows) == 4
     return {r["cell"]: r["detail"] for r in v.rows if r["status"] == "FAIL"}
 

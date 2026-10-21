@@ -302,8 +302,6 @@ def run_cycle(
         stand.psql("gate-source", "rivet", changes)
         for src in src_legs:
             src.apply_changes(stand)
-        for dest in dest_legs:
-            dest.apply_changes(stand, changes)
     dags = DAGS + (leg.dags if leg else []) + [d for src in src_legs for d in src.dags] + [d for x in dest_legs for d in x.dags]
     states = trigger_cycle(stand, v, name, run_id, dags)
     files_after = parquet(stand.rivet_dir / "out")

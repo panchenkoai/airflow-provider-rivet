@@ -123,7 +123,7 @@ def test_the_cleanup_config_is_inits_own_on_a_database_of_its_own() -> None:
     argv = destinations.init_argv(cfg, "/o.yaml")
     assert argv[argv.index("--s3-bucket") + 1] == cfg.bucket and "--clickhouse-url" in argv
     leg = destinations.S3Leg()
-    assert leg.connections(SimpleNamespace(minio="m", source_s3="p", clickhouse="c"))[cfg.source_conn]["schema"] == cfg.database
+    assert leg.connections(SimpleNamespace(minio="m", source="p", clickhouse="c"))[cfg.source_conn]["schema"] == cfg.database
     assert set(cleanup.dags(destinations.TABLES)) <= set(leg.probe_dags)
     assert cleanup.shape()["cleanup"]["pause"]["export"] == LIVE != FIRST
 
@@ -265,7 +265,7 @@ def play(tmp_path: Path, monkeypatch, breaks: str = "", graded: list[str] | None
         columns={t: ["id", "v"] for t in (FIRST, LIVE)},
         cleanup_bucket="gate-s3-cleanup",
         cleanup_db="gate_s3_cleanup",
-        cleanup_service="gate-source-s3",
+        cleanup_service="gate-source",
         cleanup_state_db="rivet_state_s3_cleanup",
         cleanup_source_dsn="",
     )
