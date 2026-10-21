@@ -254,6 +254,31 @@ def test_a_state_database_left_beside_the_original_config_is_refused_until_it_is
     assert payload["decision"] == "success"
 
 
+def test_inits_checkpoint_and_its_owner_record_are_held_to_the_state_directory(rig: Rig) -> None:
+    """rivet 0.32.2 (#664): `init -o <stem>.yaml --mode cdc` writes `./cdc/<stem>_<name>.ckpt`, and the first CDC run
+    records its owner beside it as `<checkpoint>.owner`. A checkpoint left under the original's `cdc/` is refused as
+    before; the owner record alone is not a checkpoint, is never refused and is never removed by a task."""
+    ckpt = "./cdc/pg_orders_cdc.ckpt"
+    rig.config.write_text(
+        rig.config.read_text().replace("    mode: cdc\n", f"    mode: cdc\n    cdc:\n      checkpoint: {ckpt}\n")
+    )
+    beside = rig.config_dir / "cdc"
+    beside.mkdir()
+    (beside / "pg_orders_cdc.ckpt").write_text("lsn")
+    (beside / "pg_orders_cdc.ckpt.owner").write_text('{"config": "x", "export": "orders_cdc"}')
+    assert refused(rig, rig.operator(RivetCdcRunOperator, export="orders_cdc")) == "RIVET_AIRFLOW_CHECKPOINT_BESIDE_CONFIG"
+    assert str(rig.state_dir / ckpt) in rig.events("rivet.refused")[-1]["text"]
+    (rig.state_dir / "cdc").mkdir()
+    (beside / "pg_orders_cdc.ckpt").rename(rig.state_dir / "cdc" / "pg_orders_cdc.ckpt")
+    (rig.state_dir / "cdc" / "pg_orders_cdc.ckpt.owner").write_text("the copy's claim")
+    for _cycle in (1, 2):
+        payload, _ = rig.run(rig.operator(RivetCdcRunOperator, export="orders_cdc"))
+        assert payload["decision"] == "success", "an owner record left beside the original is not a checkpoint"
+    assert rig.argv("run")[2] == str(rig.copy()), "the checkpoint resolves beside the copy, in the state directory"
+    assert (beside / "pg_orders_cdc.ckpt.owner").exists()
+    assert (rig.state_dir / "cdc" / "pg_orders_cdc.ckpt.owner").read_text() == "the copy's claim"
+
+
 def test_a_cdc_checkpoint_left_beside_the_original_config_is_refused_until_it_is_moved(rig: Rig) -> None:
     rig.config.write_text(
         rig.config.read_text().replace("    mode: cdc\n", "    mode: cdc\n    cdc:\n      checkpoint: ckpt/orders.ckpt\n")

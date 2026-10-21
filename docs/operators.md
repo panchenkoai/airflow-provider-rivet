@@ -127,7 +127,9 @@ A task that waited for the export's lock says so when it takes it (``took the lo
 - The headline's outcome is `OK`, `SKIPPED` (nothing to do: rivet's `skip_reason`, or an earlier
   try already applied the plan), `REFUSED` (class `refusal`, or a preflight refusal before rivet
   started), `FAILED` (with its class), `CRASHED` (a signal or a 129-255 exit), `STOPPED` (Airflow
-  stopped the task) or `BUSY` (the export's lock stayed held). A final failure says `final` and is
+  stopped the task) or `BUSY` (the export's lock stayed held, or rivet's own lease of the export or
+  table was held by another rivet: `RIVET_STATE_LOCK_TIMEOUT`, `RIVET_STATE_RUN_IN_PROGRESS`,
+  `RIVET_LOAD_TABLE_BUSY`; retried). A final failure says `final` and is
   an ERROR line; one Airflow retries says `retryable, Airflow retries it (try N of M)` and is a
   WARNING line. The registry `action` follows when rivet printed one.
 - `note` lines are INFO, except what you must act on: a `notifications:` block rivet will send

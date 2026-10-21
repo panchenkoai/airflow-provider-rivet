@@ -18,7 +18,13 @@ from airflow.exceptions import AirflowException, AirflowFailException
 from conftest import NEW_FLAGS, FakeTI, Rig
 
 from airflow_provider_rivet import invocation
-from airflow_provider_rivet.operators import RivetApplyOperator, RivetLoadOperator, RivetRunOperator
+from airflow_provider_rivet.operators import (
+    RivetApplyOperator,
+    RivetCdcRunOperator,
+    RivetCompactOperator,
+    RivetLoadOperator,
+    RivetRunOperator,
+)
 
 FULL = {"per_export": [{"export_name": "orders", "status": "success", "mode": "full", "rows": 7, "files": 2}]}
 INCREMENTAL = {"per_export": [{"export_name": "users", "status": "success", "mode": "incremental", "rows": 3, "files": 1}]}
@@ -283,6 +289,7 @@ def test_g2_the_lock_is_released_by_an_explicit_unlock_not_by_close(rig: Rig) ->
         ("RIVET_STATE_RUN_IN_PROGRESS", RivetRunOperator, {"export": "users"}),
         ("RIVET_STATE_RUN_IN_PROGRESS", RivetApplyOperator, {"export": "users"}),
         ("RIVET_LOAD_TABLE_BUSY", RivetLoadOperator, {"export": "users", "table": "users"}),
+        ("RIVET_STATE_LOCK_TIMEOUT", RivetCompactOperator, {"export": "users", "table": "users"}),
     ],
 )
 def test_g2c_rivets_busy_refusals_are_retried(rig: Rig, code: str, command: type, kwargs: dict, contract: bool) -> None:
@@ -324,3 +331,39 @@ def test_g2_a_child_whose_task_process_already_died_stops_whatever_sigterm_handl
         os._exit(0 if os.waitstatus_to_exitcode(status) == -signal.SIGKILL else 1)
     _, status = os.waitpid(child, 0)
     assert os.waitstatus_to_exitcode(status) == 0, "the orphaned child survived its own stop"
+
+
+# Each code as rivet main prints it on its `--json-errors` line (src/error.rs: the kind is the code's own, the class and
+# exit come from its kind); the provider decides by that object, so no table of codes is needed beside BUSY_CODES.
+NEW_CODES = [
+    # `--lock-wait` ran out on an export's run lease or a table's load lease (#662): retried, like the provider's own
+    # RIVET_AIRFLOW_EXPORT_BUSY, and the exception names the export
+    ("RIVET_STATE_LOCK_TIMEOUT", "busy", "retryable", 2, True, RivetLoadOperator, AirflowException),
+    # load / compact on a config without `load:` (#666): a config mistake, never retried
+    ("RIVET_LOAD_BLOCK_MISSING", "usage", "generic", 1, False, RivetLoadOperator, AirflowFailException),
+    # a CDC run on a checkpoint another config owns (#664): a refusal, never retried
+    ("RIVET_SOURCE_CDC_CHECKPOINT_SHARED", "refusal", "refusal", 5, False, RivetCdcRunOperator, AirflowFailException),
+    # `rivet init` only; a task never runs init, the row pins the class should a wrapper surface it
+    ("RIVET_INIT_CDC_NAME_TAKEN", "refusal", "refusal", 5, False, RivetRunOperator, AirflowFailException),
+]
+
+
+@pytest.mark.parametrize(
+    ("code", "kind", "class_", "exit_code", "retryable", "command", "raised"),
+    NEW_CODES,
+    ids=[c[0] for c in NEW_CODES],
+)
+def test_rivet_0322_codes_end_the_task_by_their_printed_class(
+    rig: Rig, code: str, kind: str, class_: str, exit_code: int, retryable: bool, command: type, raised: type
+) -> None:
+    line = {"error": "x", "exit_class": exit_code, "code": code, "kind": kind, "class": class_}
+    line |= {"exit_code": exit_code, "retryable": retryable, "action": "the registry's remedy"}
+    export = "orders_cdc" if command is RivetCdcRunOperator else "users"
+    kwargs = {"table": "users"} if command is RivetLoadOperator else {}
+    sub = "run" if command is RivetCdcRunOperator else command.command  # `cdc_run` is a `rivet run`
+    rig.scenario(flags=NEW_FLAGS, **{sub: {"exit": exit_code, "line": line}})
+    exc, ti = rig.run(rig.operator(command, export=export, **kwargs))
+    assert type(exc) is raised, exc
+    assert str(exc) == f"[{code}] {class_}: the registry's remedy ({export})"
+    payload = ti.store[("task", "return_value")]
+    assert payload["decision"] == ("retry" if retryable else "fail") and payload["error"]["code"] == code

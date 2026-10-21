@@ -452,3 +452,22 @@ def test_the_sqlite_note_comes_from_the_preflights_warning_alone() -> None:
     log, _ = make("run")
     log.record({"event": "rivet.warning", "warning": "other", "text": "watch out"})
     assert render(log, {"decision": "success", "units": [], "degraded": []})[1:] == [(WARNING, "  note     watch out")]
+
+
+def test_a_lease_another_rivet_holds_reads_busy_like_the_packages_own_lock() -> None:
+    """_failure: RIVET_STATE_LOCK_TIMEOUT (rivet's `--lock-wait` ran out) and the lease refusals of rivet 0.32.0 are a
+    wait for another process, not a failure of this one; any other retryable stop stays FAILED."""
+    log, _ = make("load", "orders", "users")
+    error = {"class": "retryable", "code": "RIVET_STATE_LOCK_TIMEOUT", "action": "retry once it ends"}
+    lines = render(log, {"decision": "retry", "error": error, "units": []}, max_tries=1)
+    assert lines[0] == (
+        WARNING,
+        "rivet load orders table users → BUSY [RIVET_STATE_LOCK_TIMEOUT], retryable, Airflow retries it (try 1 of 2), "
+        "action: retry once it ends",
+    )
+    refused = {"class": "refusal", "code": "RIVET_STATE_RUN_IN_PROGRESS"}
+    assert render(log, {"decision": "retry", "error": refused, "units": []}, max_tries=1)[0][1].startswith(
+        "rivet load orders table users → BUSY [RIVET_STATE_RUN_IN_PROGRESS], retryable"
+    )
+    other = {"class": "retryable", "code": "RIVET_SOURCE_CONNECT"}
+    assert "→ FAILED [RIVET_SOURCE_CONNECT], retryable" in render(log, {"decision": "retry", "error": other, "units": []})[0][1]

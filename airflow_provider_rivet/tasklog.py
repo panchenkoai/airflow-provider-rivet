@@ -17,6 +17,7 @@ from typing import Any
 
 from .capabilities import DEGRADATIONS
 from .preflight import SETUP_GUIDE
+from .result import BUSY_CODES
 
 clock = time.monotonic  # replaced by tests, so a golden log has fixed durations
 Write = Callable[[int, str], None]
@@ -250,7 +251,8 @@ class TaskLog:
             if payload.get("crashed_retry"):
                 return retry_level, f"{head} CRASHED: rivet ended by {how}; {retry_text} under the crash budget"
             return logging.ERROR, f"{head} CRASHED: rivet ended by {how}, final: the crash budget is used up"
-        word = STOP_WORD.get(class_, "FAILED")
+        # a lease another rivet holds reads like the package's own busy lock, whichever class rivet printed it with
+        word = "BUSY" if error.get("code") in BUSY_CODES else STOP_WORD.get(class_, "FAILED")
         parts = [word + (f" [{error['code']}]" if error.get("code") else "")]
         if word == "FAILED" and class_ != "retryable":
             parts[0] += f" {class_}"
