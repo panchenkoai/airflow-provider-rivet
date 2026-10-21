@@ -127,6 +127,21 @@ for engine in filter(None, os.environ.get("GATE_SOURCES", "").split(",")):
             operator_kwargs=leg_kwargs(engine, "cdc"),
             tags=["rivet", "gate", "source", engine],
         )
+    # The stream's run that pauses right after it opened, while the gate adds a column to a captured table (run once,
+    # after the cycles; the same config, export and state as the stream's own DAG, never at the same time).
+    hot = shape.get("hot")
+    if hot:
+        hot_kwargs = leg_kwargs(engine, "cdc")
+        hot_kwargs["env"] = {"RIVET_TEST_PAUSE_AT": hot["pause"], "RIVET_TEST_PAUSE_MARKER": hot["marker"]}
+        globals()[hot["dag"]] = build_cdc_dag(
+            hot["dag"],
+            config=f"{ROOT}/configs/{engine}_cdc/rivet.yaml",
+            export=hot["stream"]["name"],
+            tables=hot["stream"]["tables"],
+            state_dir=f"{ROOT}/state/{engine}_cdc",
+            operator_kwargs=hot_kwargs,
+            tags=["rivet", "gate", "source", engine],
+        )
 
 
 # Destination legs (gate/destinations.py): the postgres scenario to S3 (MinIO in the stack), extract-only and loaded

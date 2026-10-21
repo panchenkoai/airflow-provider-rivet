@@ -15,6 +15,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 from typing import Any
 
 import duckdb
@@ -37,6 +38,27 @@ class Limit:
     shape: str
     code: str
     documented: str
+
+
+@dataclass(frozen=True)
+class HotDdl:
+    """A column added to a captured table while a CDC run is open, and the writes on either side of it.
+
+    `before` commits before the run opens (inside its read bound); the run pauses right after it opened
+    (`cdc_after_open`), and inside that window the gate runs `alter` and then `after`, which uses the new column. init's
+    stream is bounded (`until_current: true`): the open run reads only `before`, under the columns it resolves after the
+    pause, and the next run reads `after`. Each `ops_*` is the change events of the scenario's tables."""
+
+    table: str
+    column: str
+    before: str
+    alter: str
+    after: str
+    ops_before: dict[str, dict[str, int]]
+    ops_after: dict[str, dict[str, int]]
+    #: Keys `after` deletes: an incremental extract cannot see them, so the batch target keeps them.
+    deleted: int
+    pause_ms: int = 45000
 
 
 @dataclass(frozen=True)
@@ -87,6 +109,13 @@ class Engine:
     reader: str = ""
     select: dict[str, str] = field(default_factory=dict)
     ready_timeout: float = 300
+    #: The change events each cycle's `changes` make, per table and operation; with it, every rivet task of the leg's
+    #: DAGs has its XCom unit and task log graded against the counts the gate made (not rivet's own report).
+    ops: dict[str, dict[str, dict[str, int]]] = field(default_factory=dict)
+    #: The cursor column of the batch exports (the rows an incremental extract reads are the ones past its high-water).
+    cursor: str = "updated_at"
+    #: A column added mid-stream, after the cycles (the MySQL client stack's schema change).
+    hot: HotDdl | None = None
 
     @property
     def service(self) -> str:
@@ -166,6 +195,26 @@ DELETE FROM gate_orders WHERE id <= 5000 ORDER BY id DESC LIMIT 5;
     },
     duck_type="mysql",
     duck_dsn="host=127.0.0.1 port={port} user=rivet password={password} database=rivet",
+    ops={
+        "delta": {"gate_customers": {"insert": 20, "update": 10}, "gate_orders": {"insert": 100, "update": 30, "delete": 5}},
+    },
+    # A nullable column (MySQL fills no old row, and the binlog carries none), added at the end (ALGORITHM=INSTANT on
+    # 8.4); `after` sets it on old rows, on a row `before` changed, on new rows (one left NULL), and deletes one row.
+    hot=HotDdl(
+        table="gate_orders",
+        column="note",
+        before="UPDATE gate_orders SET status = 'packed' WHERE id BETWEEN 31 AND 40;",
+        alter="ALTER TABLE gate_orders ADD COLUMN note VARCHAR(40) NULL;",
+        after="""
+UPDATE gate_orders SET status = 'held', note = CONCAT('примітка ', id) WHERE id BETWEEN 41 AND 50;
+INSERT INTO gate_orders (customer_id, amount, status, note) VALUES (1, 12.34, 'new', 'нова'), (2, 0.01, 'new', NULL);
+UPDATE gate_orders SET note = 'тільки примітка' WHERE id = 31;
+DELETE FROM gate_orders WHERE id = 100;
+""",
+        ops_before={"gate_customers": {}, "gate_orders": {"update": 10}},
+        ops_after={"gate_customers": {}, "gate_orders": {"update": 11, "insert": 2, "delete": 1}},
+        deleted=1,
+    ),
 )
 MSSQL = Engine(
     name="mssql",
@@ -478,6 +527,12 @@ class SourceLeg:
         self.targets: dict[str, dict[str, str]] = {}
         #: Per kind the engine cannot run: what is wrong with init's answer (empty: the known limit holds).
         self.limits: dict[str, list[str]] = {}
+        #: The configs init wrote, by kind, as written.
+        self.texts: dict[str, str] = {}
+        #: Each table's cursor high-water after the last graded batch run (what the next extract reads past).
+        self.high_water: dict[str, Any] = {}
+        #: The DAG of the stream whose run pauses after it opened (the hot ALTER), when the engine has one.
+        self.hot_dag = ""
         self._bq: Any = None
 
     def _env(self, stand: Any) -> tuple[list[str], dict[str, str]]:
@@ -554,6 +609,7 @@ class SourceLeg:
                 self.limits[kind] = limit_holds(limit, done.returncode, said, text, list(self.engine.tables))
                 continue
             print(f"INIT {self.engine.name} {kind} config:\n{text}", flush=True)
+            self.texts[kind] = text or ""
             self.shape[kind] = read_config(text or "", list(self.engine.tables))
         batch = self.shape.get("batch", {"exports": [], "streams": [], "extra": []})
         cdc = self.shape.get("cdc", {"exports": [], "streams": [], "extra": []})
@@ -576,8 +632,21 @@ class SourceLeg:
         for stream in cdc["streams"]:
             self.tasks[prefix + stream["dag"]] = ["run", *(f"{g}.{t}" for t in stream["tables"] for g in ("load", "compact"))]
         self.dags = list(self.tasks)
+        if self.engine.hot is not None:
+            # The same stream, config and state, in a DAG whose run pauses after it opened (run after the cycles only).
+            if len(cdc["streams"]) != 1:
+                raise ValueError(f"the hot ALTER needs one stream over the tables, init wrote {cdc['streams']}")
+            stream = cdc["streams"][0]
+            self.hot_dag = f"{prefix}{stream['dag']}_hot"
+            self.tasks[self.hot_dag] = self.tasks[prefix + stream["dag"]]
+            self.shape["hot"] = {
+                "dag": self.hot_dag,
+                "stream": stream,
+                "pause": f"cdc_after_open:{self.engine.hot.pause_ms}",
+                "marker": f"/opt/rivet/markers/{self.engine.name}_hot",
+            }
         # A compaction with nothing to merge skips; the `compacted` cell holds every cycle to "no buffer left".
-        self.may_skip = {dag: ("compact.",) for dag in self.dags}
+        self.may_skip = {dag: ("compact.",) for dag in self.tasks}
         # The DAG file reads which exports and stream to build from here (the names are init's, not the gate's).
         (stand.rivet_dir / "configs" / f"{self.engine.name}_shape.json").write_text(json.dumps(self.shape))
 
@@ -639,9 +708,9 @@ class SourceLeg:
             rows = [{**r, "document": None if r.get("document") is None else warehouse_document(r["document"])} for r in rows]
         return rows
 
-    def source_rows(self, stand: Any) -> dict[str, list[dict[str, Any]]]:
+    def source_rows(self, stand: Any, added: dict[str, list[str]] | None = None) -> dict[str, list[dict[str, Any]]]:
         """Every source row, read by a client rivet does not use: DuckDB's scanner, the engine's own SQL client,
-        python-oracledb or pymongo."""
+        python-oracledb or pymongo (`added`: columns beyond the scenario's, per table, through DuckDB)."""
         if self.engine.reader == "oracle":
             return read_oracle(self.engine, stand.host_port(self.engine.service, self.engine.port), stand.secrets.oracle)
         if self.engine.reader == "mongo":
@@ -661,38 +730,187 @@ class SourceLeg:
             con.execute(f"ATTACH '{dsn}' AS src (TYPE {self.engine.duck_type}, READ_ONLY)")
             out = {}
             for table, cols in self.engine.tables.items():
-                cur = con.execute(f"SELECT {', '.join(cols)} FROM src.{table}")
+                cur = con.execute(f"SELECT {', '.join([*cols, *(added or {}).get(table, [])])} FROM src.{table}")
                 names = [d[0] for d in cur.description]
                 out[table] = [dict(zip(names, row, strict=True)) for row in cur.fetchall()]
             return out
         finally:
             con.close()
 
-    def grade(self, stand: Any, v: Any, name: str) -> None:
+    def grade(self, stand: Any, v: Any, name: str, run_id: str = "") -> None:
         """Batch: each compacted base equals the source, with only the keys the cycle deleted extra. CDC: each base
         without the rows flagged deleted equals the source. Both: no buffer is left after `compact`. A kind the engine
-        cannot run: init still answers with the known limit (graded once, on the first cycle)."""
+        cannot run: init still answers with the known limit (graded once, on the first cycle). An engine whose changes
+        the gate counts (`ops`): init's `load:` block is the client's, every rivet task's XCom unit and task log carry
+        the rows the gate made, and no staged Parquet is left after the load."""
         if name == "initial":
             for kind, problems in sorted(self.limits.items()):
                 limit = self.engine.limits[kind]
                 v.check(
                     f"{name}/{self.engine.name}/{kind}/known-limit", lambda p=problems: p, ok=f"{limit.shape}: {limit.documented}"
                 )
+            if self.engine.ops:
+                for kind, text in sorted(self.texts.items()):
+                    v.check(
+                        f"{name}/{self.engine.name}/{kind}/load-block-as-written",
+                        load_block_problems,
+                        text,
+                        ok=", ".join(f"{k}: {w}" for k, w in CLIENT_LOAD.items()),
+                    )
         source = v.guard(f"{name}/{self.engine.name}/source", self.source_rows, stand)
         if source is None:
             return
-        for kind in self.engine.kinds:
+        deleted = {"batch": {t: deleted_by_batch(name, t) for t in self.engine.tables}}
+        self.grade_targets(v, name, source, self.engine.kinds, deleted)
+        if self.engine.ops and run_id:
+            ops = self.engine.ops.get(name, {})
+            self.grade_tasks(stand, v, name, run_id, self.dags, source, ops, baseline=name == "initial")
+            self.grade_staged(v, name, self.engine.kinds)
+            self.high_water = {t: high_water(rows, self.engine.cursor) for t, rows in source.items()}
+
+    def grade_targets(
+        self,
+        v: Any,
+        name: str,
+        source: dict[str, list[dict[str, Any]]],
+        kinds: Sequence[str],
+        deleted: dict[str, dict[str, int]],
+        added: dict[str, list[str]] | None = None,
+    ) -> None:
+        """Each kind's compacted base against `source` (`added`: CDC columns beyond the scenario's, per table)."""
+        for kind in kinds:
             objects = v.guard(f"{name}/{self.engine.name}/{kind}/objects", self.objects, kind)
             print(f"INVENTORY {name} {self.engine.name} {kind} {sorted(objects or [])}", flush=True)
             for table, cols in self.engine.tables.items():
                 cell = f"{name}/{self.engine.name}/bigquery/{kind}/{table}"
+                more = (added or {}).get(table, []) if kind == "cdc" else []
                 v.check(
                     cell + "/current-equals-source",
-                    self._compare(kind, table, source[table], cols, 0 if kind == "cdc" else deleted_by_batch(name, table)),
-                    ok=f"{len(source[table])} row(s)",
+                    self._compare(kind, table, source[table], [*cols, *more], deleted.get(kind, {}).get(table, 0)),
+                    ok=f"{len(source[table])} row(s), columns {[*cols, *more]}",
                 )
                 if objects is not None:
                     v.check(cell + "/compacted", warehouse.compacted, objects, self.targets[kind][table], cell)
+
+    def expected_rows(
+        self, kind: str, task: str, source: dict[str, list[dict[str, Any]]], ops: dict[str, dict[str, int]], baseline: bool
+    ) -> int | None:
+        """The rows a rivet task moved, from what the gate did: a CDC run, the change events of the cycle (and the
+        baseline on the first); a CDC load of a table, that table's; a batch extract or load, the rows past the previous
+        high-water. A compaction: not counted (None)."""
+        group, _, unit = task.partition(".")
+        events = {t: sum(ops.get(t, {}).values()) + (len(source[t]) if baseline else 0) for t in self.engine.tables}
+        if group == "run":
+            return sum(events.values())
+        if group == "compact":
+            return None
+        if kind == "batch":
+            return rows_past(source[unit], self.engine.cursor, self.high_water.get(unit))
+        return events.get(short(unit))
+
+    def grade_tasks(
+        self,
+        stand: Any,
+        v: Any,
+        name: str,
+        run_id: str,
+        dags: Sequence[str],
+        source: dict[str, list[dict[str, Any]]],
+        ops: dict[str, dict[str, int]],
+        baseline: bool,
+    ) -> None:
+        """Every rivet task of `dags` in `run_id`: its XCom unit moved the rows the gate made, and its task log's
+        headline says the same (a task Airflow skipped has neither)."""
+        for dag in dags:
+            states = v.guard(f"{name}/{dag}/task-states", stand.tasks, dag, run_id) or {}
+            for task in self.tasks[dag]:
+                if states.get(task, {}).get("state") != "success":
+                    continue  # the run's own cell grades a task that did not succeed (or that may skip)
+                cell = f"{name}/{dag}/{task}"
+                payload = v.guard(cell + "/xcom-unit", stand.xcom, dag, run_id, task)
+                if payload is None:
+                    continue
+                print(f"XCOM {name} {dag} {task} {json.dumps(payload, default=str)}", flush=True)
+                kind = "batch" if dag.endswith("_batch") else "cdc"
+                rows = self.expected_rows(kind, task, source, ops, baseline)
+                v.check(cell + "/xcom-unit", xcom_problems, payload, rows, ok=f"{unit_rows(payload)} row(s)")
+                text = task_log(stand, dag, run_id, task)
+                v.check(cell + "/task-log", log_problems, text, payload, ok=headline(text))
+
+    def grade_staged(self, v: Any, name: str, kinds: Sequence[str]) -> None:
+        for kind in kinds:
+            v.check(f"{name}/{self.engine.name}/{kind}/staged-parts-cleaned", lambda k=kind: staged_left(self.listing(k)))
+
+    def listing(self, kind: str) -> list[str]:
+        """Every object of a config's bucket."""
+        out = sh(["gcloud", "storage", "ls", "-r", f"gs://{self.buckets[kind]}/**"], timeout=300, check=False)
+        if out.returncode != 0 and "matched no objects" not in (out.stdout + out.stderr):
+            raise RuntimeError(f"cannot list gs://{self.buckets[kind]}: {(out.stderr or out.stdout).strip()[-500:]}")
+        return [line.strip() for line in out.stdout.splitlines() if line.strip().startswith("gs://")]
+
+    def hot_phase(self, stand: Any, v: Any, wait_runs: Callable[..., dict[str, str]], grade_runs: Callable[..., Any]) -> None:
+        """A column added to a captured table while the CDC run is open, after the cycles.
+
+        `hot-ddl-open`: the writes of `before`, then the stream's run opens and pauses after it opened; in that window the
+        gate reads the source (the run's read bound) and runs the ALTER and the writes that use the new column. The run
+        delivers `before`, loaded and compacted: the CDC base equals the source as the gate read it in the window.
+        `hot-ddl-after`: the stream and the batch export run again: the CDC base equals the source value by value with
+        the new column (every value of it reached BigQuery, the rows nobody changed after the ALTER read NULL as at the
+        source); the batch base, whose `query:` init wrote with the columns of its day, equals the source on those."""
+        hot = self.engine.hot
+        assert hot is not None
+        name, eng = "hot-ddl-open", self.engine.name
+        run_id = f"gate_{eng}_hot_open"
+        self.sql(stand, hot.before)
+        marker = stand.rivet_dir / "markers" / f"{eng}_hot"
+        marker.unlink(missing_ok=True)
+        stand.trigger(self.hot_dag, run_id)
+        opened, done, snapshot = wait_marker(marker), 0.0, None
+        if opened is not None:
+            snapshot = v.guard(f"{name}/{eng}/source-in-window", self.source_rows, stand)
+            self.sql(stand, hot.alter + hot.after)
+            done = time.monotonic()
+        v.check(
+            f"{name}/{eng}/alter-inside-the-open-run",
+            window_problems,
+            opened,
+            done,
+            hot.pause_ms,
+            ok=f"{done - (opened or 0):.1f} s",
+        )
+        states = wait_runs(stand, [self.hot_dag], run_id)
+        grade_runs(stand, v, name, run_id, states, {self.hot_dag: self.tasks[self.hot_dag]}, may_skip=self.may_skip)
+        if snapshot is not None:
+            self.grade_targets(v, name, snapshot, ("cdc",), {})
+            self.grade_tasks(stand, v, name, run_id, [self.hot_dag], snapshot, hot.ops_before, baseline=False)
+            self.grade_staged(v, name, ("cdc",))
+            target = self.targets["cdc"][hot.table]
+            got = v.guard(f"{name}/{eng}/columns", self.read, "cdc", target)
+            print(f"HOT {name}: {target} columns {sorted(got[0]) if got else []}", flush=True)
+
+        name, run_id = "hot-ddl-after", f"gate_{eng}_hot_after"
+        dags = list(self.dags)
+        for dag in dags:
+            stand.trigger(dag, run_id)
+        states = wait_runs(stand, dags, run_id)
+        grade_runs(stand, v, name, run_id, states, {d: self.tasks[d] for d in dags}, may_skip=self.may_skip)
+        source = v.guard(f"{name}/{eng}/source", self.source_rows, stand, {hot.table: [hot.column]})
+        if source is None:
+            return
+        old = {t: [{c: r[c] for c in cols} for r in source[t]] for t, cols in self.engine.tables.items()}
+        gone = {t: deleted_by_batch("idle", t) + (hot.deleted if t == hot.table else 0) for t in self.engine.tables}
+        self.grade_targets(v, name, old, ("batch",), {"batch": gone})
+        self.grade_targets(v, name, source, ("cdc",), {}, added={hot.table: [hot.column]})
+        target = self.targets["cdc"][hot.table]
+        v.check(
+            f"{name}/{eng}/bigquery/cdc/{hot.table}/{hot.column}-reached",
+            lambda: column_reached(self.read("cdc", target), source[hot.table], hot.column, self.engine.key),
+            ok=f"{sum(1 for r in source[hot.table] if r.get(hot.column) is not None)} value(s)",
+        )
+        self.grade_tasks(stand, v, name, run_id, dags, old, hot.ops_after, baseline=False)
+        self.grade_staged(v, name, self.engine.kinds)
+        for item in PENDING.get(eng, []):
+            print(f"PENDING airflow-{self.stack} {eng}/{item}", flush=True)
 
     def _compare(
         self, kind: str, table: str, source: list[dict[str, Any]], cols: list[str], deleted: int
@@ -702,6 +920,37 @@ class SourceLeg:
         return lambda: warehouse.current_state(
             self.read(kind, target), source, cols, self.engine.key, deleted, what, flagged=kind == "cdc"
         )
+
+
+#: Cells that wait on a rivet change not on main yet; printed on every stack, never graded.
+PENDING = {
+    "mysql": [
+        "cdc/shared-checkpoint-refusal: rivet #664 (init's CDC checkpoint and destination naming) is not merged; "
+        "two configs sharing one checkpoint must be refused by code - the cell lands with it",
+    ]
+}
+
+
+def wait_marker(path: Any, timeout: float = 300) -> float | None:
+    """The monotonic time a pause marker appeared, or None after the timeout."""
+    deadline = time.monotonic() + timeout
+    while not path.exists():
+        if time.monotonic() > deadline:
+            return None
+        time.sleep(0.25)
+    return time.monotonic()
+
+
+def task_log(stand: Any, dag: str, run_id: str, task: str) -> str | None:
+    """The newest attempt's log of one task instance (`dag_id=/run_id=/task_id=/attempt=N.log`), or None."""
+    root = Path(stand.dir) / "logs" / f"dag_id={dag}" / f"run_id={run_id}" / f"task_id={task}"
+    found = sorted(root.glob("attempt=*.log"), key=lambda p: int(re.sub(r"\D", "", p.stem) or 0))
+    return found[-1].read_text(errors="replace") if found else None
+
+
+def headline(text: str | None) -> str:
+    heads = list(HEADLINE.finditer(text or ""))
+    return heads[-1].group(0).strip() if heads else ""
 
 
 def short(table: str) -> str:
@@ -778,6 +1027,118 @@ def limit_holds(limit: Limit, code: int, said: str, text: str | None, tables: Se
     if over != sorted(t.lower() for t in tables):
         problems.append(f"init's CDC exports read {over}, not the scenario's tables {sorted(tables)}")
     return problems
+
+
+#: What a client stack on a delta mode relies on in the `load:` block init writes: BigQuery, a base and a buffer that
+#: `compact` merges, and the staged Parquet deleted once loaded.
+CLIENT_LOAD = {"target": "bigquery", "layout": "base_buffer", "cleanup_source": True}
+#: Unit statuses of a task that did its work (a compaction with nothing to merge reports `skipped`).
+DONE = frozenset({"success", "loaded", "compacted", "skipped"})
+#: A task log's headline (airflow_provider_rivet/tasklog.py `render`): `rivet <subject> → [target:] OK: 3 rows ... in 1.2 s`.
+HEADLINE = re.compile(
+    r"rivet (?P<subject>[^\n→]*?) →(?P<rest>[^\n]*?)\b(?P<status>OK|SKIPPED|FAILED|REFUSED|STOPPED|BUSY)\b(?P<tail>[^\n]*)"
+)
+
+
+def load_block_problems(text: str) -> list[str]:
+    """How the `load:` block init wrote differs from what the client stack runs on (`CLIENT_LOAD`)."""
+    load = (yaml.safe_load(text) or {}).get("load")
+    if not isinstance(load, dict):
+        return ["init wrote no top-level `load:` block"]
+    return [f"load.{k} is {load.get(k)!r}, expected {want!r}" for k, want in CLIENT_LOAD.items() if load.get(k) != want]
+
+
+def unit_rows(payload: dict[str, Any]) -> int | None:
+    """The rows a task's units report in total; None when no unit reports a count."""
+    known = [u["rows"] for u in payload.get("units") or [] if type(u.get("rows")) is int]
+    return sum(known) if known else None
+
+
+def xcom_problems(payload: dict[str, Any] | None, rows: int | None) -> list[str]:
+    """A rivet task's XCom return value says it did its work and, when `rows` is given, moved exactly that many rows."""
+    if not isinstance(payload, dict):
+        return [f"no XCom return value ({payload!r})"]
+    problems = []
+    if payload.get("decision") != "success" or payload.get("exit_status") != 0 or payload.get("error") is not None:
+        problems.append(
+            f"decision {payload.get('decision')!r}, exit {payload.get('exit_status')!r}, error {payload.get('error')!r}"
+        )
+    units = payload.get("units") or []
+    if not units:
+        problems.append("no units")
+    bad = [(u.get("export"), u.get("table"), u.get("status")) for u in units if u.get("status") not in DONE or u.get("error")]
+    if bad:
+        problems.append(f"units not done: {bad}")
+    if rows is not None and unit_rows(payload) != rows:
+        problems.append(f"units report {unit_rows(payload)} row(s), the source changed {rows}")
+    return problems
+
+
+def log_problems(text: str | None, payload: dict[str, Any] | None) -> list[str]:
+    """The task log's headline says what the XCom says: OK (or SKIPPED, for a unit that skipped), and the same rows."""
+    if text is None:
+        return ["no task log"]
+    heads = list(HEADLINE.finditer(text))
+    if not heads:
+        return ["no `rivet ... →` headline in the task log"]
+    head = heads[-1]
+    statuses = {u.get("status") for u in (payload or {}).get("units") or []}
+    want = ("SKIPPED", "OK") if statuses == {"skipped"} else ("OK",)
+    problems = [] if head["status"] in want else [f"headline {head.group(0).strip()!r}, expected {' or '.join(want)}"]
+    said = re.search(r"\b(\d+) rows?\b", head["tail"])
+    reported = unit_rows(payload or {})
+    if (int(said.group(1)) if said else None) != reported:
+        problems.append(f"headline says {said.group(0) if said else 'no rows'}, the XCom units {reported}")
+    return problems
+
+
+def rows_past(rows: Sequence[dict[str, Any]], cursor: str, high_water: Any) -> int:
+    """How many rows an incremental extract reads: the ones whose cursor is past the previous high-water (all of them
+    on the first run)."""
+    return sum(1 for r in rows if high_water is None or (r.get(cursor) is not None and r[cursor] > high_water))
+
+
+def high_water(rows: Sequence[dict[str, Any]], cursor: str) -> Any:
+    return max((r[cursor] for r in rows if r.get(cursor) is not None), default=None)
+
+
+def column_reached(got: Sequence[dict[str, Any]], source: Sequence[dict[str, Any]], column: str, key: str) -> list[str]:
+    """Every value of a column added mid-stream reached the warehouse under its key, and the source holds at least one
+    (a check of an all-NULL column proves nothing)."""
+    want = {str(r[key]): r[column] for r in source if r.get(column) is not None}
+    if not want:
+        return [f"the source holds no value of {column}: nothing to compare"]
+    rows = [{k.lower(): v for k, v in r.items()} for r in got]
+    if rows and column not in rows[0]:
+        return [f"no column {column} in the read-back (has {sorted(rows[0])})"]
+    live = [r for r in rows if not warehouse._deleted(r.get(warehouse.DELETED_FLAG))]
+    have = {str(r[key]): r.get(column) for r in live if r.get(column) is not None}
+    problems = []
+    missing = sorted(k for k in want if have.get(k) != want[k])
+    if missing:
+        problems.append(f"{len(missing)} of {len(want)} value(s) of {column} not in the warehouse, e.g. "
+                        f"{[(k, want[k], have.get(k)) for k in missing[:5]]}")  # fmt: skip
+    extra = sorted(set(have) - set(want))
+    if extra:
+        problems.append(f"{len(extra)} value(s) of {column} the source does not hold, e.g. {extra[:5]}")
+    return problems
+
+
+def window_problems(opened: float | None, done: float, pause_ms: int, margin: float = 5.0) -> list[str]:
+    """The hot ALTER and the writes after it landed while the run was still paused after it opened (`opened`, `done`:
+    monotonic seconds; the pause sleeps `pause_ms` from the moment its marker was written)."""
+    if opened is None:
+        return ["the CDC run never reached cdc_after_open (no marker)"]
+    took = done - opened
+    if took > pause_ms / 1000 - margin:
+        return [f"the ALTER and its writes ended {took:.1f} s after the pause opened; the pause is {pause_ms} ms"]
+    return []
+
+
+def staged_left(objects: Sequence[str]) -> list[str]:
+    """`cleanup_source: true`: once a run is loaded, none of its staged Parquet is left in the bucket."""
+    parts = sorted(o for o in objects if o.endswith(".parquet"))
+    return [f"{len(parts)} staged Parquet object(s) left after the load, e.g. {parts[:3]}"] if parts else []
 
 
 def read_oracle(engine: Engine, port: int, password: str) -> dict[str, list[dict[str, Any]]]:
