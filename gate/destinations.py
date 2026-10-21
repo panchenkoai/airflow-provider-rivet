@@ -7,10 +7,10 @@ Oracles: the Parquet in MinIO read by DuckDB's httpfs (a client rivet does not u
 the local-Parquet oracles do; ClickHouse read back over HTTP as JSON and compared value by value; a bucket that does
 not exist is a coded refusal Airflow does not retry.
 
-init writes one fixed replication slot per schema (`rivet_public_cdc`) and `cleanup_source: true` in every `load:`
-block (the staged parts are deleted once loaded), so the extract-only half (its Parquet stays to be read) and the load
-half run against two postgres servers: `gate-source` and `gate-source-s3`, which play the same scenario. After the
-cycles, one more config grades what `cleanup_source` deletes and keeps (gate/cleanup.py).
+init names each CDC config's replication slot after its `-o` file (rivet #639), so the extract-only half (its Parquet
+stays to be read) and the load half (`cleanup_source: true`: its staged parts are deleted once loaded) read one postgres
+server, `gate-source`, each config written to a file of its own name. After the cycles, one more config grades what
+`cleanup_source` deletes and keeps (gate/cleanup.py), over a database of its own on that server.
 """
 
 from __future__ import annotations
@@ -23,10 +23,13 @@ import urllib.request
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
+import yaml
+
 from . import cleanup, oracle, warehouse
-from .stand import SOURCE_DSN, state_db
+from .stand import state_db
 
 NAME = "s3"
 REGION = "us-east-1"
@@ -53,12 +56,6 @@ SERVICES = """\
     command: ["server", "/data"]
     environment: {{ MINIO_ROOT_USER: afgate-minio, MINIO_ROOT_PASSWORD: {minio} }}
     ports: ["127.0.0.1::9000"]
-  gate-source-s3:
-    image: postgres:16
-    environment: {{ POSTGRES_USER: rivet, POSTGRES_PASSWORD: {source_s3}, POSTGRES_DB: rivet }}
-    command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=10"]
-    ports: ["127.0.0.1::5432"]
-    healthcheck: {{ test: ["CMD", "pg_isready", "-U", "rivet"], interval: 5s, retries: 20 }}
 """
 
 
@@ -86,24 +83,37 @@ CONFIGS = {
         Config("batch", "incremental", "gate-source", "RIVET_GATE_SOURCE_URL", "rivet_gate_source", "gate-s3-batch"),
         Config("cdc", "cdc", "gate-source", "RIVET_GATE_SOURCE_URL", "rivet_gate_source", "gate-s3-cdc"),
         Config(
-            "ch_batch", "incremental", "gate-source-s3", "RIVET_GATE_S3_SOURCE_URL", "rivet_gate_s3_source",
-            "gate-s3-ch-batch", "gate_s3_batch",
+            "ch_batch", "incremental", "gate-source", "RIVET_GATE_SOURCE_URL", "rivet_gate_source", "gate-s3-ch-batch",
+            "gate_s3_batch",
         ),
-        Config(
-            "ch_cdc", "cdc", "gate-source-s3", "RIVET_GATE_S3_SOURCE_URL", "rivet_gate_s3_source",
-            "gate-s3-ch-cdc", "gate_s3_cdc",
-        ),
+        Config("ch_cdc", "cdc", "gate-source", "RIVET_GATE_SOURCE_URL", "rivet_gate_source", "gate-s3-ch-cdc", "gate_s3_cdc"),
         # The bucket is never made: the run must stop on a coded refusal, once.
         Config("missing", "incremental", "gate-source", "RIVET_GATE_SOURCE_URL", "rivet_gate_source", "gate-s3-missing"),
         # `cleanup_source` (gate/cleanup.py): a database of its own, so its extra changes and held run touch no cycle.
         Config(
-            cleanup.KIND, "incremental", "gate-source-s3", "RIVET_GATE_CLEANUP_SOURCE_URL", "rivet_gate_s3_cleanup_source",
+            cleanup.KIND, "incremental", "gate-source", "RIVET_GATE_CLEANUP_SOURCE_URL", "rivet_gate_s3_cleanup_source",
             "gate-s3-cleanup", "gate_s3_cleanup", cleanup.DATABASE,
         ),
     )
 }  # fmt: skip
 #: The configs whose DAGs run in every cycle (the missing-bucket and cleanup DAGs run after the cycles, on their own).
 CYCLED = ("batch", "cdc", "ch_batch", "ch_cdc")
+
+
+def config_path(kind: str) -> str:
+    """Where init writes a config, in the stack: a file named after its kind, since init names a CDC config's slot,
+    checkpoint and destination after the `-o` file's stem (rivet #639, #664)."""
+    return f"/opt/rivet/configs/s3_{kind}/s3_{kind}.yaml"
+
+
+def cdc_root(text: str) -> str:
+    """The prefix a CDC config's `cdc/<table>/` parts sit under: its stream's destination prefix without the trailing
+    `cdc/` (empty before rivet #664, `<stem>/` after it)."""
+    doc = yaml.safe_load(text) or {}
+    prefixes = [str((e.get("destination") or {}).get("prefix") or "") for e in doc.get("exports") or [] if e.get("mode") == "cdc"]
+    if len(prefixes) != 1 or not prefixes[0].endswith("cdc/"):
+        raise ValueError(f"a CDC config's stream prefixes {prefixes}: expected one ending in `cdc/`")
+    return prefixes[0].removesuffix("cdc/")
 
 
 def init_argv(cfg: Config, out: str) -> list[str]:
@@ -206,8 +216,8 @@ def _instant(value: Any) -> datetime:
 
 
 class S3Leg:
-    """The S3 destination leg of one stack: MinIO and the second source in the stack, init's configs, their DAGs, and
-    their oracles. Nothing leaves the stack: `down -v` removes MinIO, its buckets and both sources."""
+    """The S3 destination leg of one stack: MinIO in the stack, init's configs, their DAGs, and
+    their oracles. Nothing leaves the stack: `down -v` removes MinIO and its buckets, and gate-source with the cleanup database."""
 
     name = NAME
     service_yaml = SERVICES
@@ -228,14 +238,13 @@ class S3Leg:
         self.may_skip: dict[str, tuple[str, ...]] = {}
         self.shape: dict[str, dict[str, Any]] = {}
         self.minio_port = 0
-        self.source_s3_dsn = ""
         # What the earlier cycles left: every part, the batch high-water, each cycle's new change parts.
         self.files_before: dict[str, set[str]] = {k: set() for k in ("batch", "cdc")}
         self.high_water: dict[str, Any] = {}
         self.history: list[list[str]] = []
 
     def connections(self, secrets: Any) -> dict[str, dict[str, Any]]:
-        """The S3 Connection (MinIO's endpoint in its extra), ClickHouse's, and the second source's."""
+        """The S3 Connection (MinIO's endpoint in its extra), ClickHouse's, and the cleanup config's source database."""
         return {
             "rivet_gate_s3": {
                 "conn_type": "aws",
@@ -250,20 +259,12 @@ class S3Leg:
                 "login": "loader",
                 "password": secrets.clickhouse,
             },
-            "rivet_gate_s3_source": {
-                "conn_type": "postgres",
-                "host": "gate-source-s3",
-                "port": 5432,
-                "login": "rivet",
-                "password": secrets.source_s3,
-                "schema": "rivet",
-            },
             "rivet_gate_s3_cleanup_source": {
                 "conn_type": "postgres",
-                "host": "gate-source-s3",
+                "host": "gate-source",
                 "port": 5432,
                 "login": "rivet",
-                "password": secrets.source_s3,
+                "password": secrets.source,
                 "schema": cleanup.DATABASE,
             },
         }
@@ -278,24 +279,20 @@ class S3Leg:
     def wait_ready(self, stand: Any, timeout: float = 300) -> None:
         deadline = time.monotonic() + timeout
         while True:
-            ok = self.mc(stand, "ls", "gate", check=False).returncode == 0
-            ok = ok and stand.compose("exec", "-T", "gate-source-s3", "pg_isready", "-U", "rivet", check=False).returncode == 0
-            if ok:
+            if self.mc(stand, "ls", "gate", check=False).returncode == 0:
                 return
             if time.monotonic() > deadline:
-                raise TimeoutError(f"MinIO or gate-source-s3 not ready after {timeout:.0f} s")
+                raise TimeoutError(f"MinIO not ready after {timeout:.0f} s")
             time.sleep(3)
 
     def prepare(self, stand: Any, seed: str) -> None:
-        """Seed the second source, make the buckets (not the missing one), the ClickHouse databases and the states;
+        """Seed the cleanup config's database, make the buckets (not the missing one), the ClickHouse databases and the states;
         `rivet init` writes every config inside the stack's network."""
         from .sources import read_config
 
         self.wait_ready(stand)
         self.minio_port = stand.host_port("gate-minio", 9000)
-        self.source_s3_dsn = SOURCE_DSN.format(port=stand.host_port("gate-source-s3", 5432), password=stand.secrets.source_s3)
-        self.cleanup_source_dsn = self.source_s3_dsn.replace("dbname=rivet ", f"dbname={cleanup.DATABASE} ")
-        stand.psql("gate-source-s3", "rivet", seed)
+        self.cleanup_source_dsn = stand.source_dsn.replace("dbname=rivet ", f"dbname={cleanup.DATABASE} ")
         problems = []
         for kind, cfg in CONFIGS.items():
             if cfg.database != "rivet":
@@ -309,8 +306,8 @@ class S3Leg:
             (stand.rivet_dir / "state" / f"s3_{kind}").mkdir(parents=True, exist_ok=True)
             host = stand.rivet_dir / "configs" / f"s3_{kind}"
             host.mkdir(parents=True, exist_ok=True)
-            out = f"/opt/rivet/configs/s3_{kind}/rivet.yaml"
-            password = stand.secrets.source if cfg.service == "gate-source" else stand.secrets.source_s3
+            out = config_path(kind)
+            password = stand.secrets.source
             stand.compose(
                 "exec", "-T", "-e", cfg.url_env, "-e", "RIVET_STATE_URL", "airflow-worker", *init_argv(cfg, out),
                 extra_env={
@@ -321,7 +318,7 @@ class S3Leg:
             left = sorted(p.name for p in host.glob(".rivet_state.db*"))
             if left:
                 raise RuntimeError(f"init left {left} beside {host} although RIVET_STATE_URL named the PostgreSQL state")
-            text = (host / "rivet.yaml").read_text()
+            text = (host / Path(out).name).read_text()
             print(f"INIT s3 {kind} config:\n{text}", flush=True)
             shape = read_config(text, list(TABLES))
             problems += check_shape(kind, shape)
@@ -334,6 +331,7 @@ class S3Leg:
                 "state_conn": f"rivet_gate_state_{NAME}_{kind}",
                 "connections": ["rivet_gate_s3"] + (["rivet_gate_s3_clickhouse"] if cfg.clickhouse_db else []),
                 "load": bool(cfg.clickhouse_db),
+                **({"cdc_root": cdc_root(text)} if cfg.mode == "cdc" else {}),
                 **(cleanup.shape() if kind == cleanup.KIND else {}),
             }
         if problems:
@@ -350,9 +348,6 @@ class S3Leg:
             # A compaction with nothing to merge skips (ClickHouse keeps a change log behind a view).
             self.may_skip[dag] = ("compact.",)
         (stand.rivet_dir / "configs" / "s3_shape.json").write_text(json.dumps(self.shape))
-
-    def apply_changes(self, stand: Any, changes: str) -> None:
-        stand.psql("gate-source-s3", "rivet", changes)
 
     # --- reads ---
 
@@ -398,8 +393,7 @@ class S3Leg:
     # --- grading ---
 
     def grade(self, stand: Any, v: Any, name: str, run_id: str) -> None:
-        """The extract-only half: the Parquet in MinIO against gate-source. The load half: ClickHouse against
-        gate-source-s3."""
+        """The extract-only half: the Parquet in MinIO, and the load half: ClickHouse, each against gate-source."""
         con = v.guard(f"{name}/s3/duckdb", self.duck, stand)
         if con is not None:
             try:
@@ -438,7 +432,7 @@ class S3Leg:
             from .scenario import CHANGED_OPS, NO_OPS
 
             ops = CHANGED_OPS if name == "delta" else NO_OPS
-            bucket = self.root(CONFIGS["cdc"].bucket)
+            bucket = self.root(CONFIGS["cdc"].bucket) + self.shape["cdc"]["cdc_root"]
             new = after["cdc"] - self.files_before["cdc"]
             changes_new = sorted(f for t in TABLES for f in table_parts(new, bucket, t)["changes"])
             self.history.append(changes_new)
@@ -459,7 +453,7 @@ class S3Leg:
             self.files_before["cdc"] = after["cdc"]
 
     def grade_clickhouse(self, stand: Any, v: Any, name: str) -> None:
-        source = v.guard(f"{name}/s3/clickhouse/source", self.source_rows, self.source_s3_dsn)
+        source = v.guard(f"{name}/s3/clickhouse/source", self.source_rows, stand.source_dsn)
         if source is None:
             return
         for kind in ("ch_batch", "ch_cdc"):

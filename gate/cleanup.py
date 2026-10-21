@@ -12,7 +12,7 @@ mod.rs `run_load` / `append_and_view`, rivet 0.32.1):
    manifest in the bucket) the load proceeds and the whole cleanup of that prefix is skipped.
 
 The config is init's own (`--mode incremental --s3-bucket --clickhouse-*`) over a database of its own on the leg's
-second postgres server, used as written; its DAGs extract (both exports), extract with one apply paused after its
+postgres source, used as written; its DAGs extract (both exports), extract with one apply paused after its
 snapshot opened (rivet's `RIVET_TEST_PAUSE_AT` sequence point: the run is live for as long as the gate needs), and
 load one export each. A load is broken by a CHECK constraint on its ClickHouse table that refuses every row, so it
 fails at the write, after the manifests were read and the cleanup decided. The oracles: the bucket listed by MinIO's
@@ -30,7 +30,7 @@ from . import warehouse
 from .oracle import SHOWN
 
 KIND = "cleanup"
-#: The database of the cleanup config on gate-source-s3 (the other configs read `rivet`).
+#: The database of the cleanup config on gate-source (every other config reads `rivet`).
 DATABASE = "rivet_cleanup"
 #: Loaded alone first (guarantee 2), then broken in ClickHouse (guarantee 1).
 FIRST = "gate_customers"

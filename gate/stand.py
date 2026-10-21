@@ -50,7 +50,6 @@ class StandSecrets:
     mongodb_root: str
     oracle: str
     minio: str
-    source_s3: str
     fernet: str
 
     @classmethod
