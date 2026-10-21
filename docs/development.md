@@ -97,6 +97,10 @@ directory, default a fresh temporary one), `--verdicts <file>` (one JSON line pe
 `--sabotage drop-delta-file` or `warehouse-value`, `--tag` (the run tag), `--destinations s3` (below), `--workers 2`
 (the multi-host leg below).
 
+**Known reds.** A cell red by a confirmed product defect is listed in `gate/scenario.py` `KNOWN` with its issue: it
+grades `XFAIL` (counted apart, the run still passes) while red and `XPASS` once it passes, which fails the run until the
+entry is removed. Only a defect with an issue and a planned fix goes there; anything else stays a FAIL.
+
 **Multi-host leg.** `--workers 2` runs, instead of the scenario above, a stack with two Celery workers, each a host
 with a disk of its own (`hosts/a` and `hosts/b` of the stack's directory, each mounted at `/opt/rivet-host` in one
 worker only): every `state_dir` (the config copy, sealed plans, locks, crashed ledger, logs, marker) is on the host

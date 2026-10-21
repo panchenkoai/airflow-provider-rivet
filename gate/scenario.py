@@ -77,6 +77,13 @@ RIVET_TASKS = {f"gate_batch_{s}": [f"apply.{s}_{short}" for short, _ in TABLES.v
 }
 
 
+#: Cells red by a known product defect: graded XFAIL with the issue while red, XPASS (a failure of the run) once green,
+#: so the entry is removed when the fix lands.
+KNOWN = {
+    "initial/mysql/cdc/staged-parts-cleaned": "panchenkoai/rivet#671 (cleanup_source skips the CDC baseline, 0.32.3)",
+}
+
+
 @dataclass
 class Verdicts:
     """Graded cells of one gate run."""
@@ -88,6 +95,9 @@ class Verdicts:
         """Record PASS when the oracle found nothing, FAIL with its findings otherwise; print it."""
         status = "FAIL" if problems else "PASS"
         detail = "; ".join(problems) if problems else ok
+        if cell in KNOWN:
+            status = "XFAIL" if problems else "XPASS"
+            detail = f"{KNOWN[cell]}" + (f": {detail}" if problems else ": passes now, remove it from KNOWN")
         self.rows.append({"stack": self.stack, "cell": cell, "status": status, "detail": detail})
         print(f"{status} airflow-{self.stack} {cell}" + (f" — {detail}" if detail else ""), flush=True)
 
