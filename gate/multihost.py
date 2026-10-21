@@ -10,8 +10,9 @@ batch run land on both hosts, every export changes host between cycles, and a re
 try's hostname, read from the REST API, proves where it ran. The oracles read the bucket through `gcloud storage`,
 a client rivet does not use.
 
-Two measurements run beside the graded pipelines and print `MEASURE` lines instead of verdicts: SQLite state in each
-host's state_dir, and init's default local `./output/` destination (which lands in the state_dir) on PostgreSQL state.
+SQLite state in each host's state_dir must be refused before rivet starts (`RIVET_AIRFLOW_STATE_SQLITE_MULTI_HOST`),
+graded on every cycle. init's default local `./output/` destination (which lands in the state_dir) on PostgreSQL state
+is a measurement that prints `MEASURE` lines instead of verdicts.
 """
 
 from __future__ import annotations
@@ -78,13 +79,15 @@ class Pipeline:
 PIPELINES = (
     Pipeline("batch", "incremental", "rivet_state"),
     Pipeline("cdc", "cdc", "rivet_state_mh_cdc"),
-    # Measurements: SQLite state on two hosts; init's default local destination on two hosts.
+    # SQLite state on two hosts: refused by the provider (graded); init's default local destination: a measurement.
     Pipeline("sqlite", "incremental", None, graded=False, cycles=("initial", "delta", "idle")),
     Pipeline("local", "incremental", "rivet_state_mh_local", gcs=False, graded=False, cycles=("initial", "delta", "idle")),
     # An extract on one host and its load on the other (run once, after the first cycle).
     Pipeline("chain", "incremental", "rivet_state_mh_chain", graded=False, cycles=(), load=True),
 )
 BY_NAME = {p.name: p for p in PIPELINES}
+#: What the provider answers SQLite state under an executor of several hosts (the `sqlite` pipeline sets no `single_host`).
+SQLITE_MULTI_HOST = "RIVET_AIRFLOW_STATE_SQLITE_MULTI_HOST"
 #: The databases the leg makes in the stack's state server (`rivet_state` is the stack's own); init of the SQLite
 #: pipeline records the source's keys in one of its own, which no run reads.
 STATE_DBS = sorted({p.state_db for p in PIPELINES if p.state_db and p.state_db != "rivet_state"} | {"rivet_state_mh_init"})
@@ -244,6 +247,19 @@ class MultiHost:
             shown.append(line)
         return "; ".join(shown)
 
+    def sqlite_refused(self, state: str, run_id: str) -> list[str]:
+        """SQLite state under Celery without `single_host=True`: every extract refused before rivet started."""
+        if state != "failed":
+            return [f"the SQLite run ended {state}, not failed by the refusal"]
+        problems = []
+        for task, ti in sorted(self.stand.tasks("gate_mh_sqlite", run_id).items()):
+            if task == "watcher" or ti["state"] in ("upstream_failed", "skipped"):
+                continue
+            code = self.stand.xcom("gate_mh_sqlite", run_id, task).get("preflight_refusal")
+            if code != SQLITE_MULTI_HOST:
+                problems.append(f"{task} {ti['state']}: preflight_refusal {code!r}, not {SQLITE_MULTI_HOST}")
+        return problems
+
     # --- routing and the crash ----------------------------------------------------------------------------------------
 
     def route(self, routes: Mapping[str, str]) -> None:
@@ -303,6 +319,8 @@ class MultiHost:
             after = self.everything()
             new = after - files
             history.append(sorted(f for f in new if f.startswith(str(self.mirror / "cdc")) and "/snapshot/" not in f))
+            if "gate_mh_sqlite" in states:
+                self.v.grade(f"multihost/{name}/sqlite-refused", self.sqlite_refused(states["gate_mh_sqlite"], run_id))
             self.grade_cycle(name, run_id, routes, states, ops, new, history, marks)
             if name == "initial":
                 self.chain()

@@ -5,6 +5,9 @@ rivet binary; its release tags will use the prefix `airflow-v`.
 
 ## Unreleased
 
+- SQLite state is refused under an executor that may run tasks on several hosts (Celery,
+  Kubernetes, Edge): a task on another worker started from an empty state and re-read every
+  table (`RIVET_AIRFLOW_STATE_SQLITE_MULTI_HOST`). `single_host=True` declares one host.
 - `rivet_notifications=True` keeps rivet's own `notifications:` on: the operator then does not pass `--no-notify` and
   does not warn about the block. The default is unchanged (rivet's notifications off where the binary can turn them off).
 - On PostgreSQL state, a task whose upstream rivet task ran on another host (another state_dir marker) is no longer

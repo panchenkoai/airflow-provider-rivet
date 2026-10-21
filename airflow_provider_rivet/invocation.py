@@ -129,6 +129,8 @@ class Request:
     rivet_bin: str = "rivet"
     state_dir: str | None = None
     deployment: str = "auto"
+    # The scheduler's executor when it may run one DAG's tasks on several hosts and the DAG did not declare one host.
+    spreads_hosts: str | None = None
     extra_args: Sequence[str] = ()
     lock_wait: int = 600
     rivet_notifications: bool = False
@@ -1127,6 +1129,7 @@ def _invoke(request: Request, emit: Emit, on_process: Callable | None, stopped: 
         env=request.env,
         state_dir=request.state_dir,
         deployment=request.deployment,
+        spreads_hosts=request.spreads_hosts,
         export=request.export,
         cdc=request.command == "cdc_run",
         upstream_markers=tuple(request.upstream_markers),

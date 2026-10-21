@@ -17,6 +17,7 @@ from ._compat import (
     AirflowSkipException,
     BaseHook,
     BaseOperator,
+    executor_spreading_hosts,
 )
 from ._yaml import params_of
 from .connections import EnvSpec, build_environment, connection_url  # noqa: F401  (connection_url is re-exported)
@@ -90,6 +91,7 @@ class RivetBaseOperator(BaseOperator):
         stream_stderr: bool = False,
         log_keep: int | None = 10,
         cwd: str | None = None,
+        single_host: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
@@ -109,6 +111,7 @@ class RivetBaseOperator(BaseOperator):
         self.cloud_credentials = tuple(cloud_credentials)
         self.connections = tuple(connections)
         self.deployment = deployment
+        self.single_host = single_host
         self.extra_args = extra_args
         self.lock_wait = lock_wait
         self.rivet_notifications = rivet_notifications
@@ -222,6 +225,7 @@ class RivetBaseOperator(BaseOperator):
             rivet_bin=self.rivet_bin,
             state_dir=self.state_dir,
             deployment=self.deployment,
+            spreads_hosts=None if self.single_host else executor_spreading_hosts(),
             extra_args=list(self.extra_args or ()),
             lock_wait=self.lock_wait,
             rivet_notifications=self.rivet_notifications,

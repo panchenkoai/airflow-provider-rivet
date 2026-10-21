@@ -216,6 +216,7 @@ def run_preflight(
     cdc: bool,
     upstream_markers: tuple[str, ...] = (),
     extra_args: Sequence[str] = (),
+    spreads_hosts: str | None = None,
     rivet_notifications: bool = False,
 ) -> Preflight:
     """Run every check; raise `PreflightRefusal` or return what the invocation needs."""
@@ -270,6 +271,14 @@ def run_preflight(
                 f"(marker {others[0][:8]} against {result.marker[:8]}); every task must see the same path; see {SETUP_GUIDE}",
             )
         check_nothing_left_beside_config(config_path, config, result.state_dir, kind == "sqlite", export)
+        if kind == "sqlite" and spreads_hosts:
+            raise PreflightRefusal(
+                "RIVET_AIRFLOW_STATE_SQLITE_MULTI_HOST",
+                f"SQLite state in {state_dir} lives on this worker's disk, and the {spreads_hosts} may run this DAG's "
+                "next task on another worker, whose empty state would re-read every table and write it again; set "
+                "RIVET_STATE_URL to a PostgreSQL state, or pass single_host=True when this deployment has one worker; "
+                f"see {SETUP_GUIDE}",
+            )
         if kind == "sqlite":
             result.warnings.append(
                 ("sqlite_single_host", f"SQLite state in {state_dir}: this setup is single-host; see {SETUP_GUIDE}")

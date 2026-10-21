@@ -7,7 +7,7 @@ Where rivet's state lives under Airflow, and how to set up a worker for it.
 | Worker | State | What the operator does |
 |---|---|---|
 | Ephemeral pod (`KUBERNETES_SERVICE_HOST` in the environment, or `deployment="pod"`) | PostgreSQL, required | refuses SQLite (`RIVET_AIRFLOW_STATE_SQLITE_ON_POD`); refuses every CDC export (`RIVET_AIRFLOW_CDC_ON_POD`: the checkpoint is a file and would live on the pod's disk) until rivet stores it in the state database; runs the config in place; keeps rivet's stderr in a private file on the pod's disk (`stderr_temp`), never in the task log |
-| Local or long-lived worker (`deployment="local"` overrides the detection for a long-lived Kubernetes worker with a persistent volume) | SQLite in a declared directory, or PostgreSQL | requires `state_dir` for SQLite state and for CDC; checks it; refuses state or a checkpoint left beside the original config; warns once per task that SQLite is single-host |
+| Local or long-lived worker (`deployment="local"` overrides the detection for a long-lived Kubernetes worker with a persistent volume) | SQLite in a declared directory, or PostgreSQL | requires `state_dir` for SQLite state and for CDC; checks it; refuses state or a checkpoint left beside the original config; refuses SQLite state when Airflow's executor may run tasks on several hosts (Celery, Kubernetes, Edge, ...: `RIVET_AIRFLOW_STATE_SQLITE_MULTI_HOST`) unless the task says `single_host=True`; warns once per task that SQLite is single-host |
 
 `state_dir` is an operator parameter, not an Airflow Variable. The builders pass one value to
 every task they create, so "the same path for every task" holds by construction, it is visible
@@ -155,15 +155,18 @@ SQLite state in `state_dir`.
      for an incremental export reads only the rows past the moved cursor.
    - SQLite state: each host has its own `.rivet_state.db`. An export that runs on the other
      host reads from the start, exit 0: the whole table again, and on the way back the rows
-     the other host already took. The task only warns (`sqlite_single_host`).
+     the other host already took (990 of 1000 rows written twice). So SQLite state under an
+     executor that may use several hosts is refused before rivet starts
+     (`RIVET_AIRFLOW_STATE_SQLITE_MULTI_HOST`); a deployment with one Celery worker says
+     `single_host=True`.
    - A local destination (`rivet init`'s default `./output/`, which lands in the state_dir):
      the files are split between the hosts; the first run on the other host writes there
      without complaint, and a later run on a host whose manifest is behind the stored cursor is
      refused `RIVET_STATE_CURSOR_PAST_MANIFEST` by rivet.
    - The lock files guard one host (by construction, not measured): a zombie try on one host and
      its retry on another are kept apart only by rivet's own run lease ([Overlap](limits.md#overlap)).
-   - The crashed ledger is per host, so `crashed_retries` counts per host: with the default 1, a
-     crash on one host and a crash of the retry on the other are both retried.
+   - A ledger file would count crashes per host, so on PostgreSQL state the operator keeps none:
+     a crash is retried only within the first `crashed_retries` tries ([Retries](retries.md)).
 7. **Moving to PostgreSQL state.** Stop the DAGs; create a database; set `RIVET_STATE_URL` to
    its `postgresql://` URL for every task (the worker's environment, or
    `env_from_connections`). This package does not copy the SQLite state into PostgreSQL: the
