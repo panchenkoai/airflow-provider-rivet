@@ -163,6 +163,8 @@ def test_the_hot_dag_runs_the_streams_tasks_on_its_config_and_state(tmp_path: Pa
     assert leg.dags == ["gate_src_mysql_batch", "gate_src_mysql_cdc"]
     assert leg.hot_dag == "gate_src_mysql_cdc_hot"
     assert leg.tasks[leg.hot_dag] == leg.tasks["gate_src_mysql_cdc"]
+    # Mutant: `cycle_tasks` returning every DAG's tasks (a cycle grades the hot DAG, which has no run then: a 404).
+    assert list(leg.cycle_tasks()) == leg.dags
     assert leg.may_skip[leg.hot_dag] == ("compact.",)
     shape = json.loads((stand.rivet_dir / "configs" / "mysql_shape.json").read_text())
     assert shape["hot"] == {

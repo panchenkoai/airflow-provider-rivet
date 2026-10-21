@@ -324,7 +324,7 @@ def run_cycle(
             print(f"SABOTAGE {leg.sabotage()}", flush=True)
         leg.grade(stand, v, name, {t: DELETED_BY_BATCH[name] if t == "gate_orders" else 0 for t in TABLES})
     for src in src_legs:
-        grade_runs(stand, v, name, run_id, states, src.tasks, may_skip=src.may_skip)
+        grade_runs(stand, v, name, run_id, states, src.cycle_tasks(), may_skip=src.may_skip)
         src.grade(stand, v, name, run_id)
     for dest in dest_legs:
         grade_runs(stand, v, name, run_id, states, dest.tasks, may_skip=dest.may_skip)

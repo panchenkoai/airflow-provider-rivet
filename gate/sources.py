@@ -650,6 +650,10 @@ class SourceLeg:
         # The DAG file reads which exports and stream to build from here (the names are init's, not the gate's).
         (stand.rivet_dir / "configs" / f"{self.engine.name}_shape.json").write_text(json.dumps(self.shape))
 
+    def cycle_tasks(self) -> dict[str, list[str]]:
+        """The rivet tasks of the DAGs every cycle runs (not the hot-ALTER DAG, which runs once after the cycles)."""
+        return {dag: self.tasks[dag] for dag in self.dags}
+
     def capture_instance(self, stand: Any) -> str:
         """The capture instance of the engine's renamed table: its own name when this rivet's init reads the catalog."""
         if self.engine.capture_instance is None:
