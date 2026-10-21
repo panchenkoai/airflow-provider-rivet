@@ -177,6 +177,7 @@ def test_the_unqualified_config_must_run_or_be_refused_at_exit_5() -> None:
     assert unqualified_problems(5, "Error: [RIVET_INIT_X] ...", None, [], None, []) == []
     assert unqualified_problems(1, "Error: boom", None, [], None, []) == ["init exited 1 with no code"]
     assert unqualified_problems(1, "Error: [RIVET_INIT_X] ...", None, [], None, []) == ["init exited 1 RIVET_INIT_X"]
-    assert "panchenkoai/rivet#675" in KNOWN["unqualified/mysql/cdc/same-names-in-another-db"]
+    # Not a known red: rivet 0.32.2 (#675) writes `<db>.<table>` and refuses the ambiguity at exit 5.
+    assert "unqualified/mysql/cdc/same-names-in-another-db" not in KNOWN
     leg = SourceLeg(CLOUD, "3.3.2", MYSQL)
     assert BUCKET_SHAPE.fullmatch(leg.unq_bucket) and DATASET_SHAPE.fullmatch(leg.unq_dataset), "the sweep drops them"

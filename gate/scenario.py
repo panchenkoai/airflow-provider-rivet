@@ -81,9 +81,6 @@ RIVET_TASKS = {f"gate_batch_{s}": [f"apply.{s}_{short}" for short, _ in TABLES.v
 #: so the entry is removed when the fix lands.
 KNOWN = {
     "initial/mysql/cdc/staged-parts-cleaned": "panchenkoai/rivet#671 (cleanup_source skips the CDC baseline, 0.32.3)",
-    "unqualified/mysql/cdc/same-names-in-another-db": (
-        "panchenkoai/rivet#675 (init writes unqualified CDC tables its own run refuses, at exit 1 not 5), 0.32.3"
-    ),
 }
 
 
