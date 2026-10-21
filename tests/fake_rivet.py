@@ -189,7 +189,7 @@ def main():
     if argv == ["--version"]:
         if broken.get("--version") == "hang":
             time.sleep(90)
-        print(f"rivet {spec.get('version', '0.32.0')} (fake)")
+        print(f"rivet {spec.get('version', '0.32.1')} (fake)")
         return 0
     sub = argv[0]
     if "--help" in argv:

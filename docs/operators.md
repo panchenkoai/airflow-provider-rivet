@@ -63,7 +63,7 @@ Every task returns (and, on failure, pushes before raising) one XCom value under
                "rows": 2500, "files": 1, "stop_reason": null, "error": null } ],
   "error": null, "degraded": ["lock_wait", "no_notify"],
   "exit_status": 0, "signal": null, "stderr_path": "/var/lib/rivet/postgres/logs/...",
-  "skip_reason": null, "state_marker": "1d86...", "rivet_version": "0.32.0 (8afde974)" }
+  "skip_reason": null, "state_marker": "1d86...", "rivet_version": "0.32.1 (5ee08c0a)" }
 ```
 
 A unit has exactly the shape of `tests/fixtures/scheduler/xcom_unit*.json`; a package test

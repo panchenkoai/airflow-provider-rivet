@@ -52,7 +52,7 @@ def test_every_structured_event_and_the_payload_carry_their_keys(rig: Rig) -> No
     """A log pipeline reads these keys (outcome 15 18 24 34 51 52 58-69, step 60 61 88 89)."""
     rig.scenario(leak_env=[], run={"summary": {"per_export": [entry()]}, "stderr": "a warning"})
     payload = payload_of(rig, rig.operator(RivetRunOperator, export="orders", stream_stderr=True))
-    assert (payload["command"], payload["exit_status"], payload["rivet_version"]) == ("run", 0, "0.32.0 (fake)")
+    assert (payload["command"], payload["exit_status"], payload["rivet_version"]) == ("run", 0, "0.32.1 (fake)")
     [result] = rig.events("rivet.result")
     assert set(result) == RESULT_KEYS
     assert {k: result[k] for k in RESULT_KEYS - {"event"}} == {k: payload[k] for k in RESULT_KEYS - {"event"}}

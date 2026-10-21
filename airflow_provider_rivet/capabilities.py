@@ -6,7 +6,7 @@ import os
 import re
 import subprocess
 
-MIN_RIVET_VERSION = (0, 32, 0)
+MIN_RIVET_VERSION = (0, 32, 1)
 PROBE_TIMEOUT = 60
 _VERSION_RE = re.compile(r"rivet\s+(\d+)\.(\d+)\.(\d+)")
 

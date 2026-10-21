@@ -22,7 +22,7 @@ classifiers = [
     "Programming Language :: Python :: 3.14",
     "Typing :: Typed",
 ]
-dependencies = ["apache-airflow>=2.10", "rivet-cli>=0.32.0"]
+dependencies = ["apache-airflow>=2.10", "rivet-cli>=0.32.1"]
 
 [project.optional-dependencies]
 slack = ["apache-airflow-providers-slack>=8.0"]
