@@ -215,6 +215,18 @@ def test_d16_a_skipped_compaction_fails_only_the_bigquery_batch_dag() -> None:
     }
 
 
+def test_a_compaction_with_nothing_to_merge_may_skip_on_the_first_and_the_idle_cycle() -> None:
+    """rivet #652: the first incremental load creates an absent base from its pass, so its compaction skips; the idle
+    load buffers nothing. Mutant: MUST_COMPACT applied on every cycle (the D16 rule red on a right skip)."""
+    leg = Leg(CLOUD, "3.3.2", TABLES)
+    for cycle in ("initial", "idle"):
+        v = Verdicts("3.3.2")
+        states = dict.fromkeys(leg.dags, "success")
+        scenario.grade_runs(TaskStand(), v, cycle, "r", states, leg.tasks, may_skip=warehouse.may_skip(leg.dags, cycle))
+        assert [r for r in v.rows if r["status"] == "FAIL"] == [], cycle
+    assert warehouse.may_skip(leg.dags, "delta")["gate_wh_bigquery_batch"] == ()
+
+
 # --- D34: the cleanup lists again and raises on anything left ---------------------------------------------------------
 
 

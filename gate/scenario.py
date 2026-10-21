@@ -319,7 +319,7 @@ def run_cycle(
     tasks = grade_runs(stand, v, name, run_id, states, RIVET_TASKS)
     marks = grade_base(stand, v, name, run_id, ops, new, files_after, high_water, history, tasks)
     if leg:
-        grade_runs(stand, v, name, run_id, states, leg.tasks, may_skip=leg.may_skip)
+        grade_runs(stand, v, name, run_id, states, leg.tasks, may_skip=warehouse.may_skip(leg.dags, name))
         if sabotage == "warehouse-value" and name == "delta":
             print(f"SABOTAGE {leg.sabotage()}", flush=True)
         leg.grade(stand, v, name, {t: DELETED_BY_BATCH[name] if t == "gate_orders" else 0 for t in TABLES})
