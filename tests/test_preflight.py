@@ -53,7 +53,6 @@ def test_a_pod_with_postgres_state_runs_a_batch_export_and_writes_nothing_to_the
     assert not Path(payload["stderr_path"]).is_relative_to(rig.state_dir)
     assert rig.argv("run")[2] == str(rig.config.resolve()), "the config is run in place"
     assert list(rig.state_dir.iterdir()) == []
-    assert "state_url_sqlite" not in payload["degraded"]
     assert rig.calls()[-1]["env"]["RIVET_STATE_URL"] == PG_STATE["RIVET_STATE_URL"]
 
 
@@ -112,9 +111,10 @@ def test_on_postgresql_state_a_task_on_another_host_than_its_upstream_runs(rig: 
 
 
 def test_a_binary_below_the_minimum_is_refused_with_both_versions(rig: Rig) -> None:
-    rig.scenario(version="0.31.9")  # the last below 0.32.0, which answers a replayed apply itself (G1b)
+    # 0.32.0: below 0.32.1, whose `rivet load` takes only its own export's manifests (a nested foreign prefix was loaded)
+    rig.scenario(version="0.32.0")
     exc, ti = rig.run(rig.operator(RivetApplyOperator, export="orders"))
-    assert isinstance(exc, AirflowFailException) and "0.31.9" in str(exc) and "0.32.0" in str(exc)
+    assert isinstance(exc, AirflowFailException) and "rivet 0.32.0 (fake)" in str(exc) and "0.32.1" in str(exc)
     assert ti.store[("task", "return_value")]["preflight_refusal"] == "RIVET_AIRFLOW_BINARY_TOO_OLD"
 
 
@@ -146,13 +146,13 @@ def test_with_no_notify_the_flag_is_passed_and_the_warning_is_gone(rig: Rig) -> 
 
 def test_postgres_state_on_a_local_worker_does_not_warn_about_sqlite(rig: Rig) -> None:
     payload, _ = rig.run(rig.operator(RivetRunOperator, export="orders", env=PG_STATE))
-    assert not rig.events("rivet.warning") and "state_url_sqlite" not in payload["degraded"]
+    assert not rig.events("rivet.warning")
 
 
 def test_flags_are_probed_from_help_as_whole_words(rig: Rig) -> None:
     rig.scenario(flags={"load": ["--export-all"]})
     caps = probe(str(rig.bin / "rivet"))
-    assert caps.version == (0, 32, 0)
+    assert caps.version == (0, 32, 1)
     assert caps.has_flag("run", "--export") and not caps.has_flag("load", "--export")
     assert not caps.has_flag("run", "--no-notify")
 
@@ -253,6 +253,31 @@ def test_a_state_database_left_beside_the_original_config_is_refused_until_it_is
     (rig.config_dir / ".rivet_state.db").rename(rig.state_dir / ".rivet_state.db")
     payload, _ = rig.run(rig.operator(RivetRunOperator, export="orders"))
     assert payload["decision"] == "success"
+
+
+def test_inits_checkpoint_and_its_owner_record_are_held_to_the_state_directory(rig: Rig) -> None:
+    """rivet 0.32.2 (#664): `init -o <stem>.yaml --mode cdc` writes `./cdc/<stem>_<name>.ckpt`, and the first CDC run
+    records its owner beside it as `<checkpoint>.owner`. A checkpoint left under the original's `cdc/` is refused as
+    before; the owner record alone is not a checkpoint, is never refused and is never removed by a task."""
+    ckpt = "./cdc/pg_orders_cdc.ckpt"
+    rig.config.write_text(
+        rig.config.read_text().replace("    mode: cdc\n", f"    mode: cdc\n    cdc:\n      checkpoint: {ckpt}\n")
+    )
+    beside = rig.config_dir / "cdc"
+    beside.mkdir()
+    (beside / "pg_orders_cdc.ckpt").write_text("lsn")
+    (beside / "pg_orders_cdc.ckpt.owner").write_text('{"config": "x", "export": "orders_cdc"}')
+    assert refused(rig, rig.operator(RivetCdcRunOperator, export="orders_cdc")) == "RIVET_AIRFLOW_CHECKPOINT_BESIDE_CONFIG"
+    assert str(rig.state_dir / ckpt) in rig.events("rivet.refused")[-1]["text"]
+    (rig.state_dir / "cdc").mkdir()
+    (beside / "pg_orders_cdc.ckpt").rename(rig.state_dir / "cdc" / "pg_orders_cdc.ckpt")
+    (rig.state_dir / "cdc" / "pg_orders_cdc.ckpt.owner").write_text("the copy's claim")
+    for _cycle in (1, 2):
+        payload, _ = rig.run(rig.operator(RivetCdcRunOperator, export="orders_cdc"))
+        assert payload["decision"] == "success", "an owner record left beside the original is not a checkpoint"
+    assert rig.argv("run")[2] == str(rig.copy()), "the checkpoint resolves beside the copy, in the state directory"
+    assert (beside / "pg_orders_cdc.ckpt.owner").exists()
+    assert (rig.state_dir / "cdc" / "pg_orders_cdc.ckpt.owner").read_text() == "the copy's claim"
 
 
 def test_a_cdc_checkpoint_left_beside_the_original_config_is_refused_until_it_is_moved(rig: Rig) -> None:

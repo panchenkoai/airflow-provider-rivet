@@ -45,10 +45,13 @@ SQLite state in `state_dir`.
    - `.rivet_state.db`: rivet's state, under its default name.
    - `<config name>.<hash>.yaml` (and `<config name>.<hash>--<export>.yaml`): the operator's
      copy of your config, byte for byte. `<hash>` is the first 8 hex digits of the SHA-256 of the
-     original's absolute path, so two configs with one file name never share a copy. Today's
-     rivet can only keep SQLite state beside the config file, so the operator materialises the
-     config here and runs that copy (`state_url_sqlite`). Edit your original; the copy is
-     rewritten on every task.
+     original's absolute path, so two configs with one file name never share a copy. rivet
+     resolves the config's relative paths (its SQLite state, a `cdc.checkpoint`, a `query_file`,
+     a local `destination.path`) against the config's directory, so running the copy puts all of
+     them here (see 5). Edit your original; the copy is rewritten on every task. The operator
+     does not set `RIVET_STATE_URL=sqlite:` (rivet 0.32.2): the copy already keeps the state here
+     on every rivet it runs, and a `sqlite:` value in the task's environment that names another
+     file moves the state out of the directory these checks look at, so leave it unset for tasks.
    - every relative `query_file` of the config, copied to the same relative path (see 5), and
      `.rivet_airflow_query_files.json`, which records the config directory each one came from.
    - a relative `cdc.checkpoint`, which resolves beside the copied config, that is, here.
@@ -114,7 +117,8 @@ SQLite state in `state_dir`.
    **After `rivet init -o X`:** init records the source's primary keys in a `.rivet_state.db`
    beside `X`, which the task then refuses the same way: move it (with `-wal` and `-shm`) into
    `state_dir`, or run `init` with `RIVET_STATE_URL` set to the PostgreSQL state the tasks use.
-   rivet 0.32.1 adds `RIVET_STATE_URL=sqlite:<path>`, so init and the tasks can name one file.
+   rivet 0.32.2 adds `RIVET_STATE_URL=sqlite:<path>`, so init can write into
+   `<state_dir>/.rivet_state.db`, the file the tasks use (README Quickstart).
 4. **What breaks when a task sees a different or an empty directory.** rivet creates a new,
    empty state there and treats every export as a first run: an incremental export re-reads
    from the start, a CDC stream re-anchors and the changes between the lost position and the new
@@ -132,8 +136,8 @@ SQLite state in `state_dir`.
    | Key | rivet resolves it against | Under this package |
    |---|---|---|
    | `query_file` | the config's directory; an absolute path, `..` and a symlink out of it are refused by rivet | stays as written; the file is copied to the same relative path in the state directory before every task. Refused before rivet starts (`RIVET_AIRFLOW_QUERY_FILE`) when it is absolute, has `..`, leaves the directory through a symlink, is missing for the task's export, or when a config from ANOTHER directory already put a file at that relative path in this state directory |
-   | `cdc.checkpoint` | the config's directory | resolves in the state directory; a file left beside the original is refused, see 3 |
-   | a local `destination.path` (or `prefix`) | the config's directory (rivet 0.32+) | the state directory: init's `./output/orders/` lands in `<state_dir>/output/orders/`; `cwd` does not move it. Write an absolute path to put the files elsewhere |
+   | `cdc.checkpoint` | the config's directory | resolves in the state directory, a subdirectory included (rivet 0.32.2's `init -o <stem>.yaml` writes `./cdc/<stem>_<export>.ckpt`); a file left beside the original is refused, see 3. The `<checkpoint>.owner` record rivet 0.32.2 keeps beside it (which config owns the checkpoint) is neither checked nor touched by the operator: move it with the checkpoint or leave it, rivet re-claims a checkpoint whose recorded owner no longer names it |
+   | a local `destination.path` (or `prefix`) | the config's directory (rivet 0.32+) | the state directory: init's `./output/orders/` lands in `<state_dir>/output/orders/` (from rivet 0.32.2 a CDC scaffold written with `-o <stem>.yaml` says `./output/<stem>/orders_cdc/`, which lands in `<state_dir>/output/<stem>/orders_cdc/`); `cwd` does not move it. Write an absolute path to put the files elsewhere |
    | the other paths rivet opens as written, such as `tls.ca_file` | the process's working directory | unchanged: the working directory defaults to the directory of your ORIGINAL config; set `cwd` to change it |
    The preflight reads the config as rivet does: every `${name}` is taken from a `-p` /
    `--param` in `extra_args`, then from the task's environment, and spliced into the text before

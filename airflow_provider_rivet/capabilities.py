@@ -6,7 +6,7 @@ import os
 import re
 import subprocess
 
-MIN_RIVET_VERSION = (0, 32, 0)
+MIN_RIVET_VERSION = (0, 32, 1)
 PROBE_TIMEOUT = 60
 _VERSION_RE = re.compile(r"rivet\s+(\d+)\.(\d+)\.(\d+)")
 
@@ -16,13 +16,13 @@ _VERSION_RE = re.compile(r"rivet\s+(\d+)\.(\d+)\.(\d+)")
 DEGRADATIONS = {
     "no_notify": "flag",
     "lock_wait": "flag",
-    "state_url_sqlite": "none",
     "error_object": "output",
     "per_unit_error": "output",
     "stop_reason": "output",
     "load_filter": "flag",
     "load_table_filter": "flag",
     "load_result": "flag",
+    "load_digest": "output",
     "stderr_temp": "worker",
     "crashed_ledger": "worker",
     "result_missing": "output",

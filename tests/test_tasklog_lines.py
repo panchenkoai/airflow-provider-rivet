@@ -212,13 +212,14 @@ def test_step_lines_of_a_step_that_did_not_end_an_unnamed_strategy_and_a_layout_
 
 
 def test_notes_sqlite_an_unknown_degradation_warnings_max_events_and_a_ledger_problem() -> None:
-    """_notes 20/21 (SQLite from `degraded` alone), 34-36 (an unknown key), 48-51 (rivet's warning text), 59 (the
+    """_notes 20/21 (SQLite from rivet.warning), 34-36 (an unknown key), 48-51 (rivet's warning text), 59 (the
     exports of a max_events stop), 68-75 (the crash ledger's problem)."""
     log, _ = make("run")
     log.record({"event": "rivet.warning", "warning": "other", "text": "watch out"})
     log.record({"event": "rivet.cdc.max_events", "exports": ["a", "b"]})
     log.record({"event": "rivet.crashed", "ledger_problem": "the ledger is unwritable"})
-    lines = render(log, {"decision": "success", "units": [], "degraded": ["state_url_sqlite", "mystery"]})
+    log.record({"event": "rivet.warning", "warning": "sqlite_single_host", "text": "not shown: the note says it"})
+    lines = render(log, {"decision": "success", "units": [], "degraded": ["mystery"]})
     assert lines[1:] == [
         (INFO, f"  note     SQLite state is single-host — see {SETUP_GUIDE}"),
         (INFO, "  note     degraded: mystery"),
@@ -297,3 +298,176 @@ def test_an_empty_container_key_is_left_out_like_an_absent_one() -> None:
 
     load = {"target": "bigquery", "project": "", "dataset": "d"}
     assert config_target({"load": load}, "load", "x", "t") == ("d.t__changes", None)
+
+
+# --- what a load / compact did (#63) -------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("count", "text"),
+    [
+        (0, "0 B"),
+        (1023, "1023 B"),
+        (1024, "1.0 KiB"),
+        (1536, "1.5 KiB"),
+        (52428800, "50.0 MiB"),
+        (3 * 1024**3, "3.0 GiB"),
+        (1024**4, "1.0 TiB"),
+        (2048 * 1024**4, "2048.0 TiB"),  # TiB is the last unit
+    ],
+)
+def test_a_byte_count_reads_in_binary_units(count: int, text: str) -> None:
+    assert tasklog._size(count) == text
+
+
+def test_job_ids_are_named_up_to_three_and_the_rest_counted() -> None:
+    assert tasklog._jobs(["j1"]) == "job j1"
+    assert tasklog._jobs(["j1", "j2"]) == "2 jobs (j1, j2)"
+    assert tasklog._jobs(["j1", "j2", "j3"]) == "3 jobs (j1, j2, j3)"
+    assert tasklog._jobs(["j1", "j2", "j3", "j4"]) == "4 jobs (j1, j2, j3, ...)"
+
+
+def test_a_compacts_digest_says_what_the_merge_did_and_what_it_cost() -> None:
+    digest = {
+        "rows_inserted": 200,
+        "rows_updated": 950,
+        "rows_deleted": 50,
+        "rows_merged": 1200,
+        "base_rows_after": 10150,
+        "files": None,
+        "runs": None,
+        "warehouse_job_ids": ["c1"],
+        "bytes_processed": 52428800,
+        "bytes_billed": 52428800,
+    }
+    assert tasklog._digest(digest) == [
+        "200 inserted",
+        "950 updated",
+        "50 deleted",
+        "base 10150 rows",
+        "job c1",
+        "50.0 MiB billed",
+    ]
+    # a delete_flag compact: BigQuery reports no deletes, and none is invented
+    assert tasklog._digest({**digest, "rows_deleted": None, "bytes_billed": None})[:3] == [
+        "200 inserted",
+        "950 updated",
+        "base 10150 rows",
+    ]
+
+
+def test_a_loads_digest_names_its_parts_and_runs_and_not_its_inserted_rows_twice() -> None:
+    digest = {"rows_inserted": 1200, "rows_merged": None, "base_rows_after": None, "files": 3, "runs": 1}
+    assert tasklog._digest({**digest, "warehouse_job_ids": ["l1", "l2"], "bytes_billed": 0}) == [
+        "3 files",
+        "1 source run",
+        "2 jobs (l1, l2)",
+        "0 B billed",
+    ]
+    assert tasklog._digest({"files": 1, "runs": 2, "base_rows_after": 1, "warehouse_job_ids": []}) == [
+        "base 1 row",
+        "1 file",
+        "2 source runs",
+    ]
+    assert tasklog._digest(None) == [] and tasklog._digest({}) == []
+
+
+def test_the_work_of_several_units_is_summed_and_an_unreported_total_left_out() -> None:
+    digests = [{"warehouse_job_ids": ["a", "b"], "bytes_billed": 1024}, {"warehouse_job_ids": ["c"], "bytes_billed": 1024}]
+    assert tasklog._work(digests) == ["3 jobs", "2.0 KiB billed"]
+    assert tasklog._work([{"warehouse_job_ids": ["a"], "bytes_billed": None}]) == ["1 job"]
+    assert tasklog._work([{"warehouse_job_ids": [], "bytes_billed": 0}, {}]) == ["0 B billed"]
+    assert tasklog._work([]) == []
+
+
+COMPACTED = {
+    "export": "cdc",
+    "table": "orders",
+    "target": "p.d.orders",
+    "buffer": "p.d.orders__changes",
+    "target_from": "rivet",
+    "digest": {"rows_inserted": 2, "rows_updated": 1, "rows_deleted": 0, "rows_merged": 3, "warehouse_job_ids": ["c1"]},
+}
+
+
+def test_one_compacted_table_has_its_digest_line_and_the_jobs_in_the_headline() -> None:
+    log, _ = make("compact", "cdc", "orders")
+    log.record({"event": "rivet.unit", **COMPACTED})
+    units = [{"export": "cdc", "table": "orders", "status": "compacted", "rows": 3, "run_id": "r1"}]
+    lines = render(log, {"decision": "success", "units": units})
+    assert lines == [
+        (INFO, "rivet compact cdc table orders → p.d.orders__changes into p.d.orders: OK: 3 rows, 1 job in 1.0 s (run r1)"),
+        (
+            INFO,
+            "  table    cdc.orders → p.d.orders__changes into p.d.orders: compacted, 3 rows, 2 inserted, 1 updated, 0 deleted, job c1 (run r1)",
+        ),
+    ]
+
+
+def test_a_failed_table_still_names_the_jobs_it_ran() -> None:
+    log, _ = make("compact", "cdc", "orders")
+    log.record({"event": "rivet.unit", **COMPACTED, "digest": {"warehouse_job_ids": ["c1"], "bytes_billed": 10}})
+    units = [{"export": "cdc", "table": "orders", "status": "failed", "error": {"class": "retryable"}}]
+    lines = render(log, {"decision": "retry", "error": {"class": "retryable"}, "units": units}, max_tries=1)
+    assert (INFO, "  table    cdc.orders → p.d.orders__changes into p.d.orders: failed retryable, job c1, 10 B billed") in lines
+
+
+def test_a_table_without_a_digest_has_no_line_of_its_own() -> None:
+    log, _ = make("load", "cdc", "orders")
+    log.record({"event": "rivet.unit", "export": "cdc", "table": "orders", "digest": {"warehouse_job_ids": []}})
+    lines = render(log, {"decision": "success", "units": [{"export": "cdc", "table": "orders", "status": "loaded", "rows": 1}]})
+    assert lines == [(INFO, "rivet load cdc table orders → OK: 1 row in 1.0 s")]
+
+
+def test_the_headline_splits_the_wait_for_the_lock_from_the_work() -> None:
+    """#63: `in 33.0 s` was the wait and the work together; the lock's record says how long the wait took."""
+    log, written = make("compact", "cdc", "orders")
+    log.record({"event": "rivet.lock.wait", "unit": "export `cdc`", "lock_wait": 600})
+    log.record({"event": "rivet.lock.acquired", "unit": "export `cdc`", "waited": 0.4})
+    assert written[-1] == (INFO, "took the lock of export `cdc` after 0.4 s")
+    lines = render(log, {"decision": "success", "units": [{"export": "cdc", "table": "orders", "status": "compacted"}]})
+    assert lines[0] == (INFO, "rivet compact cdc table orders → OK in 0.6 s, after 0.4 s waiting for the lock of export `cdc`")
+    log, written = make("compact", "cdc", "orders")
+    log.record({"event": "rivet.lock.acquired", "unit": "export `cdc`"})  # no seconds recorded: none are invented
+    assert written[-1] == (INFO, "took the lock of export `cdc` after 0.0 s")
+    skipped = [{"export": "cdc", "table": "orders", "status": "skipped"}]
+    assert render(log, {"decision": "success", "units": skipped})[0] == (
+        INFO,
+        "rivet compact cdc table orders → SKIPPED: nothing to do in 1.0 s, after 0.0 s waiting for the lock of export `cdc`",
+    )
+
+
+def test_units_with_no_record_of_their_own_are_listed_without_a_name_or_a_digest() -> None:
+    """A unit the task made itself (no summary, `load_result`) has no `rivet.unit` record to read a digest from."""
+    log, _ = make("load", "cdc")
+    units = [{"export": "cdc", "table": t, "status": "loaded"} for t in ("a", "b")]
+    assert render(log, {"decision": "success", "units": units})[1:] == [
+        (INFO, "  table    cdc.a: loaded"),
+        (INFO, "  table    cdc.b: loaded"),
+    ]
+
+
+def test_the_sqlite_note_comes_from_the_preflights_warning_alone() -> None:
+    """_notes: another warning is not the SQLite one, and no degradation key stands for it any more."""
+    log, _ = make("run")
+    log.record({"event": "rivet.warning", "warning": "other", "text": "watch out"})
+    assert render(log, {"decision": "success", "units": [], "degraded": []})[1:] == [(WARNING, "  note     watch out")]
+
+
+def test_a_lease_another_rivet_holds_reads_busy_like_the_packages_own_lock() -> None:
+    """_failure: RIVET_STATE_LOCK_TIMEOUT (rivet's `--lock-wait` ran out) and the lease refusals of rivet 0.32.0 are a
+    wait for another process, not a failure of this one; any other retryable stop stays FAILED."""
+    log, _ = make("load", "orders", "users")
+    error = {"class": "retryable", "code": "RIVET_STATE_LOCK_TIMEOUT", "action": "retry once it ends"}
+    lines = render(log, {"decision": "retry", "error": error, "units": []}, max_tries=1)
+    assert lines[0] == (
+        WARNING,
+        "rivet load orders table users → BUSY [RIVET_STATE_LOCK_TIMEOUT], retryable, Airflow retries it (try 1 of 2), "
+        "action: retry once it ends",
+    )
+    refused = {"class": "refusal", "code": "RIVET_STATE_RUN_IN_PROGRESS"}
+    assert render(log, {"decision": "retry", "error": refused, "units": []}, max_tries=1)[0][1].startswith(
+        "rivet load orders table users → BUSY [RIVET_STATE_RUN_IN_PROGRESS], retryable"
+    )
+    other = {"class": "retryable", "code": "RIVET_SOURCE_CONNECT"}
+    assert "→ FAILED [RIVET_SOURCE_CONNECT], retryable" in render(log, {"decision": "retry", "error": other, "units": []})[0][1]

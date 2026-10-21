@@ -23,7 +23,6 @@ so the "rivet >=" column is the first release that carries that section.
 |---|---|---|---|
 | `no_notify` | global `--no-notify` | does not pass it; warns when the config has a `notifications:` block | D9, rivet >= unreleased |
 | `lock_wait` | global `--lock-wait` and the per-export run lease | does not pass it; the builders set `max_active_runs=1` and `max_active_tis_per_dag=1` | D7, rivet >= unreleased |
-| `state_url_sqlite` | `RIVET_STATE_URL=sqlite:<dir>` | copies the config into the state directory, so `.rivet_state.db` lands beside it there | D5, rivet >= unreleased |
 | `error_object` | `class`, `retryable`, `kind`, `action` on the `--json-errors` line | derives `class` and `retryable` from the printed line's integer `exit_class`; `kind` and `action` are null | D1/D2, rivet >= unreleased |
 | `per_unit_error` | `failures[]` and `per_export[].error` | when several units of one process failed, each carries the process-level object | D2/D3, rivet >= unreleased |
 | `stop_reason` | CDC `stop_reason` and `tables[]` | `stop_reason` is null: a `max_events` stop cannot be told from `caught_up` | D4, rivet >= unreleased |
@@ -31,13 +30,14 @@ so the "rivet >=" column is the first release that carries that section.
 | `load_table_filter` | `--table` on `rivet load` / `rivet compact` | the per-table task handles every table of its export; tasks of one export are serialised by a file lock in the state directory | D3, rivet >= unreleased |
 | `load_result` | `--summary-output` on `rivet load` / `rivet compact` | status is `loaded` / `compacted` on exit 0 and `failed` otherwise; `skipped`, `table` and row counts are unknown (null) | D3, rivet >= unreleased |
 
-Five more keys record something the worker or one output lacks, not the binary's version:
+Six more keys record something the worker or one output lacks, not the binary's version:
 
 | Key | What is missing | What the package does |
 |---|---|---|
 | `stderr_temp` | a state directory or `stderr_dir` on the worker | writes rivet's stdout and stderr to a private per-user directory under the temp directory (see Secrets); a pod loses them with its disk |
 | `crashed_ledger` | a readable and writable crashed-budget ledger | without a state directory: a crash is retried only within the first `crashed_retries` tries of the task instance; with a ledger that cannot be read or written: no crash retry at all |
 | `result_malformed` | an error object or a result entry with the contract's keys and types; also a stderr line that starts with `{` and is not JSON, or a summary file of an exit-0 process that is not a JSON object | a malformed error object is ignored and the task is classified by the exit-code table; a value of the wrong type is null; a status outside the contract's words counts as `failed` |
+| `load_digest` | the digest of a `rivet load` / `rivet compact` entry (`target`, `rows_inserted` ... `bytes_billed`, ADR-0039 D3, rivet >= 0.32.2) | the unit's warehouse object is the config's `load:` block's, marked `(from config)` in the task log, and is null in XCom; the log says nothing of what the warehouse did (counts, jobs, bytes) |
 | `result_missing` | the `--summary-output` file of a process that exited 0 | rivet could not write it (it only warns); the units are built as if the binary had no summary flag: one unit per requested export or table, status from the exit |
 | `exit_zero_failed_unit` | a non-zero exit when the summary reports a failed unit | the task fails, classified by the worst failed unit (`data_integrity` > `internal` > `refusal` > `schema_drift` > `retryable` > `generic`, ADR-0039 D2) |
 

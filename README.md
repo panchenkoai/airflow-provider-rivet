@@ -41,7 +41,7 @@ rivet itself (sources, destinations, warehouses, CDC, configs): **<https://githu
   the task; nothing secret is in argv, XCom or the task log.
 
 Status: alpha. It is versioned independently of the binary and checks
-the binary's version at run time (minimum **rivet 0.32.0**; a lower one is refused with both
+the binary's version at run time (minimum **rivet 0.32.1**; a lower one is refused with both
 versions in the message). Supported: Airflow 2.10+ and 3.x, Python 3.12+ (Airflow 2.10 only on 3.12).
 
 ## Install
@@ -62,7 +62,7 @@ RUN pip install --no-cache-dir airflow-provider-rivet
 
 The operators run `rivet` from the worker's `PATH`, else the binary `rivet-cli` installed into
 Airflow's environment. To run another build, pass `rivet_bin="/abs/path/rivet"` (for example one
-copied from `ghcr.io/panchenkoai/rivet:v0.32.0`).
+copied from `ghcr.io/panchenkoai/rivet:v0.32.1`).
 
 ## Quickstart
 
@@ -70,7 +70,7 @@ A daily PostgreSQL → Parquet DAG on one worker, with SQLite state. Run the com
 (or in the image) where Airflow runs.
 
 1. **Generate the config** from the live database with `rivet init` (the `rivet` that `rivet-cli`
-   installed; 0.32.1 or newer for `RIVET_STATE_URL=sqlite:`), and keep its state in the directory
+   installed; 0.32.2 or newer for `RIVET_STATE_URL=sqlite:`), and keep its state in the directory
    the DAG will use. The directory must exist, on persistent storage, at the same path on every
    worker:
 

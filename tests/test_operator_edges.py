@@ -23,6 +23,7 @@ UNIT_KEYS = {
     "target",
     "buffer",
     "target_from",
+    "digest",
     "export",
     "table",
     "status",
@@ -51,7 +52,7 @@ def test_every_structured_event_and_the_payload_carry_their_keys(rig: Rig) -> No
     """A log pipeline reads these keys (outcome 15 18 24 34 51 52 58-69, step 60 61 88 89)."""
     rig.scenario(leak_env=[], run={"summary": {"per_export": [entry()]}, "stderr": "a warning"})
     payload = payload_of(rig, rig.operator(RivetRunOperator, export="orders", stream_stderr=True))
-    assert (payload["command"], payload["exit_status"], payload["rivet_version"]) == ("run", 0, "0.32.0 (fake)")
+    assert (payload["command"], payload["exit_status"], payload["rivet_version"]) == ("run", 0, "0.32.1 (fake)")
     [result] = rig.events("rivet.result")
     assert set(result) == RESULT_KEYS
     assert {k: result[k] for k in RESULT_KEYS - {"event"}} == {k: payload[k] for k in RESULT_KEYS - {"event"}}
@@ -241,3 +242,49 @@ def test_a_crash_ledger_that_cannot_be_written_names_the_error(tmp_path: Path, m
     monkeypatch.setattr(invocation, "_write_atomic", refuse)
     allowed, why = crashed_retry_allowed(tmp_path / "crashed" / "ledger", 1, 3, 1)
     assert allowed is False and "cannot be written (PermissionError)" in str(why)
+
+
+# --- the digest of a load / compact entry (#63) --------------------------------------------------------------------
+
+
+def digest_of(row: dict) -> tuple[dict | None, set[str]]:
+    """`_digest` of one entry, and the degradations it recorded."""
+    from types import SimpleNamespace
+
+    s = SimpleNamespace(degraded=set())
+    s.malformed = lambda value, kind: invocation._Session.malformed(s, value, kind)
+    return invocation._digest(s, row), s.degraded  # type: ignore[arg-type]
+
+
+def test_a_digest_is_read_with_the_contracts_types_and_nothing_else() -> None:
+    from conftest import fixture
+
+    for name in ("load_result.json", "compact_result.json"):
+        for row in fixture(name)["per_table"]:
+            digest, degraded = digest_of(row)
+            assert digest == {k: row[k] for k in invocation.DIGEST_KEYS} and degraded == set(), (name, row["table"])
+    digest, degraded = digest_of({"rows_merged": "12", "bytes_billed": True, "files": 1.0, "warehouse_job_ids": ["j", 1]})
+    assert digest == {k: None for k in invocation.DIGEST_KEYS} and degraded == {"result_malformed"}
+    digest, degraded = digest_of({"warehouse_job_ids": ["j", 1]})  # one id that is not a name: no ids at all
+    assert digest["warehouse_job_ids"] is None and degraded == {"result_malformed"}
+    digest, degraded = digest_of({"warehouse_job_ids": "j1", "runs": 2})
+    assert digest["warehouse_job_ids"] is None and digest["runs"] == 2 and degraded == {"result_malformed"}
+
+
+def test_an_entry_without_a_digest_key_is_an_older_binary_and_says_so() -> None:
+    assert digest_of({"export": "e", "table": "t", "rows": 1, "target": "p.d.t"}) == (None, {"load_digest"})
+    for key in invocation.DIGEST_KEYS:  # any one key is the digest's shape: the rest read as null
+        digest, degraded = digest_of({key: None})
+        assert digest == {k: None for k in invocation.DIGEST_KEYS} and degraded == set(), key
+
+
+def test_the_unit_record_carries_the_digest_and_the_configs_names_where_xcom_has_none(rig: Rig) -> None:
+    """A row without the digest (a binary older than 0.32.2): the log names the config's table, XCom nothing."""
+    rig.config.write_text(rig.config.read_text() + "load:\n  target: bigquery\n  project: p\n  dataset: d\n")
+    row = {"export": "users", "table": "users", "status": "loaded", "rows": 4}
+    rig.scenario(flags=NEW_FLAGS, load={"summary": {"run_id": "l1", "per_table": [row]}})
+    payload = payload_of(rig, rig.operator(RivetLoadOperator, export="users", table="users"))
+    [unit] = rig.events("rivet.unit")
+    assert (unit["target"], unit["target_from"], unit["digest"]) == ("p.d.users__changes", "config", None)
+    assert (payload["units"][0]["target"], payload["units"][0]["buffer"]) == (None, None)
+    assert "load_digest" in payload["degraded"]

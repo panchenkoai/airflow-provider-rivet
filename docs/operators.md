@@ -58,15 +58,20 @@ Every task returns (and, on failure, pushes before raising) one XCom value under
 
 ```json
 { "command": "apply", "decision": "success",
-  "units": [ { "export": "orders", "table": null, "status": "success", "run_id": "orders_...",
+  "units": [ { "export": "orders", "table": null, "target": null, "buffer": null,
+               "status": "success", "run_id": "orders_...",
                "rows": 2500, "files": 1, "stop_reason": null, "error": null } ],
-  "error": null, "degraded": ["lock_wait", "no_notify", "state_url_sqlite"],
+  "error": null, "degraded": ["lock_wait", "no_notify"],
   "exit_status": 0, "signal": null, "stderr_path": "/var/lib/rivet/postgres/logs/...",
-  "skip_reason": null, "state_marker": "1d86...", "rivet_version": "0.32.0 (8afde974)" }
+  "skip_reason": null, "state_marker": "1d86...", "rivet_version": "0.32.1 (5ee08c0a)" }
 ```
 
 A unit has exactly the shape of `tests/fixtures/scheduler/xcom_unit*.json`; a package test
-compares the two, so the package and the Rust contract cannot drift.
+compares the two, so the package and the Rust contract cannot drift. `target` and `buffer` are the
+warehouse objects a load or compact unit wrote and read, as rivet's result names them (null for a
+run or apply unit, and null when the binary's result has no names: the config's guess is never
+put in XCom). What the warehouse did (rows inserted, updated and deleted, parts, jobs, bytes) is
+not part of the XCom unit: it is in the task log and in the `rivet.unit` record's `digest`.
 
 ## Reading the task log
 
@@ -101,12 +106,30 @@ A load or compact task names the warehouse object it wrote after the arrow, as r
 it: a load the table of a `full` export, else its `__changes` log
 (`rivet load cdc table orders → my-project.demo_cdc.orders__changes: OK: 50 rows in 12.0 s`); a
 compact the buffer it merged and the base (`….orders__changes into ….orders`). A binary whose
-result has no such name gets it from the config's `load:` block, marked `(from config)`.
+result has no such name gets it from the config's `load:` block, marked `(from config)`
+(`load_digest`).
+
+With rivet >= 0.32.2 a load or compact also says what the warehouse did, from rivet's per-table
+digest (ADR-0039 D3): the headline sums the rows, the warehouse jobs and the bytes billed, and
+one line per table gives a compact's inserted / updated / deleted rows and the base's rows after,
+a load's Parquet parts and source runs, the job ids (the first three) and the bytes billed. A
+value rivet did not return (bytes on ClickHouse and Snowflake, job ids on Snowflake) is left out,
+never shown as 0:
+
+```
+rivet compact cdc table orders → p.orders__changes into p.orders: OK: 1200 rows, 1 job, 50.0 MiB billed in 3.4 s, after 30.0 s waiting for the lock of export `cdc` (run …)
+  table    cdc.orders → p.orders__changes into p.orders: compacted, 1200 rows, 200 inserted, 950 updated, 50 deleted, base 10150 rows, job rivet_compact_orders_1, 50.0 MiB billed (run …)
+```
+
+A task that waited for the export's lock says so when it takes it (``took the lock of export
+`cdc` after 30.0 s``), and its headline gives the time after the wait apart from the wait.
 
 - The headline's outcome is `OK`, `SKIPPED` (nothing to do: rivet's `skip_reason`, or an earlier
   try already applied the plan), `REFUSED` (class `refusal`, or a preflight refusal before rivet
   started), `FAILED` (with its class), `CRASHED` (a signal or a 129-255 exit), `STOPPED` (Airflow
-  stopped the task) or `BUSY` (the export's lock stayed held). A final failure says `final` and is
+  stopped the task) or `BUSY` (the export's lock stayed held, or rivet's own lease of the export or
+  table was held by another rivet: `RIVET_STATE_LOCK_TIMEOUT`, `RIVET_STATE_RUN_IN_PROGRESS`,
+  `RIVET_LOAD_TABLE_BUSY`; retried). A final failure says `final` and is
   an ERROR line; one Airflow retries says `retryable, Airflow retries it (try N of M)` and is a
   WARNING line. The registry `action` follows when rivet printed one.
 - `note` lines are INFO, except what you must act on: a `notifications:` block rivet will send

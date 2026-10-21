@@ -18,9 +18,25 @@ STOP_RANK = ("crashed", "generic", "retryable", "schema_drift", "refusal", "inte
 # `already_applied` (rivet >= 0.32, ADR-0039 D3): an apply that replayed a point-in-time plan rivet had already applied
 # answers with the run that applied it (`run_id` == `answered_by_run`) and extracts nothing.
 STATUSES = frozenset({"success", "failed", "skipped", "loaded", "compacted", "already_applied"})
-# rivet's refusals of a second holder of one lease (exit 5, refusal): their remedy is "wait for the holder to end, then
-# repeat", which is what an Airflow retry does, so they are retried whatever the printed `retryable` says (G2).
-BUSY_CODES = frozenset({"RIVET_STATE_RUN_IN_PROGRESS", "RIVET_LOAD_TABLE_BUSY"})
+# rivet's stops for a lease another live process holds: their remedy is "wait for the holder to end, then repeat", which
+# is what an Airflow retry does, so they are retried whatever the printed `retryable` says (G2). rivet 0.32.0 printed the
+# first two as exit 5 refusals; rivet >= 0.32.2 gives them kind `busy`, exit 2, and stops with RIVET_STATE_LOCK_TIMEOUT
+# when its own `--lock-wait` for the lease runs out (the provider's RIVET_AIRFLOW_EXPORT_BUSY, inside rivet).
+BUSY_CODES = frozenset({"RIVET_STATE_RUN_IN_PROGRESS", "RIVET_LOAD_TABLE_BUSY", "RIVET_STATE_LOCK_TIMEOUT"})
+# What a `rivet load` / `rivet compact` entry reports beyond its rows (ADR-0039 D3, rivet >= 0.32.2): the counts the
+# warehouse or the ledger returned, and the jobs it ran. A value nobody returned is null, never 0.
+DIGEST_COUNTS = (
+    "rows_inserted",
+    "rows_updated",
+    "rows_deleted",
+    "rows_merged",
+    "base_rows_after",
+    "files",
+    "runs",
+    "bytes_processed",
+    "bytes_billed",
+)
+DIGEST_KEYS = (*DIGEST_COUNTS, "warehouse_job_ids")
 
 
 @dataclass(frozen=True)
@@ -114,17 +130,23 @@ class UnitResult:
     error: ErrorObject | None = None
     skip_reason: str | None = field(default=None, compare=False)
     # The warehouse object a load / compact unit wrote, the `__changes` buffer a compact read, and whether rivet named
-    # them (`rivet`) or the config's `load:` did (`config`); in the task log and the `rivet.unit` record, not yet in the
-    # contract's XCom unit.
-    target: str | None = field(default=None, compare=False)
-    buffer: str | None = field(default=None, compare=False)
+    # them (`rivet`) or the config's `load:` did (`config`, a binary whose result lacks the names). XCom carries only
+    # rivet's names: a value rivet did not return is null there, never the config's guess.
+    target: str | None = None
+    buffer: str | None = None
     target_from: str | None = field(default=None, compare=False)
+    # The D3 digest of a load / compact unit (`DIGEST_KEYS`), `None` when rivet's entry has none; in the task log and
+    # the `rivet.unit` record, not in the contract's XCom unit.
+    digest: dict[str, Any] | None = field(default=None, compare=False)
 
     def to_xcom(self) -> dict[str, Any]:
         """The contract's XCom unit shape (tests/fixtures/scheduler/xcom_unit*.json)."""
+        named = self.target_from == "rivet"
         return {
             "export": self.export,
             "table": self.table,
+            "target": self.target if named else None,
+            "buffer": self.buffer if named else None,
             "status": self.status,
             "run_id": self.run_id,
             "rows": self.rows,

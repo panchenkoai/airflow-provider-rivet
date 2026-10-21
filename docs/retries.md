@@ -17,7 +17,11 @@ How rivet's exit and error object become an Airflow success, retry or stop.
 | exit 1 with a printed line saying `class: "crashed"` (a killed child, future binary) | `crashed` | the same crashed budget |
 | any other status | built: `generic` | `AirflowFailException`: no retry |
 | the package's own preflight refused | `preflight_refusal: RIVET_AIRFLOW_*` in XCom | `AirflowFailException`: no retry |
-| code `RIVET_STATE_RUN_IN_PROGRESS` (rivet 0.32.0 prints it with exit class 2) or `RIVET_LOAD_TABLE_BUSY` (exit 5) (another rivet holds the export's run lease or the table's load lease; rivet's remedy is "wait, then repeat") | `refusal`, `retryable: true` whatever the line says | `AirflowException`: retried under `retries` |
+| code `RIVET_STATE_RUN_IN_PROGRESS` (rivet 0.32.0 prints it with exit class 2) or `RIVET_LOAD_TABLE_BUSY` (exit 5) (another rivet holds the export's run lease or the table's load lease; rivet's remedy is "wait, then repeat") | `refusal`, `retryable: true` whatever the line says | `AirflowException`: retried under `retries`; the headline says `BUSY` |
+| code `RIVET_STATE_LOCK_TIMEOUT` (rivet >= 0.32.2, kind `busy`, exit 2: rivet waited `--lock-wait` seconds for a lease another rivet process holds and gave up; the same end as `RIVET_AIRFLOW_EXPORT_BUSY`, inside rivet) | `retryable`, `retryable: true` whatever the line says | `AirflowException`: retried under `retries`; the headline says `BUSY`, the exception names the export |
+| code `RIVET_LOAD_BLOCK_MISSING` (rivet >= 0.32.2, kind `usage`, exit 1: load or compact on a config with no `load:` block) | `generic` | `AirflowFailException`: no retry; add the block |
+| code `RIVET_SOURCE_CDC_CHECKPOINT_SHARED` (rivet >= 0.32.2, exit 5: another config's export owns the checkpoint, `<checkpoint>.owner`) | `refusal` | `AirflowFailException`: no retry; give the export its own `cdc.checkpoint` |
+| code `RIVET_INIT_CDC_NAME_TAKEN` (rivet >= 0.32.2, exit 5; `rivet init` only, which no operator runs) | `refusal` | `AirflowFailException`: no retry |
 | the export's lock stayed held for `lock_wait` seconds ([Overlap](limits.md#overlap)) | `busy: RIVET_AIRFLOW_EXPORT_BUSY` in XCom; rivet is not started | `AirflowException`: retried under `retries` |
 
 The exception text is `[code] class: action (export)`. It never contains rivet's error message.

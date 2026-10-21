@@ -169,3 +169,45 @@ def test_a_stopped_process_is_killed_once_it_outlives_the_grace_exactly(monkeypa
     running.stop_at = 1000.0
     assert running.wait() == -9
     assert proc.kills == [1000.0 + invocation.STOP_GRACE] and set(proc.timeouts) == {0.2}
+
+
+def test_a_lock_taken_after_a_wait_records_how_long_the_wait_took(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """_wait_for_lock (#63, #61): the wait's end is recorded once, with the seconds from its start to the lock, so the
+    task log can tell the wait from rivet's work."""
+    path = tmp_path / "x.lock"
+    holder = os.open(path, os.O_RDWR | os.O_CREAT)
+    fcntl.flock(holder, fcntl.LOCK_EX)
+    fd = os.open(path, os.O_RDWR)
+    clock = Clock()
+
+    def sleep(seconds: float) -> None:
+        Clock.sleep(clock, seconds)
+        if len(clock.sleeps) == 3:  # the other holder lets go during the third poll
+            fcntl.flock(holder, fcntl.LOCK_UN)
+
+    clock.sleep = sleep  # type: ignore[method-assign]
+    monkeypatch.setattr(invocation, "time", clock)
+    s, events = wait_session(60)
+    try:
+        invocation._wait_for_lock(s, fd, path, "export `orders`")
+    finally:
+        os.close(fd)
+        os.close(holder)
+    assert len(clock.sleeps) == 3
+    assert events == [
+        {"event": "rivet.lock.wait", "lock": str(path), "unit": "export `orders`", "lock_wait": 60},
+        {"event": "rivet.lock.acquired", "lock": str(path), "unit": "export `orders`", "waited": clock.now - 100.0},
+    ]
+    assert events[1]["waited"] == pytest.approx(3 * invocation.LOCK_POLL)
+
+
+def test_a_free_lock_is_taken_without_a_record(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """_wait_for_lock: no wait, no record of one."""
+    monkeypatch.setattr(invocation, "time", Clock())
+    fd = os.open(tmp_path / "free.lock", os.O_RDWR | os.O_CREAT)
+    s, events = wait_session(60)
+    try:
+        invocation._wait_for_lock(s, fd, tmp_path / "free.lock", "u")
+    finally:
+        os.close(fd)
+    assert events == []

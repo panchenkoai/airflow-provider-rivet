@@ -30,7 +30,7 @@ from airflow_provider_rivet.operators import (
     connection_url,
 )
 
-OLD_BATCH = ["lock_wait", "no_notify", "state_url_sqlite"]
+OLD_BATCH = ["lock_wait", "no_notify"]
 # An apply that failed retryably: its retry replays the sealed plan. A retry after an apply that SUCCEEDED is answered
 # `already_applied` by rivet (G1b, tests/test_retry.py), so the tests of how a retry replays its plan start from a failure.
 FAILED_APPLY = {"exit": 2, "line": {"error": "network", "exit_class": 2}}
@@ -72,6 +72,8 @@ def test_apply_success_on_todays_binary(rig: Rig) -> None:
         {
             "export": "orders",
             "table": None,
+            "target": None,
+            "buffer": None,
             "status": "success",
             "run_id": "orders_1",
             "rows": 500,
@@ -96,7 +98,7 @@ def test_apply_on_a_binary_with_the_contract_flags_passes_them_and_degrades_noth
     apply = rig.argv("apply")
     assert apply[2:] == ["--summary-output", apply[3], "--json-errors", "--no-notify", "--lock-wait", "30"]
     assert not any(c["argv"][0] == "metrics" for c in rig.calls())
-    assert payload["degraded"] == ["state_url_sqlite"] and payload["units"][0]["rows"] == 7
+    assert payload["degraded"] == [] and payload["units"][0]["rows"] == 7
 
 
 def test_a_retry_reuses_the_sealed_plan_artifact(rig: Rig) -> None:
@@ -324,6 +326,8 @@ def test_load_on_todays_binary_runs_a_single_export_copy_of_the_config(rig: Rig)
         {
             "export": "users",
             "table": "users",
+            "target": None,
+            "buffer": None,
             "status": "loaded",
             "run_id": None,
             "rows": None,
@@ -338,7 +342,6 @@ def test_load_on_todays_binary_runs_a_single_export_copy_of_the_config(rig: Rig)
         "load_table_filter",
         "lock_wait",
         "no_notify",
-        "state_url_sqlite",
     ]
     assert (rig.state_dir / "airflow" / "locks" / "users.lock").exists()
 
@@ -375,7 +378,7 @@ def test_load_on_a_contract_binary_filters_by_flag_and_reads_the_result(rig: Rig
     assert type(exc) is AirflowException
     payload = ti.store[("task", "return_value")]
     assert [(u["table"], u["status"], u["error"]["class"]) for u in payload["units"]] == [("events", "failed", "retryable")]
-    assert payload["degraded"] == ["state_url_sqlite"]
+    assert payload["degraded"] == []
 
 
 def test_a_load_that_is_up_to_date_is_a_success_so_compact_still_runs(rig: Rig) -> None:
@@ -395,7 +398,16 @@ def test_a_compaction_rivet_reports_as_skipped_is_an_airflow_skip(rig: Rig) -> N
 
 def failed_unit(error: dict, export: str | None = None, table: str | None = None) -> dict:
     """One failed unit as the XCom carries it."""
-    base = {"export": export, "table": table, "run_id": None, "rows": None, "files": None, "stop_reason": None}
+    base = {
+        "export": export,
+        "table": table,
+        "target": None,
+        "buffer": None,
+        "run_id": None,
+        "rows": None,
+        "files": None,
+        "stop_reason": None,
+    }
     return {**base, "status": "failed", "error": error}
 
 
@@ -941,7 +953,7 @@ def test_a_worker_state_url_the_task_does_not_pass_on_is_refused_before_rivet_st
     assert not (rig.state_dir / "logs").exists() and not list(rig.state_dir.glob("*.yaml"))
     passed = rig.operator(RivetRunOperator, export="orders", env_passthrough=["RIVET_STATE_URL"])
     payload, _ = rig.run(passed)
-    assert payload["decision"] == "success" and "state_url_sqlite" not in payload["degraded"]
+    assert payload["decision"] == "success"
     declared = rig.operator(
         RivetRunOperator, export="orders", env={"RIVET_PG_URL": SECRET, "RIVET_STATE_URL": "postgresql://other/db"}
     )
@@ -949,8 +961,8 @@ def test_a_worker_state_url_the_task_does_not_pass_on_is_refused_before_rivet_st
     assert [c["env"]["RIVET_STATE_URL"] for c in rig.calls()] == [STATE_URL, "postgresql://other/db"]
     monkeypatch.setenv("RIVET_STATE_URL", STATE_URL)
     opted_out, _ = rig.run(rig.operator(RivetRunOperator, export="orders", env={"RIVET_PG_URL": SECRET, "RIVET_STATE_URL": ""}))
-    assert opted_out["decision"] == "success" and "state_url_sqlite" in opted_out["degraded"], (
-        "a declared empty value is a decision"
+    assert opted_out["decision"] == "success" and rig.argv("run")[2] == str(rig.copy()), (
+        "a declared empty value is a decision: SQLite state, beside the config's copy in state_dir"
     )
     assert rig.calls()[-1]["env"]["RIVET_STATE_URL"] == ""
     for ignored in ("", " ", "sqlite:///tmp/x.db", "mysql://state-db/x", "Postgres://state-db/x", " postgresql://state-db/x"):
@@ -959,7 +971,7 @@ def test_a_worker_state_url_the_task_does_not_pass_on_is_refused_before_rivet_st
         assert isinstance(payload, dict) and payload["decision"] == "success", (
             f"rivet does not use {ignored!r} as its state: {payload}"
         )
-        assert "state_url_sqlite" in payload["degraded"]
+        assert rig.argv("run")[2] == str(rig.copy()), "SQLite state beside the copy in state_dir"
     for used in ("postgres://state-db/x", "postgresql://state-db/x"):
         monkeypatch.setenv("RIVET_STATE_URL", used)
         exc, _ = rig.run(rig.operator(RivetRunOperator, export="orders"))
@@ -1393,7 +1405,7 @@ def test_a_failed_table_row_without_its_error_fails_the_task_on_exit_zero(rig: R
     assert type(exc) is AirflowFailException and payload["decision"] == "fail"
     (unit,) = payload["units"]
     assert unit["status"] == "failed" and unit["error"]["class"] == "generic"
-    assert payload["degraded"] == ["exit_zero_failed_unit", "state_url_sqlite"], "one failed unit: no per_unit_error"
+    assert payload["degraded"] == ["exit_zero_failed_unit", "load_digest"], "one failed unit: no per_unit_error"
 
 
 def test_a_failed_table_row_without_its_error_takes_the_printed_process_error(rig: Rig) -> None:
