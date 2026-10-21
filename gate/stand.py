@@ -212,12 +212,15 @@ class Stand:
         workers: int = 1,
         destinations: tuple[Any, ...] = (),
         state_place: str = "gate",
+        migrate_from: Path | None = None,
     ) -> None:
         self.flavor = FLAVORS[version]
         if state_place not in STATE_PLACES:
             raise ValueError(f"state place {state_place!r}: one of {STATE_PLACES}")
         #: Where the source legs' configs keep rivet's state (`STATE_PLACES`).
         self.state_place = state_place
+        #: rivet 0.32.1 for the migration leg (gate/migrate.py), mounted at /opt/rivet/bin/rivet-0.32.1.
+        self.migrate_from = migrate_from
         #: 1: one Celery worker on the shared volume; 2: the multi-host leg, two workers with a disk each.
         self.workers = workers
         # The run tag keeps two gate runs of one Airflow version apart: each `down -v` and image build is its own.
@@ -299,8 +302,25 @@ class Stand:
                 for d in self.destinations
                 for kind in d.configs
             },
+            **self.migration_connections(),
             **self.extra_connections,
         }
+
+    def migration_connections(self) -> dict[str, dict[str, Any]]:
+        """The migration leg's (gate/migrate.py): its MySQL database and its PostgreSQL state, where `state_place` says."""
+        mysql = [e for e in self.sources if e.name == "mysql"]
+        if not self.migrate_from or not mysql:
+            return {}
+        return {
+            "rivet_gate_mysql_mig": {**mysql[0].connection(self.secrets), "schema": "rivet_mig"},
+            state_conn_id("mysql", "mig"): self.leg_state_conn(state_db("mysql", "mig")),
+        }
+
+    def leg_state_sql(self, db: str, sql: str) -> str:
+        """Read a source leg config's state database (the gate's state server, or the compose `postgres` as its owner)."""
+        if self.state_place == "compose-postgres":
+            return self.metastore_sql(db, sql)
+        return self.psql("gate-state", db, sql)
 
     @property
     def hosts(self) -> tuple[str, ...]:
@@ -378,6 +398,11 @@ class Stand:
             for sub in HOST_DIRS:
                 (self.host_disk(host) / sub).mkdir(parents=True)
         shutil.copy2(HERE / "stand" / "dags" / "rivet_gate.py", self.dir / "dags" / "rivet_gate.py")
+        if self.migrate_from:
+            # The previous release the migration leg starts on, in the mount every container has (/opt/rivet/bin).
+            (self.rivet_dir / "bin").mkdir(parents=True, exist_ok=True)
+            shutil.copy2(self.migrate_from, self.rivet_dir / "bin" / "rivet-0.32.1")
+            (self.rivet_dir / "bin" / "rivet-0.32.1").chmod(0o755)
         services = "\n".join(
             f"  {s}:\n    <<: *rivet"
             + (

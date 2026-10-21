@@ -259,3 +259,22 @@ if os.environ.get("GATE_WORKERS", "1") != "1" and os.path.exists(MULTIHOST_SHAPE
                 "RIVET_TEST_PAUSE_MARKER": f"{ROOT}/markers/mh_{mh['paused']}",
             }
         globals()[f"gate_mh_{name}"] = dag
+
+
+# The migration leg (gate/migrate.py): one MySQL CDC config and one state_dir, run by rivet 0.32.1 on SQLite, then by this
+# binary on the PostgreSQL state `rivet state copy` filled, then (the way back) by this binary on the SQLite file again.
+if os.path.exists(f"{ROOT}/configs/mysql_migrate.json"):
+    with open(f"{ROOT}/configs/mysql_migrate.json") as handle:
+        mig = json.load(handle)
+    on_sqlite = {"env_from_connections": {mig["url_env"]: mig["conn"]}, "env": {"RIVET_STATE_URL": ""}, "single_host": True}
+    on_pg = {"env_from_connections": {mig["url_env"]: mig["conn"], "RIVET_STATE_URL": mig["state_conn"]}}
+    for kind, kwargs in (("sqlite", {**on_sqlite, "rivet_bin": mig["old_bin"]}), ("pg", on_pg), ("back", on_sqlite)):
+        globals()[mig["dags"][kind]] = build_cdc_dag(
+            mig["dags"][kind],
+            config=mig["config"],
+            export=mig["stream"]["name"],
+            tables=mig["stream"]["tables"],
+            state_dir=mig["state_dir"],
+            operator_kwargs={**kwargs, "connections": ["gate_gcp"]},
+            tags=["rivet", "gate", "migrate"],
+        )
