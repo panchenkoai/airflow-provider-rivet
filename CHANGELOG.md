@@ -51,6 +51,11 @@ Against rivet 0.32.1 (the minimum) and 0.32.2, and the contract of ADR-0039 on r
   and the lock of a task without an export are named by the path the DAG gave, not the symlink-resolved one. A sync
   left the previous copy behind, still naming the CDC checkpoint, and rivet 0.32.2 refuses a checkpoint another config
   still names (`RIVET_SOURCE_CDC_CHECKPOINT_SHARED`): every CDC stream would have stopped at the first sync.
+  Under git-sync, upgrade the provider together with or before rivet 0.32.2: provider 0.1.0 with rivet 0.32.2 is
+  refused at the first sync with `[RIVET_SOURCE_CDC_CHECKPOINT_SHARED] cdc: checkpoint '<state_dir>/cdc/<stem>_<export>.ckpt'
+  belongs to export '<export>' of config '<state_dir>/<stem>.<8 hex>.yaml', which still reads it; ...`. To clear it,
+  install 0.2.0, delete the provider's old copy the message names (`<state_dir>/<stem>.<8 hex>.yaml`; never the
+  checkpoint or its `.owner`) and clear the task: the stream continues from its checkpoint.
 - On PostgreSQL state, a task whose upstream rivet task ran on another host (another state_dir marker) is no longer
   refused `RIVET_AIRFLOW_STATE_DIR_DIFFERS`: with two Celery workers, each with its own state_dir, a load landing on
   the other host than its extract failed without a retry, in the deployment docs/state.md recommends for several
