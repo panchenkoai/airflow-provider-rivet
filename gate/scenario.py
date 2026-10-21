@@ -354,7 +354,7 @@ def play(
         DAGS
         + (leg.dags if leg else [])
         + [d for src in src_legs for d in src.dags]
-        + [d for x in dest_legs for d in [*x.dags, destinations.CONFIGS["missing"].dag]]
+        + [d for x in dest_legs for d in [*x.dags, *x.probe_dags]]
     )
     files: set[str] = set()
     high_water: dict[str, Any] = {}
@@ -365,3 +365,4 @@ def play(
         )
     for dest in dest_legs:
         dest.missing_bucket_probe(stand, v, wait_runs)
+        dest.cleanup_probe(stand, v, wait_runs)

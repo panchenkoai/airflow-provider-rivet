@@ -24,7 +24,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from . import oracle, warehouse
+from . import cleanup, oracle, warehouse
 from .stand import SOURCE_DSN, state_db
 
 NAME = "s3"
@@ -72,6 +72,7 @@ class Config:
     source_conn: str
     bucket: str
     clickhouse_db: str = ""  # with a ClickHouse `load:` block (the load half)
+    database: str = "rivet"  # the database init and the DAGs read on `service`
 
     @property
     def dag(self) -> str:
@@ -93,9 +94,14 @@ CONFIGS = {
         ),
         # The bucket is never made: the run must stop on a coded refusal, once.
         Config("missing", "incremental", "gate-source", "RIVET_GATE_SOURCE_URL", "rivet_gate_source", "gate-s3-missing"),
+        # `cleanup_source` (gate/cleanup.py): a database of its own, so its extra changes and held run touch no cycle.
+        Config(
+            cleanup.KIND, "incremental", "gate-source-s3", "RIVET_GATE_CLEANUP_SOURCE_URL", "rivet_gate_s3_cleanup_source",
+            "gate-s3-cleanup", "gate_s3_cleanup", cleanup.DATABASE,
+        ),
     )
 }  # fmt: skip
-#: The configs whose DAGs run in every cycle (the missing-bucket DAG runs once, on its own).
+#: The configs whose DAGs run in every cycle (the missing-bucket and cleanup DAGs run after the cycles, on their own).
 CYCLED = ("batch", "cdc", "ch_batch", "ch_cdc")
 
 
@@ -208,6 +214,15 @@ class S3Leg:
 
     def __init__(self) -> None:
         self.dags = [CONFIGS[k].dag for k in CYCLED]
+        #: The DAGs that run once after the cycles.
+        self.probe_dags = [CONFIGS["missing"].dag, *cleanup.dags(list(TABLES))]
+        self.columns = TABLES
+        self.cleanup_bucket = CONFIGS[cleanup.KIND].bucket
+        self.cleanup_db = CONFIGS[cleanup.KIND].clickhouse_db
+        self.cleanup_service = CONFIGS[cleanup.KIND].service
+        self.cleanup_state_db = state_db(NAME, cleanup.KIND)
+        self.cleanup_source_dsn = ""
+        self.ch_exec = ch_exec
         self.tasks: dict[str, list[str]] = {}
         self.may_skip: dict[str, tuple[str, ...]] = {}
         self.shape: dict[str, dict[str, Any]] = {}
@@ -242,6 +257,14 @@ class S3Leg:
                 "password": secrets.source_s3,
                 "schema": "rivet",
             },
+            "rivet_gate_s3_cleanup_source": {
+                "conn_type": "postgres",
+                "host": "gate-source-s3",
+                "port": 5432,
+                "login": "rivet",
+                "password": secrets.source_s3,
+                "schema": cleanup.DATABASE,
+            },
         }
 
     # --- setup ---
@@ -270,9 +293,13 @@ class S3Leg:
         self.wait_ready(stand)
         self.minio_port = stand.host_port("gate-minio", 9000)
         self.source_s3_dsn = SOURCE_DSN.format(port=stand.host_port("gate-source-s3", 5432), password=stand.secrets.source_s3)
+        self.cleanup_source_dsn = self.source_s3_dsn.replace("dbname=rivet ", f"dbname={cleanup.DATABASE} ")
         stand.psql("gate-source-s3", "rivet", seed)
         problems = []
         for kind, cfg in CONFIGS.items():
+            if cfg.database != "rivet":
+                stand.psql(cfg.service, "rivet", f"CREATE DATABASE {cfg.database};")
+                stand.psql(cfg.service, cfg.database, seed)
             if kind != "missing":
                 self.mc(stand, "mb", f"gate/{cfg.bucket}")
             if cfg.clickhouse_db:
@@ -286,7 +313,7 @@ class S3Leg:
             stand.compose(
                 "exec", "-T", "-e", cfg.url_env, "-e", "RIVET_STATE_URL", "airflow-worker", *init_argv(cfg, out),
                 extra_env={
-                    cfg.url_env: f"postgresql://rivet:{password}@{cfg.service}:5432/rivet",
+                    cfg.url_env: f"postgresql://rivet:{password}@{cfg.service}:5432/{cfg.database}",
                     "RIVET_STATE_URL": stand.state_url(state_db(NAME, kind)),
                 },
             )  # fmt: skip
@@ -306,6 +333,7 @@ class S3Leg:
                 "state_conn": f"rivet_gate_state_{NAME}_{kind}",
                 "connections": ["rivet_gate_s3"] + (["rivet_gate_s3_clickhouse"] if cfg.clickhouse_db else []),
                 "load": bool(cfg.clickhouse_db),
+                **(cleanup.shape() if kind == cleanup.KIND else {}),
             }
         if problems:
             raise ValueError("; ".join(problems))
@@ -467,6 +495,10 @@ class S3Leg:
         if state != "failed":
             problems.insert(0, f"run {state}, expected failed")
         v.grade("s3/missing-bucket/coded-final-stop", problems, ok=f"{MISSING_BUCKET_CODE}, exit {MISSING_BUCKET_EXIT}, one try")
+
+    def cleanup_probe(self, stand: Any, v: Any, wait_runs: Any) -> None:
+        """The three `cleanup_source` guarantees (gate/cleanup.py), on init's own config, after the cycles."""
+        cleanup.Phase(self, stand, v, wait_runs, list(TABLES)).play()
 
 
 def legs(names: Sequence[str]) -> list[S3Leg]:

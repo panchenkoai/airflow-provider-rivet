@@ -69,7 +69,7 @@ def test_init_gets_the_bucket_and_region_and_no_url_and_clickhouse_only_for_the_
     # The extract-only half and the load half read different servers: init's slot `rivet_public_cdc` is one per server.
     assert CONFIGS["cdc"].service != CONFIGS["ch_cdc"].service
     assert len({c.bucket for c in CONFIGS.values()}) == len(CONFIGS)
-    assert len({c.clickhouse_db for c in CONFIGS.values() if c.clickhouse_db}) == 2
+    assert len({c.clickhouse_db for c in CONFIGS.values() if c.clickhouse_db}) == 3
 
 
 # --- The stand -----------------------------------------------------------------------------------------------------------
