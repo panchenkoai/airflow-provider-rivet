@@ -376,6 +376,8 @@ def play(
             src.hot_phase(stand, v, wait_runs, grade_runs)
         if src.engine.shared is not None and src.shared:
             src.shared_phase(stand, v, wait_runs, grade_runs)
+        if src.engine.recreate is not None:
+            src.recreate_phase(stand, v, wait_runs)
         if src.engine.git_sync is not None:
             src.git_sync_phase(stand, v, wait_runs)
     for dest in dest_legs:

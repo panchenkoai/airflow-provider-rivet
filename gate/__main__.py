@@ -55,6 +55,13 @@ def main(argv: list[str] | None = None) -> int:
         "`rivet init --s3-bucket` writes, extract-only and loaded into the stack's ClickHouse",
     )
     ap.add_argument(
+        "--state",
+        choices=["gate", "compose-postgres"],
+        default="gate",
+        help="where the source legs keep rivet's state: the gate's own TLS PostgreSQL, or (the client's) a database and a "
+        "role of its own on the compose file's `postgres` server, beside Airflow's metadata database",
+    )
+    ap.add_argument(
         "--workers",
         type=int,
         choices=[1, 2],
@@ -112,6 +119,8 @@ def main(argv: list[str] | None = None) -> int:
     engines = tuple(e for e in args.sources.split(",") if e)
     if set(engines) - set(sources.ENGINES):
         ap.error(f"unknown source(s) {sorted(set(engines) - set(sources.ENGINES))}; known: {list(sources.ENGINES)}")
+    if args.state != "gate" and not engines:
+        ap.error("--state compose-postgres places the source legs' state: pass --sources")
     if engines and "bigquery" not in warehouses:
         ap.error("--sources loads into BigQuery: pass --warehouses with bigquery")
     dests = tuple(d for d in args.destinations.split(",") if d)
@@ -165,6 +174,7 @@ def main(argv: list[str] | None = None) -> int:
             sources=sources.engines(engines),
             destinations=tuple(destinations.legs(dests)),
             workers=args.workers,
+            state_place=args.state,
         )
         leg = Leg(cloud, version, TABLES, warehouses) if cloud and warehouses else None
         hosts = multihost.MultiHost(stand, Verdicts(version), cloud) if cloud and args.workers > 1 else None

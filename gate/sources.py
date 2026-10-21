@@ -25,7 +25,7 @@ import duckdb
 import yaml
 
 from . import warehouse
-from .stand import sh, state_db
+from .stand import COMPOSE_STATE_ROLE, METASTORE_DB, sh, state_db
 
 #: A bucket the gate made for one config of a stack and engine: `rivet-afgate-<tag>-<stack>-<engine>-<batch|cdc>` (the
 #: sweep drops nothing else).
@@ -125,6 +125,8 @@ class Engine:
     #: The stream's config read through a git-sync checkout (`repo -> rev-A`), flipped to `rev-B` after the other phases;
     #: then these changes (with their events) must reach the stream intact.
     git_sync: tuple[str, dict[str, dict[str, int]]] | None = None
+    #: After the worker container is recreated: these changes (with their events) must reach the stream intact.
+    recreate: tuple[str, dict[str, dict[str, int]]] | None = None
 
     @property
     def service(self) -> str:
@@ -226,6 +228,12 @@ DELETE FROM gate_orders WHERE id = 100;
     ),
     shared=("UPDATE gate_customers SET tier = 'gold' WHERE id <= 3;", {"gate_customers": {"update": 3}, "gate_orders": {}}),
     git_sync=("UPDATE gate_customers SET tier = 'synced' WHERE id BETWEEN 4 AND 6;", {"gate_customers": {"update": 3}}),
+    recreate=(
+        "UPDATE gate_orders SET status = 'recreated' WHERE id BETWEEN 51 AND 55;\n"
+        "INSERT INTO gate_orders (customer_id, amount, status, note) VALUES (3, 1.23, 'new', 'після');\n"
+        "DELETE FROM gate_orders WHERE id = 102;",
+        {"gate_orders": {"update": 5, "insert": 1, "delete": 1}},
+    ),
 )
 MSSQL = Engine(
     name="mssql",
@@ -594,7 +602,7 @@ class SourceLeg:
         for kind, ds in self.datasets.items():
             sh(["gcloud", "storage", "buckets", "create", f"gs://{self.buckets[kind]}", f"--project={self.cloud.project}",
                 f"--location={self.cloud.location}", "--uniform-bucket-level-access"], timeout=300)  # fmt: skip
-            stand.psql("gate-state", "rivet_state", f"CREATE DATABASE {state_db(self.engine.name, kind)};")
+            stand.make_leg_state_db(state_db(self.engine.name, kind))
             warehouse._bq(f"--location={self.cloud.location}", "mk", "-f", "--dataset", f"{self.cloud.project}:{ds}")
             host = stand.rivet_dir / "configs" / f"{self.engine.name}_{kind}"
             host.mkdir(parents=True, exist_ok=True)
@@ -605,7 +613,7 @@ class SourceLeg:
                 "exec", "-T", "-e", self.engine.url_env, "-e", "RIVET_STATE_URL", "airflow-worker", *argv,
                 extra_env={
                     self.engine.url_env: self.engine.url(stand.secrets),
-                    "RIVET_STATE_URL": stand.state_url(state_db(self.engine.name, kind)),
+                    "RIVET_STATE_URL": stand.leg_state_url(state_db(self.engine.name, kind)),
                 },
                 check=limit is None,
             )  # fmt: skip
@@ -692,7 +700,7 @@ class SourceLeg:
             "exec", "-T", "-e", self.engine.url_env, "-e", "RIVET_STATE_URL", "airflow-worker", *argv,
             extra_env={
                 self.engine.url_env: self.engine.url(stand.secrets),
-                "RIVET_STATE_URL": stand.state_url(state_db(eng, "cdc")),
+                "RIVET_STATE_URL": stand.leg_state_url(state_db(eng, "cdc")),
             },
             check=False,
         )  # fmt: skip
@@ -826,6 +834,13 @@ class SourceLeg:
             return
         deleted = {"batch": {t: deleted_by_batch(name, t) for t in self.engine.tables}}
         self.grade_targets(v, name, source, self.engine.kinds, deleted)
+        if name == "initial" and getattr(stand, "state_place", "gate") == "compose-postgres":
+            v.check(
+                f"compose-pg/{self.engine.name}/state-in-own-database",
+                lambda: placement_problems(*self.placement(stand)),
+                ok=f"{', '.join(state_db(self.engine.name, k) for k in self.engine.kinds)} owned by {COMPOSE_STATE_ROLE}, "
+                f"nothing of rivet's in {METASTORE_DB}",
+            )
         if self.stale_copy is not None and name == "initial" and run_id:
             dag = next(d for d in self.dags if d.endswith("_cdc"))
             v.check(
@@ -1033,6 +1048,58 @@ class SourceLeg:
         self.grade_tasks(stand, v, name, run_id, [dag], old, ops, baseline=False)
         self.grade_staged(v, name, ("cdc",))
 
+    def placement(self, stand: Any) -> tuple[dict[str, str], dict[str, list[tuple[str, str]]], list[tuple[str, str]], str]:
+        """Each state database's owner and tables (with their owners), and the tables of Airflow's metadata database."""
+        owners, tables = {}, {}
+        for kind in self.engine.kinds:
+            db = state_db(self.engine.name, kind)
+            owners[db] = stand.metastore_sql(
+                METASTORE_DB, f"SELECT pg_get_userbyid(datdba) FROM pg_database WHERE datname = '{db}';"
+            ).strip()
+            tables[db] = _rows(stand.metastore_sql(db, USER_TABLES))
+        return owners, tables, _rows(stand.metastore_sql(METASTORE_DB, USER_TABLES)), COMPOSE_STATE_ROLE
+
+    def recreate_phase(self, stand: Any, v: Any, wait_runs: Callable[..., dict[str, str]]) -> None:
+        """The worker container is recreated (`docker compose up -d --force-recreate airflow-worker`; under Celery the
+        tasks run only there). The state_dir is the bind mount `<stack>/rivet:/opt/rivet`, so it outlives the container;
+        the stream's next run must continue with no gap and no duplicate."""
+        assert self.engine.recreate is not None and self.engine.hot is not None
+        name, eng, hot = "recreate", self.engine.name, self.engine.hot
+        dag = next(d for d in self.dags if d.endswith("_cdc"))
+        before = stand.compose("ps", "-q", "airflow-worker").stdout.split()
+        stand.compose("up", "-d", "--force-recreate", "airflow-worker", timeout=900)
+        after = stand.compose("ps", "-q", "airflow-worker").stdout.split()
+        print(f"RECREATE airflow-worker {before} -> {after}", flush=True)
+        changes, ops = self.engine.recreate
+        self.sql(stand, changes)
+        run_id = f"gate_{eng}_recreate"
+        stand.trigger(dag, run_id)
+        state = wait_runs(stand, [dag], run_id).get(dag)
+        tasks = v.guard(f"{name}/{eng}/cdc/task-states", stand.tasks, dag, run_id) or {}
+        payload = (
+            v.guard(f"{name}/{eng}/cdc/xcom", stand.xcom, dag, run_id, "run")
+            if tasks.get("run", {}).get("state") in ("success", "failed")
+            else None
+        )
+        source = v.guard(f"{name}/{eng}/source", self.source_rows, stand, {hot.table: [hot.column]})
+        cols = {t: [*c, *([hot.column] if t == hot.table else [])] for t, c in self.engine.tables.items()}
+        events = sum(n for per in ops.values() for n in per.values())
+        v.check(
+            f"{name}/{eng}/cdc/continues-after-worker-recreate",
+            lambda: (
+                recreated(before, after)
+                + run_after_flip(state, tasks, payload, events)
+                + (
+                    ["no source read"]
+                    if source is None
+                    else stream_equals_source(
+                        {t: self.read("cdc", self.targets["cdc"][t]) for t in self.engine.tables}, source, cols, self.engine.key
+                    )
+                )
+            ),
+            ok=f"worker {before[:1]} -> {after[:1]}, {events} change(s) delivered once, base equals the source",
+        )
+
     def git_sync_phase(self, stand: Any, v: Any, wait_runs: Callable[..., dict[str, str]]) -> None:
         """git-sync publishes a new revision of the DAG folder: the config, unchanged, in `rev-B`, and the `repo` link
         flipped to it atomically (the old revision removed). The stream's next run must succeed and deliver intact."""
@@ -1087,6 +1154,45 @@ def git_sync_layout(root: Path, text: str, name: str = "rivet.yaml") -> str:
     (root / "rev-A" / name).write_text(text)
     (root / "repo").symlink_to("rev-A")
     return f"/opt/rivet/{root.relative_to(root.parents[1])}/repo/{name}"
+
+
+USER_TABLES = (
+    "SELECT tablename, tableowner FROM pg_tables WHERE schemaname NOT IN ('pg_catalog', 'information_schema') ORDER BY 1;"
+)
+
+
+def _rows(text: str) -> list[tuple[str, str]]:
+    return [tuple(line.split("|", 1)) for line in text.splitlines() if "|" in line]  # type: ignore[misc]
+
+
+def placement_problems(
+    owners: dict[str, str], tables: dict[str, list[tuple[str, str]]], metastore: list[tuple[str, str]], role: str
+) -> list[str]:
+    """rivet's state is in databases of its own, owned by its own role, its tables owned by that role; Airflow's metadata
+    database holds no table of rivet's (none of the names rivet made, none owned by its role)."""
+    problems = []
+    names = set()
+    for db, owner in sorted(owners.items()):
+        if owner != role:
+            problems.append(f"{db} is owned by {owner!r}, not {role}")
+        held = tables.get(db, [])
+        if not held:
+            problems.append(f"{db} holds no table: rivet wrote nothing there, the cell proves nothing")
+        foreign = sorted(t for t, o in held if o != role)
+        if foreign:
+            problems.append(f"{db}: tables not owned by {role}: {foreign}")
+        names |= {t for t, _ in held}
+    leaked = sorted(t for t, o in metastore if t in names or o == role)
+    if leaked:
+        problems.append(f"Airflow's metadata database holds rivet's tables: {leaked}")
+    return problems
+
+
+def recreated(before: Sequence[str], after: Sequence[str]) -> list[str]:
+    """The worker container was replaced: one running before and after, with a new id."""
+    if len(before) != 1 or len(after) != 1:
+        return [f"worker containers before {before}, after {after}: expected one each"]
+    return [f"the worker container {before[0][:12]} was not recreated"] if before == after else []
 
 
 def old_copy_name(resolved: str, name: str = "rivet.yaml") -> str:
