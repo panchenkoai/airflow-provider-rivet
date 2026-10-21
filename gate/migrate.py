@@ -46,8 +46,6 @@ DAGS = {"sqlite": "gate_mig_mysql_sqlite", "pg": "gate_mig_mysql_pg", "back": "g
 #: The incremental batch pipeline of the same tables, migrated the same way (its own config, state_dir and state).
 B_STATE_DB = state_db(ENGINE, "migb")
 B_STATE_CONN = state_conn_id(ENGINE, "migb")
-B_CONFIG_DIR = "/opt/rivet/configs/mysql_migb"
-B_INIT_DIR = "/opt/rivet/configs/mysql_migb_init"
 B_STATE_DIR = "/opt/rivet/state/mysql_migb"
 B_DAGS = {"sqlite": "gate_migb_mysql_sqlite", "pg": "gate_migb_mysql_pg", "back": "gate_migb_mysql_back"}
 #: The batch steps: updates and inserts only (an incremental extract cannot see a delete), after the stream's steps.
@@ -253,7 +251,7 @@ class Migration:
         self.b_exports = self.prepare_batch(stand)
         shape = {"config": f"{CONFIG_DIR}/rivet.yaml", "state_dir": STATE_DIR, "stream": self.stream, "dags": DAGS,
                  "old_bin": OLD_BIN, "url_env": URL_ENV, "conn": CONN, "state_conn": STATE_CONN,
-                 "batch": {"config": f"{B_CONFIG_DIR}/rivet.yaml", "state_dir": B_STATE_DIR, "exports": self.b_exports,
+                 "batch": {"config": f"{B_STATE_DIR}/rivet.yaml", "state_dir": B_STATE_DIR, "exports": self.b_exports,
                            "dags": B_DAGS, "state_conn": B_STATE_CONN}}  # fmt: skip
         (stand.rivet_dir / "configs" / "mysql_migrate.json").write_text(json.dumps(shape))
 
@@ -267,22 +265,20 @@ class Migration:
             f"--location={self.src.cloud.location}", "mk", "-f", "--dataset", f"{self.src.cloud.project}:{self.b_dataset}"
         )
         stand.make_leg_state_db(B_STATE_DB)
-        for sub in ("configs/mysql_migb", "configs/mysql_migb_init", "state/mysql_migb"):
-            (stand.rivet_dir / sub).mkdir(parents=True, exist_ok=True)
+        (stand.rivet_dir / "state" / "mysql_migb").mkdir(parents=True, exist_ok=True)
         argv = [
             OLD_BIN, "init", "--source-env", URL_ENV, "--tls", "disable", "--mode", "incremental", "--gcs-bucket", self.b_bucket,
             "--bigquery-project", self.src.cloud.project, "--bigquery-dataset", self.b_dataset,
-            "--include", *TABLES, "-o", f"{B_INIT_DIR}/rivet.yaml",
+            "--include", *TABLES, "-o", f"{B_STATE_DIR}/rivet.yaml",
         ]  # fmt: skip
+        # Into the state_dir itself: 0.32.1 keeps SQLite beside -o, and init records the `query:` exports' primary keys
+        # there, which their loads need (`pk: auto`); the provider then runs that file as it is (no copy). Live: written
+        # into a scratch folder, every load of the batch pipeline failed, from its first run on.
         self.command(f"(batch) {URL_ENV}=<mysql url> " + " ".join(argv))
         stand.compose("exec", "-T", "-e", URL_ENV, "-e", "RIVET_STATE_URL", "airflow-worker", *argv,
                       extra_env={URL_ENV: self.url(stand), "RIVET_STATE_URL": ""})  # fmt: skip
-        text = (stand.rivet_dir / "configs" / "mysql_migb_init" / "rivet.yaml").read_text()
+        text = (stand.rivet_dir / "state" / "mysql_migb" / "rivet.yaml").read_text()
         print(f"INIT mysql migrate batch (rivet 0.32.1) config:\n{text}", flush=True)
-        shutil.copyfile(
-            stand.rivet_dir / "configs" / "mysql_migb_init" / "rivet.yaml",
-            stand.rivet_dir / "configs" / "mysql_migb" / "rivet.yaml",
-        )
         exports = read_config(text, list(TABLES))["exports"]
         if sorted(exports) != sorted(TABLES):
             raise ValueError(f"rivet 0.32.1's batch init wrote exports {exports}, expected {sorted(TABLES)}")
@@ -532,14 +528,8 @@ class Migration:
             sql, rows = B_STEPS[step]
             self.sql(stand, sql)
             self.run_batch(stand, v, wait_runs, step, dag, rows)
-        names = sorted(p.name for p in (stand.rivet_dir / "state" / "mysql_migb").glob("rivet.*.yaml"))
-        copies = full_copies(names)
-        if len(copies) != 1:
-            v.grade(
-                "migrate/mysql/batch/state-copy", [f"whole config copies in the state_dir: {copies} of {names}, expected one"]
-            )
-            return
-        argv = ["rivet", "state", "copy", "-c", f"{B_STATE_DIR}/{copies[0]}"]
+        # The batch config is init's file in the state_dir itself: the SQLite state beside it is the one to copy.
+        argv = ["rivet", "state", "copy", "-c", f"{B_STATE_DIR}/rivet.yaml"]
         self.command(
             f"(batch) RIVET_STATE_URL=postgresql://rivet_state:<password>@postgres:5432/{B_STATE_DB}?sslmode=disable {' '.join(argv)}"
         )
@@ -590,6 +580,12 @@ class Migration:
             f"MIGRATE batch {step} {dag}: run {state}, {json.dumps({t: i.get('state') for t, i in tasks.items()})}, extracts {moved}",
             flush=True,
         )
+        for t in [t for t, i in tasks.items() if i.get("state") == "failed"]:
+            try:
+                p = stand.xcom(dag, run_id, t)
+                print(f"MIGRATE batch {step} {t} failed: {json.dumps(p.get('error'))} units {p.get('units')}", flush=True)
+            except Exception as exc:  # the log says why there is none
+                print(f"MIGRATE batch {step} {t} failed, no XCom: {exc}", flush=True)
         problems = [] if state == "success" else [f"run {state}"]
         bad = {t: i.get("state") for t, i in tasks.items() if i.get("state") not in ("success", "skipped")}
         if bad or not tasks:
