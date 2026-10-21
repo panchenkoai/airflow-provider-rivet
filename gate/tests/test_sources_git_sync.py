@@ -5,6 +5,7 @@ Each test names the mutant it is RED on.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -88,3 +89,29 @@ def test_the_streams_dags_read_the_config_through_the_checkout(tmp_path: Path, m
     dag = (Path(sources.__file__).parent / "stand" / "dags" / "rivet_gate.py").read_text()
     block = dag[dag.index("cdc_config = shape.get") : dag.index("# A second CDC config")]
     assert block.count("config=cdc_config") == 2, "the stream's DAG and the hot DAG read one config path"
+
+
+def test_the_stale_copy_carries_the_name_the_previous_provider_gave_it() -> None:
+    from airflow_provider_rivet.invocation import copy_name
+
+    path = "/opt/rivet/configs/mysql_cdc_sync/rev-A/rivet.yaml"
+    # Mutant: hashed over the link path, or the digest cut differently (a copy no provider ever wrote).
+    assert sources.old_copy_name(path) == copy_name(Path(path)) == f"rivet.{hashlib.sha256(path.encode()).hexdigest()[:8]}.yaml"
+
+
+def test_the_stale_copy_must_not_get_the_run_refused(tmp_path: Path, monkeypatch) -> None:
+    ok = {"decision": "success", "error": None}
+    assert sources.stale_copy_problems("success", ok, True) == []
+    refused = {"decision": "fail", "error": {"code": "RIVET_SOURCE_CDC_CHECKPOINT_SHARED"}}
+    # Mutant: the XCom not read (a refusal with the run marked anything but failed passes).
+    assert sources.stale_copy_problems("success", refused, True) == [
+        "rivet stopped [RIVET_SOURCE_CDC_CHECKPOINT_SHARED] decision 'fail'"
+    ]
+    assert sources.stale_copy_problems("failed", refused, True)[0] == "run failed"
+    # Mutant: the presence not checked (a cell with no stale copy passes vacuously).
+    assert sources.stale_copy_problems("success", ok, False) == ["no stale copy in the state_dir: the cell proves nothing"]
+    leg, stand = prepared(tmp_path, monkeypatch)
+    want = stand.rivet_dir / "state" / "mysql_cdc" / sources.old_copy_name("/opt/rivet/configs/mysql_cdc_sync/rev-A/rivet.yaml")
+    # Mutant: the stale copy named by the repo/ path (the fixed provider's own name: nothing stale), or no `.owner` rule.
+    assert leg.stale_copy == want and want.read_text() == CDC
+    assert not list(want.parent.glob("*.owner")) and not list(want.parent.rglob("*.ckpt.owner"))

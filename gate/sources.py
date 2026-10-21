@@ -7,6 +7,7 @@ wrote (nothing is edited). The warehouse is read back by a client the loader doe
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
 import os
 import re
@@ -543,6 +544,8 @@ class SourceLeg:
         self.high_water: dict[str, Any] = {}
         #: The DAG of the stream whose run pauses after it opened (the hot ALTER), when the engine has one.
         self.hot_dag = ""
+        #: The config copy a previous provider left in the stream's state_dir (git-sync leg), placed before the cycles.
+        self.stale_copy: Path | None = None
         #: The second CDC config on the first stream's checkpoint: init's answer, and its DAG when init wrote it.
         self.shared: dict[str, Any] = {}
         self.shared_dag = ""
@@ -665,6 +668,12 @@ class SourceLeg:
             self.shape["cdc_config"] = git_sync_layout(
                 stand.rivet_dir / "configs" / f"{self.engine.name}_cdc_sync", self.texts["cdc"]
             )
+            # What the previous provider left in the state_dir: its copy of the config, named by the RESOLVED path (the
+            # revision's), with the same text and no `.owner` record (rivet <= 0.32.1 wrote none).
+            resolved = self.shape["cdc_config"].replace("/repo/", "/rev-A/")
+            state_dir = stand.rivet_dir / "state" / f"{self.engine.name}_cdc"
+            self.stale_copy = state_dir / old_copy_name(resolved)
+            self.stale_copy.write_text(self.texts["cdc"])
         # A compaction with nothing to merge skips; the `compacted` cell holds every cycle to "no buffer left".
         self.may_skip = {dag: ("compact.",) for dag in self.tasks}
         # The DAG file reads which exports and stream to build from here (the names are init's, not the gate's).
@@ -817,6 +826,15 @@ class SourceLeg:
             return
         deleted = {"batch": {t: deleted_by_batch(name, t) for t in self.engine.tables}}
         self.grade_targets(v, name, source, self.engine.kinds, deleted)
+        if self.stale_copy is not None and name == "initial" and run_id:
+            dag = next(d for d in self.dags if d.endswith("_cdc"))
+            v.check(
+                f"git-sync/{self.engine.name}/cdc/stale-copy-of-old-provider-not-refused",
+                lambda: stale_copy_problems(
+                    stand.run_state(dag, run_id), stand.xcom(dag, run_id, "run"), self.stale_copy.exists()
+                ),
+                ok=f"{self.stale_copy.name} in the state_dir, the run through repo/ succeeded",
+            )
         if self.engine.ops and run_id:
             ops = self.engine.ops.get(name, {})
             self.grade_tasks(stand, v, name, run_id, self.dags, source, ops, baseline=name == "initial")
@@ -1069,6 +1087,24 @@ def git_sync_layout(root: Path, text: str, name: str = "rivet.yaml") -> str:
     (root / "rev-A" / name).write_text(text)
     (root / "repo").symlink_to("rev-A")
     return f"/opt/rivet/{root.relative_to(root.parents[1])}/repo/{name}"
+
+
+def old_copy_name(resolved: str, name: str = "rivet.yaml") -> str:
+    """The name the previous provider gave a config's copy: its stem and the first 8 hex digits of the sha256 of the
+    symlink-RESOLVED path (`copy_name(Path(config).resolve())`)."""
+    stem, _, suffix = name.rpartition(".")
+    return f"{stem}.{hashlib.sha256(resolved.encode()).hexdigest()[:8]}.{suffix}"
+
+
+def stale_copy_problems(state: str | None, payload: dict[str, Any] | None, present: bool) -> list[str]:
+    """With the old provider's copy (no owner record) in the state_dir, the stream's run succeeded, not refused."""
+    problems = [] if present else ["no stale copy in the state_dir: the cell proves nothing"]
+    if state != "success":
+        problems.append(f"run {state}")
+    error = (payload or {}).get("error") or {}
+    if error or (payload or {}).get("decision") != "success":
+        problems.append(f"rivet stopped [{error.get('code')}] decision {(payload or {}).get('decision')!r}")
+    return problems
 
 
 def flip(root: Path) -> str:
