@@ -3,26 +3,54 @@
 All notable changes to `airflow-provider-rivet`. The package is versioned independently of the
 rivet binary; its release tags will use the prefix `airflow-v`.
 
-## Unreleased
+## 0.2.0 (unreleased)
 
-- SQLite state is refused under an executor that may run tasks on several hosts (Celery,
-  Kubernetes, Edge): a task on another worker started from an empty state and re-read every
-  table (`RIVET_AIRFLOW_STATE_SQLITE_MULTI_HOST`). `single_host=True` declares one host.
+Against rivet 0.32.1 (the minimum) and 0.32.2, and the contract of ADR-0039 on rivet main.
+
+### Added
+
 - `rivet_notifications=True` keeps rivet's own `notifications:` on: the operator then does not pass `--no-notify` and
   does not warn about the block. The default is unchanged (rivet's notifications off where the binary can turn them off).
+- `single_host=True` declares a deployment with one worker, where SQLite state is allowed under an executor that could
+  spread tasks over several hosts (see Changed).
+- The per_table digest of `rivet load` / `rivet compact` (rivet >= 0.32.2, ADR-0039 D3) in the task log: the headline
+  sums rows, tables, warehouse jobs and bytes billed; one line per table gives a compact's rows inserted / updated /
+  deleted and the base's rows after, a load's Parquet parts and source runs, the job ids and the bytes billed. A value
+  rivet did not return is left out, never shown as 0. The `rivet.unit` record carries it as `digest` (#63).
+- XCom units carry `target` and `buffer`, the warehouse objects a load or compact unit wrote and read, as rivet names
+  them (the contract's `xcom_unit*.json`); null for a run or apply unit and on a binary whose result has no names.
+- A load / compact task's headline names the warehouse table (`project.dataset.table`): rivet's own name when its
+  result has one, else the config's `load:` block, marked `(from config)` (degradation `load_digest`).
+- A task that waited for the export's lock logs when it takes it (`took the lock of ... after N s`), and its headline
+  gives the time after the wait apart from the wait (#63).
+- rivet 0.32.2's codes: `RIVET_STATE_LOCK_TIMEOUT` (rivet's `--lock-wait` ran out) is retried and reads `BUSY`, like
+  the package's own `RIVET_AIRFLOW_EXPORT_BUSY` and rivet's other lease stops; `RIVET_LOAD_BLOCK_MISSING`,
+  `RIVET_SOURCE_CDC_CHECKPOINT_SHARED` and `RIVET_INIT_CDC_NAME_TAKEN` are final (docs/retries.md).
+
+### Changed
+
+- **Minimum rivet 0.32.1** (`rivet-cli>=0.32.1`); an older binary is refused before it starts
+  (`RIVET_AIRFLOW_BINARY_TOO_OLD`).
+- SQLite state is refused under an executor that may run tasks on several hosts (Celery, Kubernetes, Edge): a task on
+  another worker started from an empty state and re-read every table (`RIVET_AIRFLOW_STATE_SQLITE_MULTI_HOST`).
+  `single_host=True` declares one host.
+- The degradation `state_url_sqlite` is gone: the config's copy in `state_dir` is how every relative path of the
+  config (its SQLite state, a checkpoint, a query file, a local destination) lands there, on every rivet, and is not a
+  fallback. Nothing moves.
+- The task log is shorter: a one-step task whose step took the task's time has no step line, and "this binary lacks"
+  is written at DEBUG, not on every task (#62).
+- XCom `rivet_version` holds the whole version line (`0.32.1 (3f337e9e3)`), not only the number.
+- README Quickstart: `rivet init` with `RIVET_STATE_URL=sqlite:` (rivet 0.32.2) into the state directory, the
+  Connection, a scheduled DAG, where the Parquet lands. The docs now say that a relative local `destination.path`
+  lands under `state_dir` (rivet 0.32 anchors it to the config's directory), not under `cwd`, and how rivet 0.32.2's
+  `init` checkpoint (`./cdc/<stem>_<export>.ckpt`) and its `.owner` record sit there.
+
+### Fixed
+
 - On PostgreSQL state, a task whose upstream rivet task ran on another host (another state_dir marker) is no longer
   refused `RIVET_AIRFLOW_STATE_DIR_DIFFERS`: with two Celery workers, each with its own state_dir, a load landing on
   the other host than its extract failed without a retry, in the deployment docs/state.md recommends for several
-  workers (measured by the live gate's new multi-host leg). SQLite state is still refused.
-- README Quickstart: `rivet init` with `RIVET_STATE_URL=sqlite:` into the state directory, the
-  Connection, a scheduled DAG, where the Parquet lands. The docs now say that a relative local
-  `destination.path` lands under `state_dir` (rivet 0.32 anchors it to the config's directory),
-  not under `cwd`.
-- The task log is shorter: a one-step task whose step took the task's time has no step line, and
-  "this binary lacks" is written at DEBUG, not on every task (#62).
-- A load / compact task's headline names the warehouse table (`project.dataset.table`): rivet's own
-  name when its result has one, else the config's `load:` block, marked `(from config)`.
-- XCom `rivet_version` holds the whole version line (`0.32.1 (3f337e9e3)`), not only the number.
+  workers (measured by the live gate's multi-host leg). SQLite state is still refused.
 
 ## 0.1.0 (2026-10-18)
 
