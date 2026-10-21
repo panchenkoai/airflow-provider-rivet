@@ -53,7 +53,6 @@ def test_a_pod_with_postgres_state_runs_a_batch_export_and_writes_nothing_to_the
     assert not Path(payload["stderr_path"]).is_relative_to(rig.state_dir)
     assert rig.argv("run")[2] == str(rig.config.resolve()), "the config is run in place"
     assert list(rig.state_dir.iterdir()) == []
-    assert "state_url_sqlite" not in payload["degraded"]
     assert rig.calls()[-1]["env"]["RIVET_STATE_URL"] == PG_STATE["RIVET_STATE_URL"]
 
 
@@ -146,7 +145,7 @@ def test_with_no_notify_the_flag_is_passed_and_the_warning_is_gone(rig: Rig) -> 
 
 def test_postgres_state_on_a_local_worker_does_not_warn_about_sqlite(rig: Rig) -> None:
     payload, _ = rig.run(rig.operator(RivetRunOperator, export="orders", env=PG_STATE))
-    assert not rig.events("rivet.warning") and "state_url_sqlite" not in payload["degraded"]
+    assert not rig.events("rivet.warning")
 
 
 def test_flags_are_probed_from_help_as_whole_words(rig: Rig) -> None:

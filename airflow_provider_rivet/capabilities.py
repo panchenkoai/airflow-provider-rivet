@@ -16,7 +16,6 @@ _VERSION_RE = re.compile(r"rivet\s+(\d+)\.(\d+)\.(\d+)")
 DEGRADATIONS = {
     "no_notify": "flag",
     "lock_wait": "flag",
-    "state_url_sqlite": "none",
     "error_object": "output",
     "per_unit_error": "output",
     "stop_reason": "output",

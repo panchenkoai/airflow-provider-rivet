@@ -61,7 +61,7 @@ Every task returns (and, on failure, pushes before raising) one XCom value under
   "units": [ { "export": "orders", "table": null, "target": null, "buffer": null,
                "status": "success", "run_id": "orders_...",
                "rows": 2500, "files": 1, "stop_reason": null, "error": null } ],
-  "error": null, "degraded": ["lock_wait", "no_notify", "state_url_sqlite"],
+  "error": null, "degraded": ["lock_wait", "no_notify"],
   "exit_status": 0, "signal": null, "stderr_path": "/var/lib/rivet/postgres/logs/...",
   "skip_reason": null, "state_marker": "1d86...", "rivet_version": "0.32.0 (8afde974)" }
 ```

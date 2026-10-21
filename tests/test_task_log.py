@@ -110,7 +110,7 @@ def test_golden_apply_success_on_a_degraded_binary(rig: Rig, log: Recorder) -> N
     rig.scenario(apply={"summary": summary("users", 30, 1, "users_1")})
     payload, _ = rig.run(rig.operator(RivetApplyOperator, export="users"))
     run_id = payload["units"][0]["run_id"]
-    assert payload["degraded"] == ["lock_wait", "no_notify", "state_url_sqlite"]
+    assert payload["degraded"] == ["lock_wait", "no_notify"]
     assert log.shown() == [
         f"INFO rivet apply users → OK: 30 rows, 1 file in 5.0 s (run {run_id})",
         "INFO   plan     sealed, strategy incremental in 1.0 s",
@@ -216,7 +216,7 @@ def test_golden_rivet_answers_a_replay_of_an_applied_plan(rig: Rig, log: Recorde
     rig.scenario(flags=NEW_FLAGS, apply={"summary": entry})
     payload, _ = rig.run(rig.operator(RivetApplyOperator, export="orders"))
     unit = payload["units"][0]
-    assert payload["decision"] == "success" and payload["degraded"] == ["state_url_sqlite"]
+    assert payload["decision"] == "success" and payload["degraded"] == []
     assert (unit["status"], unit["run_id"], unit["rows"], unit["files"]) == ("already_applied", run_id, 30, 1)
     assert unit["error"] is None
     [done] = rig.events("rivet.apply.already_applied")

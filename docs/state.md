@@ -45,10 +45,13 @@ SQLite state in `state_dir`.
    - `.rivet_state.db`: rivet's state, under its default name.
    - `<config name>.<hash>.yaml` (and `<config name>.<hash>--<export>.yaml`): the operator's
      copy of your config, byte for byte. `<hash>` is the first 8 hex digits of the SHA-256 of the
-     original's absolute path, so two configs with one file name never share a copy. Today's
-     rivet can only keep SQLite state beside the config file, so the operator materialises the
-     config here and runs that copy (`state_url_sqlite`). Edit your original; the copy is
-     rewritten on every task.
+     original's absolute path, so two configs with one file name never share a copy. rivet
+     resolves the config's relative paths (its SQLite state, a `cdc.checkpoint`, a `query_file`,
+     a local `destination.path`) against the config's directory, so running the copy puts all of
+     them here (see 5). Edit your original; the copy is rewritten on every task. The operator
+     does not set `RIVET_STATE_URL=sqlite:` (rivet 0.32.2): the copy already keeps the state here
+     on every rivet it runs, and a `sqlite:` value in the task's environment that names another
+     file moves the state out of the directory these checks look at, so leave it unset for tasks.
    - every relative `query_file` of the config, copied to the same relative path (see 5), and
      `.rivet_airflow_query_files.json`, which records the config directory each one came from.
    - a relative `cdc.checkpoint`, which resolves beside the copied config, that is, here.
@@ -114,7 +117,8 @@ SQLite state in `state_dir`.
    **After `rivet init -o X`:** init records the source's primary keys in a `.rivet_state.db`
    beside `X`, which the task then refuses the same way: move it (with `-wal` and `-shm`) into
    `state_dir`, or run `init` with `RIVET_STATE_URL` set to the PostgreSQL state the tasks use.
-   rivet 0.32.1 adds `RIVET_STATE_URL=sqlite:<path>`, so init and the tasks can name one file.
+   rivet 0.32.2 adds `RIVET_STATE_URL=sqlite:<path>`, so init can write into
+   `<state_dir>/.rivet_state.db`, the file the tasks use (README Quickstart).
 4. **What breaks when a task sees a different or an empty directory.** rivet creates a new,
    empty state there and treats every export as a first run: an incremental export re-reads
    from the start, a CDC stream re-anchors and the changes between the lost position and the new

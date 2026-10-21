@@ -70,7 +70,7 @@ A daily PostgreSQL → Parquet DAG on one worker, with SQLite state. Run the com
 (or in the image) where Airflow runs.
 
 1. **Generate the config** from the live database with `rivet init` (the `rivet` that `rivet-cli`
-   installed; 0.32.1 or newer for `RIVET_STATE_URL=sqlite:`), and keep its state in the directory
+   installed; 0.32.2 or newer for `RIVET_STATE_URL=sqlite:`), and keep its state in the directory
    the DAG will use. The directory must exist, on persistent storage, at the same path on every
    worker:
 

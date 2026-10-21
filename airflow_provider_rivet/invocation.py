@@ -272,11 +272,11 @@ class _Session:
             _prune_logs(self.logs, max(1, self.req.log_keep))
 
     def config_for(self, only_export: str | None) -> str:
-        """The config path rivet reads: a copy in the state directory, narrowed to one export when asked."""
+        """The config path rivet reads: a copy in the state directory, narrowed to one export when asked. rivet resolves
+        the config's relative paths (its SQLite state, a `cdc.checkpoint`, a `query_file`, a local destination) against
+        the config's directory, so the copy puts all of them in the state directory (docs/state.md)."""
         source = Path(self.req.config).resolve()
         target_dir = self.pf.state_dir
-        if target_dir is not None and self.pf.state_kind == "sqlite":
-            self.degraded.add("state_url_sqlite")
         if only_export is None and (target_dir is None or source.parent == target_dir.resolve()):
             return str(source)
         folder = target_dir if target_dir is not None else self.work

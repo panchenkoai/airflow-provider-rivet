@@ -212,13 +212,14 @@ def test_step_lines_of_a_step_that_did_not_end_an_unnamed_strategy_and_a_layout_
 
 
 def test_notes_sqlite_an_unknown_degradation_warnings_max_events_and_a_ledger_problem() -> None:
-    """_notes 20/21 (SQLite from `degraded` alone), 34-36 (an unknown key), 48-51 (rivet's warning text), 59 (the
+    """_notes 20/21 (SQLite from rivet.warning), 34-36 (an unknown key), 48-51 (rivet's warning text), 59 (the
     exports of a max_events stop), 68-75 (the crash ledger's problem)."""
     log, _ = make("run")
     log.record({"event": "rivet.warning", "warning": "other", "text": "watch out"})
     log.record({"event": "rivet.cdc.max_events", "exports": ["a", "b"]})
     log.record({"event": "rivet.crashed", "ledger_problem": "the ledger is unwritable"})
-    lines = render(log, {"decision": "success", "units": [], "degraded": ["state_url_sqlite", "mystery"]})
+    log.record({"event": "rivet.warning", "warning": "sqlite_single_host", "text": "not shown: the note says it"})
+    lines = render(log, {"decision": "success", "units": [], "degraded": ["mystery"]})
     assert lines[1:] == [
         (INFO, f"  note     SQLite state is single-host — see {SETUP_GUIDE}"),
         (INFO, "  note     degraded: mystery"),
@@ -444,3 +445,10 @@ def test_units_with_no_record_of_their_own_are_listed_without_a_name_or_a_digest
         (INFO, "  table    cdc.a: loaded"),
         (INFO, "  table    cdc.b: loaded"),
     ]
+
+
+def test_the_sqlite_note_comes_from_the_preflights_warning_alone() -> None:
+    """_notes: another warning is not the SQLite one, and no degradation key stands for it any more."""
+    log, _ = make("run")
+    log.record({"event": "rivet.warning", "warning": "other", "text": "watch out"})
+    assert render(log, {"decision": "success", "units": [], "degraded": []})[1:] == [(WARNING, "  note     watch out")]

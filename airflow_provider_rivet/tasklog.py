@@ -21,10 +21,9 @@ from .preflight import SETUP_GUIDE
 clock = time.monotonic  # replaced by tests, so a golden log has fixed durations
 Write = Callable[[int, str], None]
 
-# What a degradation that is not a missing flag means, in words an operator reads. `state_url_sqlite` is the SQLite
-# note; a missing flag is listed by its key under "this binary lacks".
+# What a degradation that is not a missing flag means, in words an operator reads; a missing flag is listed by its key
+# under "this binary lacks".
 NOTES = {
-    "state_url_sqlite": None,
     "error_object": "rivet's failure line has no class or action: the class is read from its exit class",
     "per_unit_error": "several units failed and rivet gave one shared failure object for all of them",
     "stop_reason": "this binary reports no CDC stop reason: a max_events stop reads like caught up",
@@ -323,10 +322,10 @@ class TaskLog:
         if lacks:
             # Flags no released rivet may have yet: nothing for the operator to do, so not on every task's INFO (#62).
             notes.append((logging.DEBUG, f"this binary lacks: {', '.join(lacks)} (the operator works around them)"))
-        if "state_url_sqlite" in degraded or any(w.get("warning") == "sqlite_single_host" for w in warnings):
+        if any(w.get("warning") == "sqlite_single_host" for w in warnings):
             notes.append((logging.INFO, f"SQLite state is single-host — see {SETUP_GUIDE}"))
         for key in degraded:
-            if key not in LACKS and NOTES.get(key, key) is not None:
+            if key not in LACKS:
                 notes.append((logging.INFO, NOTES.get(key) or f"degraded: {key}"))
         for warning in warnings:
             if warning.get("warning") != "sqlite_single_host":
