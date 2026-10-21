@@ -1062,7 +1062,8 @@ def _digest(s: _Session, row: Mapping[str, Any]) -> dict[str, Any] | None:
     digest = {key: s.malformed(row.get(key), int) for key in DIGEST_COUNTS}
     jobs = s.malformed(row.get("warehouse_job_ids"), list)
     if jobs is not None and not all(isinstance(job, str) for job in jobs):
-        jobs = s.malformed(jobs, str)  # a list holding something other than ids: null, recorded
+        s.degraded.add("result_malformed")  # a list holding something other than ids: null, recorded
+        jobs = None
     digest["warehouse_job_ids"] = jobs
     return digest
 

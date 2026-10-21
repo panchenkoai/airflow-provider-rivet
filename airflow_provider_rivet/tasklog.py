@@ -84,9 +84,8 @@ def _digest(digest: dict[str, Any] | None) -> list[str]:
     """What the warehouse did for one table, from rivet's D3 entry: `200 inserted, 950 updated, 50 deleted, base 10150
     rows, job j1, 50.0 MiB billed`; a value rivet did not return is left out."""
     d = digest or {}
-    parts = []
-    if d.get("rows_merged") is not None:  # a merge's DML; a load's inserted rows are its rows, already said
-        parts += [f"{d[key]} {word}" for key, word in DML if d.get(key) is not None]
+    merged = d.get("rows_merged") is not None  # a merge's DML; a load's inserted rows are its rows, already said
+    parts = [f"{d[key]} {word}" for key, word in DML if merged and d.get(key) is not None]
     if d.get("base_rows_after") is not None:
         parts.append(f"base {_plural(d['base_rows_after'], 'row')}")
     parts += [_plural(d[key], word) for key, word in (("files", "file"), ("runs", "source run")) if d.get(key) is not None]
