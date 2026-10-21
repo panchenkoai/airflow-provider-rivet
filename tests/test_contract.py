@@ -9,7 +9,16 @@ import pytest
 from conftest import DOCS, FIXTURES, PACKAGE_ROOT, fixture
 
 from airflow_provider_rivet.capabilities import DEGRADATIONS
-from airflow_provider_rivet.result import CLASSES, STATUSES, ErrorObject, UnitResult, error_from_exit, error_from_line
+from airflow_provider_rivet.result import (
+    CLASSES,
+    DIGEST_COUNTS,
+    DIGEST_KEYS,
+    STATUSES,
+    ErrorObject,
+    UnitResult,
+    error_from_exit,
+    error_from_line,
+)
 
 
 def full(error: ErrorObject) -> dict:
@@ -51,7 +60,26 @@ def test_a_loaded_table_becomes_the_pinned_xcom_load_unit() -> None:
     doc = fixture("load_result.json")
     row = doc["per_table"][0]
     unit = UnitResult(export=row["export"], table=row["table"], status=row["status"], run_id=doc["run_id"], rows=row["rows"])
+    unit.target, unit.buffer, unit.target_from = row["target"], row["buffer"], "rivet"
     assert unit.to_xcom() == fixture("xcom_unit_load.json")
+
+
+def test_xcom_carries_rivets_warehouse_names_and_never_the_configs_guess() -> None:
+    """A name the config's `load:` block gave (a binary whose result lacks it) stays in the task log: XCom's `target` and
+    `buffer` are what rivet returned, null otherwise (ADR-0039 D3: a value nobody returned is null)."""
+    unit = UnitResult("cdc", "orders", target="p.d.orders", buffer="p.d.orders__changes", target_from="rivet")
+    assert (unit.to_xcom()["target"], unit.to_xcom()["buffer"]) == ("p.d.orders", "p.d.orders__changes")
+    unit.target_from = "config"
+    assert (unit.to_xcom()["target"], unit.to_xcom()["buffer"]) == (None, None)
+
+
+def test_the_digest_keys_are_the_d3_entrys_beyond_the_unit() -> None:
+    """Every key of a pinned load / compact entry is a unit key, a digest key or the entry's own error object."""
+    unit_keys = {"export", "table", "target", "buffer", "status", "skip_reason", "rows", "error"}
+    for name in ("load_result.json", "compact_result.json", "compact_result_log_only.json"):
+        for row in fixture(name)["per_table"]:
+            assert set(row) == unit_keys | set(DIGEST_KEYS), (name, set(row) ^ (unit_keys | set(DIGEST_KEYS)))
+    assert set(DIGEST_KEYS) - set(DIGEST_COUNTS) == {"warehouse_job_ids"}
 
 
 def test_the_unit_shape_has_exactly_the_contract_keys() -> None:

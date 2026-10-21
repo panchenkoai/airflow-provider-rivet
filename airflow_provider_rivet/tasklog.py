@@ -33,11 +33,14 @@ NOTES = {
     "result_missing": "rivet wrote no summary file: units are taken from its exit status, counts are unknown",
     "result_malformed": "part of rivet's result did not have the contract's shape and was ignored (XCom `degraded`)",
     "exit_zero_failed_unit": "rivet exited 0 while its summary reports a failed unit",
+    "load_digest": "rivet's load / compact result has no per-table digest: no counts of what the warehouse did, no job ids",
 }
 LACKS = sorted(key for key, detect in DEGRADATIONS.items() if detect == "flag")
 # A single step's line is shown only when the task took this much longer than the step (a lock wait, a slow preflight).
 STEP_SLACK = 1.0
 UNIT_WORD = {"load": "table", "compact": "table"}
+JOBS_SHOWN = 3  # warehouse job ids named on a unit line; the rest are counted
+DML = (("rows_inserted", "inserted"), ("rows_updated", "updated"), ("rows_deleted", "deleted"))
 STOP_WORD = {"refusal": "REFUSED", "crashed": "CRASHED"}
 
 
@@ -56,6 +59,51 @@ def _counts(units: list[dict[str, Any]]) -> list[str]:
         known = [u[key] for u in units if isinstance(u.get(key), int)]
         if known:
             parts.append(_plural(sum(known), word))
+    return parts
+
+
+def _size(count: int) -> str:
+    """`512 B`, `50.0 MiB`: a byte count in binary units, up to TiB."""
+    value = float(count)
+    for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+        if value < 1024 or unit == "TiB":
+            break
+        value /= 1024
+    return f"{count} B" if unit == "B" else f"{value:.1f} {unit}"
+
+
+def _jobs(ids: list[str]) -> str:
+    """`job j1`, `2 jobs (j1, j2)`; the ids past JOBS_SHOWN are only counted."""
+    if len(ids) == 1:
+        return f"job {ids[0]}"
+    more = ", ..." if len(ids) > JOBS_SHOWN else ""
+    return f"{len(ids)} jobs ({', '.join(ids[:JOBS_SHOWN])}{more})"
+
+
+def _digest(digest: dict[str, Any] | None) -> list[str]:
+    """What the warehouse did for one table, from rivet's D3 entry: `200 inserted, 950 updated, 50 deleted, base 10150
+    rows, job j1, 50.0 MiB billed`; a value rivet did not return is left out."""
+    d = digest or {}
+    parts = []
+    if d.get("rows_merged") is not None:  # a merge's DML; a load's inserted rows are its rows, already said
+        parts += [f"{d[key]} {word}" for key, word in DML if d.get(key) is not None]
+    if d.get("base_rows_after") is not None:
+        parts.append(f"base {_plural(d['base_rows_after'], 'row')}")
+    parts += [_plural(d[key], word) for key, word in (("files", "file"), ("runs", "source run")) if d.get(key) is not None]
+    if d.get("warehouse_job_ids"):
+        parts.append(_jobs(d["warehouse_job_ids"]))
+    if d.get("bytes_billed") is not None:
+        parts.append(f"{_size(d['bytes_billed'])} billed")
+    return parts
+
+
+def _work(digests: list[dict[str, Any]]) -> list[str]:
+    """`3 jobs, 50.0 MiB billed`: the warehouse work of every unit together, a total no unit reports left out."""
+    jobs = sum(len(d.get("warehouse_job_ids") or []) for d in digests)
+    billed = [d["bytes_billed"] for d in digests if d.get("bytes_billed") is not None]
+    parts = [_plural(jobs, "job")] if jobs else []
+    if billed:
+        parts.append(f"{_size(sum(billed))} billed")
     return parts
 
 
@@ -97,6 +145,8 @@ class TaskLog:
                 f"waiting up to {record.get('lock_wait')} s for the lock of {record.get('unit')}: another try of this "
                 "task, or a rivet process it left running, holds it",
             )
+        elif event == "rivet.lock.acquired":
+            self.write(logging.INFO, f"took the lock of {record.get('unit')} after {_secs(record.get('waited') or 0.0)}")
         elif event == "rivet.stderr":
             self.write(logging.INFO, f"rivet {record.get('step')} stderr: {record.get('line')}")
 
@@ -107,6 +157,10 @@ class TaskLog:
 
     def _first(self, event: str) -> dict[str, Any] | None:
         return next((e for e in self.events if e.get("event") == event), None)
+
+    def _unit_records(self) -> dict[tuple[Any, Any], dict[str, Any]]:
+        """The `rivet.unit` record of each unit, by export and table: what XCom does not carry (names, digest)."""
+        return {(e.get("export"), e.get("table")): e for e in self.events if e.get("event") == "rivet.unit"}
 
     def render(self, payload: dict[str, Any], try_number: int, max_tries: int, stop_requested: bool) -> list[tuple[int, str]]:
         """The readable block: `[(level, line)]`, headline first."""
@@ -145,7 +199,9 @@ class TaskLog:
         else:
             lines.append(self._failure(head, error, payload, units, retry_text, retry_level, stop_requested))
         lines += self._step_lines(seconds)
-        if len(units) > 1 or (payload.get("decision") != "success" and units and units[0].get("status") == "failed"):
+        records = self._unit_records()
+        digested = any(_digest(records.get((u.get("export"), u.get("table")), {}).get("digest")) for u in units)
+        if digested or len(units) > 1 or (payload.get("decision") != "success" and units and units[0].get("status") == "failed"):
             lines += self._unit_lines(units)
         if payload.get("decision") not in (None, "success") and payload.get("stderr_path"):
             lines.append((logging.INFO, f"  stderr   {payload['stderr_path']}"))
@@ -156,9 +212,14 @@ class TaskLog:
         """`OK: 30 rows, 1 file in 4.1 s (run X)`, or SKIPPED when nothing was done."""
         runs = sorted({u["run_id"] for u in units if isinstance(u.get("run_id"), str)})
         run = f" (run {runs[0]})" if len(runs) == 1 else ""
-        counts = _counts(units)
+        counts = _counts(units) + _work([r["digest"] for r in self._unit_records().values() if r.get("digest")])
         if len(units) > 1:
             counts.insert(0, _plural(len(units), UNIT_WORD.get(self.command, "export")))
+        took = _secs(seconds)
+        acquired = self._first("rivet.lock.acquired")
+        if acquired is not None:  # the task's own wait for the export's lock, apart from the work
+            waited = acquired.get("waited") or 0.0
+            took = f"{_secs(seconds - waited)}, after {_secs(waited)} waiting for the lock of {acquired.get('unit')}"
         done = self._first("rivet.apply.already_applied")
         if done is not None:
             what = ", ".join(counts)
@@ -167,9 +228,9 @@ class TaskLog:
             )
         if units and all(u.get("status") == "skipped" for u in units):
             reason = payload.get("skip_reason")
-            return f"{head} SKIPPED: nothing to do{f' ({reason})' if reason else ''} in {_secs(seconds)}{run}"
+            return f"{head} SKIPPED: nothing to do{f' ({reason})' if reason else ''} in {took}{run}"
         what = f": {', '.join(counts)}" if counts else ""
-        return f"{head} OK{what} in {_secs(seconds)}{run}"
+        return f"{head} OK{what} in {took}{run}"
 
     def _failure(
         self,
@@ -238,16 +299,17 @@ class TaskLog:
     def _unit_lines(self, units: list[dict[str, Any]]) -> list[tuple[int, str]]:
         """One line per unit of a task with several, and the failed unit of a failed task."""
         lines = []
-        targets = {(e.get("export"), e.get("table")): _target(e) for e in self.events if e.get("event") == "rivet.unit"}
+        records = self._unit_records()
         for unit in units:
             error = unit.get("error") or {}
+            record = records.get((unit.get("export"), unit.get("table")), {})
             if unit.get("status") == "failed":
                 code = f" [{error['code']}]" if error.get("code") else ""
-                text = f"failed{code} {error.get('class')}"
+                text = ", ".join([f"failed{code} {error.get('class')}", *_digest(record.get("digest"))])
             else:
-                text = ", ".join([str(unit.get("status")), *_counts([unit])])
+                text = ", ".join([str(unit.get("status")), *_counts([unit]), *_digest(record.get("digest"))])
             run = f" (run {unit['run_id']})" if isinstance(unit.get("run_id"), str) else ""
-            target = targets.get((unit.get("export"), unit.get("table")))
+            target = _target(record)
             name = f"{_unit_name(unit)}{f' → {target}' if target else ''}"
             lines.append((logging.INFO, f"  {UNIT_WORD.get(self.command, 'export'):<8} {name}: {text}{run}"))
         return lines

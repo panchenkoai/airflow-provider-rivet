@@ -28,7 +28,7 @@ from typing import Any
 from . import _yaml
 from .capabilities import ProbeFailed
 from .preflight import STATE_URL_ENV, Preflight, PreflightRefusal, binary_unanswering, run_preflight, state_kind
-from .result import STATUSES, ErrorObject, UnitResult, error_from_exit, error_from_line, worst
+from .result import DIGEST_COUNTS, DIGEST_KEYS, STATUSES, ErrorObject, UnitResult, error_from_exit, error_from_line, worst
 
 Emit = Callable[[dict[str, Any]], None]
 COMMANDS = ("run", "cdc_run", "apply", "plan", "load", "compact")
@@ -439,8 +439,9 @@ class _Session:
                 "target": unit.target,
                 "buffer": unit.buffer,
                 "target_from": unit.target_from,
+                "digest": unit.digest,
             }
-            self.emit({"event": "rivet.unit", **extra, **record})
+            self.emit({"event": "rivet.unit", **record, **extra})
         self.emit(
             {
                 "event": "rivet.result",
@@ -730,10 +731,13 @@ def _export_lock(s: _Session) -> Iterator[None]:
 def _wait_for_lock(s: _Session, fd: int, path: Path, unit: str) -> None:
     """Take the exclusive lock on `fd`, polling every `LOCK_POLL` seconds for up to `lock_wait`; raise `Busy` after
     it and `Stopped` when the task is stopped while waiting. Outside `_export_lock` so mutation testing reaches it."""
-    deadline = time.monotonic() + max(0, s.req.lock_wait)
+    started = time.monotonic()
+    deadline = started + max(0, s.req.lock_wait)
     for attempt in itertools.count():
         try:
             fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if attempt:  # the wait is recorded once more, when it ends, with how long it took
+                s.emit({"event": "rivet.lock.acquired", "lock": str(path), "unit": unit, "waited": time.monotonic() - started})
             return
         except BlockingIOError:
             if s.stopped is not None and s.stopped():
@@ -1049,6 +1053,20 @@ def _with_target(s: _Session, unit: UnitResult, row: Mapping[str, Any]) -> UnitR
     return unit
 
 
+def _digest(s: _Session, row: Mapping[str, Any]) -> dict[str, Any] | None:
+    """The D3 digest of one `per_table` entry, each value of the contract's type or null (recorded); `None`, recorded as
+    `load_digest`, when the entry has none of its keys (a binary older than the digest)."""
+    if not any(key in row for key in DIGEST_KEYS):
+        s.degraded.add("load_digest")
+        return None
+    digest = {key: s.malformed(row.get(key), int) for key in DIGEST_COUNTS}
+    jobs = s.malformed(row.get("warehouse_job_ids"), list)
+    if jobs is not None and not all(isinstance(job, str) for job in jobs):
+        jobs = s.malformed(jobs, str)  # a list holding something other than ids: null, recorded
+    digest["warehouse_job_ids"] = jobs
+    return digest
+
+
 def _load(s: _Session) -> Outcome:
     """`rivet load` / `rivet compact` for one export and, where the binary can, one table."""
     cmd, export, table = s.req.command, s.req.export, s.req.table
@@ -1096,6 +1114,7 @@ def _load(s: _Session) -> Outcome:
                 rows=s.malformed(row.get("rows"), int),
                 error=unit_error,
                 skip_reason=s.malformed(row.get("skip_reason"), str),
+                digest=_digest(s, row),
             )
         )
         _with_target(s, units[-1], row)

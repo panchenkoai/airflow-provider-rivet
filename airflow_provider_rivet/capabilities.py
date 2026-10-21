@@ -23,6 +23,7 @@ DEGRADATIONS = {
     "load_filter": "flag",
     "load_table_filter": "flag",
     "load_result": "flag",
+    "load_digest": "output",
     "stderr_temp": "worker",
     "crashed_ledger": "worker",
     "result_missing": "output",

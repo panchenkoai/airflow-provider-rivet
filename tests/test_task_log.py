@@ -29,6 +29,7 @@ from airflow_provider_rivet.operators import (
     RivetPlanOperator,
     RivetRunOperator,
 )
+from airflow_provider_rivet.result import DIGEST_KEYS
 
 GUIDE = "https://github.com/panchenkoai/airflow-provider-rivet/blob/main/docs/state.md#local-worker-setup-guide"
 SQLITE = f"  note     SQLite state is single-host — see {GUIDE}"
@@ -166,14 +167,25 @@ def test_golden_compact_skipped_is_an_airflow_skip_with_the_same_headline(rig: R
         compact={
             "summary": {
                 "run_id": "c1",
-                "per_table": [{"export": "orders", "table": "t", "status": "skipped", "skip_reason": "nothing to compact"}],
+                "per_table": [
+                    {
+                        **{key: None for key in DIGEST_KEYS},
+                        "export": "orders",
+                        "table": "t",
+                        "target": "p.d.t",
+                        "buffer": None,
+                        "status": "skipped",
+                        "skip_reason": "nothing to compact",
+                        "warehouse_job_ids": [],
+                    }
+                ],
             }
         },
     )
     exc, _ = rig.run(rig.operator(RivetCompactOperator, export="orders", table="t"))
     assert isinstance(exc, AirflowSkipException)
     assert log.shown() == [
-        "INFO rivet compact orders table t → SKIPPED: nothing to do (nothing to compact) in 3.0 s (run c1)",
+        "INFO rivet compact orders table t → p.d.t: SKIPPED: nothing to do (nothing to compact) in 3.0 s (run c1)",
         "INFO   compact  done in 1.0 s",
         f"INFO {SQLITE}",
     ]
@@ -523,3 +535,40 @@ def test_golden_compact_names_the_buffer_and_base_the_config_names(rig: Rig, log
         "INFO rivet compact orders table t → rivet-data-tool.demo_cdc.t__changes into rivet-data-tool.demo_cdc.t "
         "(from config): OK in 3.0 s (run c1)"
     )
+
+
+def test_golden_compact_says_what_the_merge_did_from_rivets_digest(rig: Rig, log: Recorder) -> None:
+    """#63: the owner's "OK in 33.0 s" said nothing of what was done. The compact entry of the pinned contract fixture
+    (rivet >= 0.32.2) gives the rows merged, the DML, the base after, the job and the bytes billed."""
+    rig.scenario(flags=NEW_FLAGS, compact={"summary": fixture("compact_result.json")})
+    payload, _ = rig.run(rig.operator(RivetCompactOperator, export="orders_cdc", table="orders"))
+    assert payload["units"][0]["target"] == "proj.analytics.orders" and "load_digest" not in payload["degraded"]
+    head = "rivet compact orders_cdc table orders → proj.analytics.orders__changes into proj.analytics.orders"
+    assert log.shown() == [
+        f"INFO {head}: OK: 1200 rows, 1 job, 50.0 MiB billed in 3.0 s (run 20261006T102300.789-compact)",
+        "INFO   compact  done in 1.0 s",
+        "INFO   table    orders_cdc.orders → proj.analytics.orders__changes into proj.analytics.orders: compacted, "
+        "1200 rows, 200 inserted, 950 updated, 50 deleted, base 10150 rows, job rivet_compact_orders_1, 50.0 MiB billed "
+        "(run 20261006T102300.789-compact)",
+        f"INFO {SQLITE}",
+    ]
+
+
+def test_golden_load_of_several_tables_counts_tables_rows_and_jobs(rig: Rig, log: Recorder) -> None:
+    """#63: one line per table with its parts, source runs and jobs; the headline sums the rows and the jobs, the
+    failed table's billed job included."""
+    rig.scenario(flags=NEW_FLAGS, load={"summary": fixture("load_result.json")})
+    exc, ti = rig.run(rig.operator(RivetLoadOperator))
+    payload = ti.store[("task", "return_value")]
+    assert type(exc) is AirflowException and payload["units"][0] == fixture("xcom_unit_load.json")
+    shown = log.shown()
+    assert shown[0].startswith("WARNING rivet load → FAILED, retryable")
+    assert (
+        "INFO   table    orders_cdc.orders → proj.analytics.orders__changes: loaded, 1200 rows, 3 files, 2 source runs, "
+        "2 jobs (rivet_load_orders_1, rivet_load_orders_2), 0 B billed (run 20261006T101900.456-load)"
+    ) in shown
+    assert (
+        "INFO   table    countries.countries → proj.analytics.countries: skipped, 0 rows (run 20261006T101900.456-load)" in shown
+    )
+    failed = [line for line in shown if line.startswith("INFO   table    events.events")]
+    assert failed and failed[0].endswith(", job rivet_load_events_1 (run 20261006T101900.456-load)")

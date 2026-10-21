@@ -72,6 +72,8 @@ def test_apply_success_on_todays_binary(rig: Rig) -> None:
         {
             "export": "orders",
             "table": None,
+            "target": None,
+            "buffer": None,
             "status": "success",
             "run_id": "orders_1",
             "rows": 500,
@@ -324,6 +326,8 @@ def test_load_on_todays_binary_runs_a_single_export_copy_of_the_config(rig: Rig)
         {
             "export": "users",
             "table": "users",
+            "target": None,
+            "buffer": None,
             "status": "loaded",
             "run_id": None,
             "rows": None,
@@ -395,7 +399,16 @@ def test_a_compaction_rivet_reports_as_skipped_is_an_airflow_skip(rig: Rig) -> N
 
 def failed_unit(error: dict, export: str | None = None, table: str | None = None) -> dict:
     """One failed unit as the XCom carries it."""
-    base = {"export": export, "table": table, "run_id": None, "rows": None, "files": None, "stop_reason": None}
+    base = {
+        "export": export,
+        "table": table,
+        "target": None,
+        "buffer": None,
+        "run_id": None,
+        "rows": None,
+        "files": None,
+        "stop_reason": None,
+    }
     return {**base, "status": "failed", "error": error}
 
 
@@ -1393,7 +1406,9 @@ def test_a_failed_table_row_without_its_error_fails_the_task_on_exit_zero(rig: R
     assert type(exc) is AirflowFailException and payload["decision"] == "fail"
     (unit,) = payload["units"]
     assert unit["status"] == "failed" and unit["error"]["class"] == "generic"
-    assert payload["degraded"] == ["exit_zero_failed_unit", "state_url_sqlite"], "one failed unit: no per_unit_error"
+    assert payload["degraded"] == ["exit_zero_failed_unit", "load_digest", "state_url_sqlite"], (
+        "one failed unit: no per_unit_error"
+    )
 
 
 def test_a_failed_table_row_without_its_error_takes_the_printed_process_error(rig: Rig) -> None:
