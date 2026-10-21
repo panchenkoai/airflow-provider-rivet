@@ -102,7 +102,9 @@ def test_c1a_a_help_probe_that_fails_after_the_preflight_is_refused_without_retr
 ) -> None:
     """C1-a: `rivet <sub> --help` is probed lazily while argv is built; its RuntimeError or TimeoutExpired left the
     operator raw, retried, with no XCom."""
-    monkeypatch.setattr(capabilities, "PROBE_TIMEOUT", 0.5, raising=False)
+    # Long enough for the fake's `--version` to answer on a loaded host (0.5 s did not, at load 130), far below its
+    # 90 s hang of `--help`.
+    monkeypatch.setattr(capabilities, "PROBE_TIMEOUT", 10, raising=False)
     rig.scenario(probe_broken={sub: how})
     code, text = refusal(rig, rig.operator(cls, export="orders"))
     assert code == "RIVET_AIRFLOW_BINARY_MISSING"
