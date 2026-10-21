@@ -191,7 +191,14 @@ operator's copies of both configs resolve init's relative `cdc.checkpoint` to on
 stop on `RIVET_SOURCE_CDC_CHECKPOINT_SHARED`, exit 5, on Airflow's first try, nothing after it running
 (`shared-checkpoint/mysql/cdc/refused-by-code`; when init refuses the config instead, that cell is init's
 `RIVET_INIT_CDC_NAME_TAKEN`, exit 5, nothing written). `shared-checkpoint-after` then runs the first stream over three
-more updates: its base equals the source value by value and its tasks moved those three rows.
+more updates: its base equals the source value by value and its tasks moved those three rows. Last, git-sync: from the
+first cycle on, the stream's DAGs read init's config, unchanged, through a git-sync checkout
+(`configs/mysql_cdc_sync/repo -> rev-A`, the DAG's `config=` the path under `repo/`). After the other phases the gate
+publishes a new revision as git-sync does (the config copied unchanged into `rev-B`, a new link renamed over `repo`,
+`rev-A` removed), makes three updates and runs the stream: `git-sync/mysql/cdc/run-after-flip` (the run and its tasks
+succeed and the run moved those rows) and `git-sync/mysql/cdc/current-equals-source` (every table's base equals the
+source value by value). The config's copy in the `state_dir` must not change its name with the revision: a copy named by
+the resolved path leaves the old copy owning the checkpoint, and the run is refused `RIVET_SOURCE_CDC_CHECKPOINT_SHARED`.
 
 `--sources mongodb` and `--sources oracle` (together: `--sources mongodb,oracle`) are the same leg where rivet can run
 it, and a known-limit cell where it cannot. **MongoDB 7** runs as a one-member replica set (a change stream needs one)
