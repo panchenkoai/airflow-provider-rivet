@@ -202,9 +202,18 @@ def main(argv: list[str] | None = None) -> int:
         shutil.rmtree(work, ignore_errors=True)
     if args.verdicts:
         args.verdicts.write_text("".join(json.dumps(r) + "\n" for r in rows))
-    failed = [r for r in rows if r["status"] != "PASS"]
-    print(f"airflow gate: {len(rows) - len(failed)} PASS, {len(failed)} FAIL over {len(versions)} stack(s)")
-    return 0 if rows and not failed else 1
+    line, ok = summary(rows, len(versions))
+    print(line)
+    return 0 if ok else 1
+
+
+def summary(rows: list[dict[str, str]], stacks: int) -> tuple[str, bool]:
+    """The verdict line, and whether the run passed: every cell PASS or a known red (XFAIL); an XPASS fails it."""
+    failed = sum(r["status"] not in ("PASS", "XFAIL") for r in rows)
+    xfail = sum(r["status"] == "XFAIL" for r in rows)
+    known = f", {xfail} XFAIL" if xfail else ""
+    line = f"airflow gate: {len(rows) - failed - xfail} PASS, {failed} FAIL{known} over {stacks} stack(s)"
+    return line, bool(rows) and not failed
 
 
 if __name__ == "__main__":
