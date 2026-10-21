@@ -317,13 +317,13 @@ def run_cycle(
     tasks = grade_runs(stand, v, name, run_id, states, RIVET_TASKS)
     marks = grade_base(stand, v, name, run_id, ops, new, files_after, high_water, history, tasks)
     if leg:
-        grade_runs(stand, v, name, run_id, states, leg.tasks, may_skip=leg.may_skip)
+        grade_runs(stand, v, name, run_id, states, leg.tasks, may_skip=warehouse.may_skip(leg.dags, name))
         if sabotage == "warehouse-value" and name == "delta":
             print(f"SABOTAGE {leg.sabotage()}", flush=True)
         leg.grade(stand, v, name, {t: DELETED_BY_BATCH[name] if t == "gate_orders" else 0 for t in TABLES})
     for src in src_legs:
-        grade_runs(stand, v, name, run_id, states, src.tasks, may_skip=src.may_skip)
-        src.grade(stand, v, name)
+        grade_runs(stand, v, name, run_id, states, src.cycle_tasks(), may_skip=src.may_skip)
+        src.grade(stand, v, name, run_id)
     for dest in dest_legs:
         grade_runs(stand, v, name, run_id, states, dest.tasks, may_skip=dest.may_skip)
         dest.grade(stand, v, name, run_id)
@@ -351,7 +351,7 @@ def play(
     stand.wait_dags(
         DAGS
         + (leg.dags if leg else [])
-        + [d for src in src_legs for d in src.dags]
+        + [d for src in src_legs for d in [*src.dags, *filter(None, [src.hot_dag, src.shared_dag])]]
         + [d for x in dest_legs for d in [*x.dags, *x.probe_dags]]
     )
     files: set[str] = set()
@@ -361,6 +361,11 @@ def play(
         files, high_water = run_cycle(
             stand, v, n, name, changes, ops, files, high_water, history, sabotage, leg, src_legs, dest_legs
         )
+    for src in src_legs:
+        if src.hot_dag:
+            src.hot_phase(stand, v, wait_runs, grade_runs)
+        if src.engine.shared is not None and src.shared:
+            src.shared_phase(stand, v, wait_runs, grade_runs)
     for dest in dest_legs:
         dest.missing_bucket_probe(stand, v, wait_runs)
         dest.cleanup_probe(stand, v, wait_runs)

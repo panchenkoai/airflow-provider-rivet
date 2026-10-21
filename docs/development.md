@@ -133,7 +133,8 @@ connection, ClickHouse over HTTP as JSON), every value is brought to one form (i
 microseconds, text) and compared with the source: the batch current state equals the source with exactly the keys the
 cycle deleted left over (an incremental extract cannot see a delete); the CDC current state without the rows flagged
 `__is_deleted` equals the source; the BigQuery batch buffer `<table>__changes` is gone after `compact`, which only
-that DAG may not skip. `--sabotage warehouse-value` adds a cent to one BigQuery row after the delta load and must turn
+that DAG may not skip, on the delta cycle (the first load creates the base from its pass, rivet #652, and the idle load
+buffers nothing, so there a skip is right). `--sabotage warehouse-value` adds a cent to one BigQuery row after the delta load and must turn
 it red. The cleanup lists the dataset, schema and GCS prefix again and fails on anything left; the sweep of runs older
 than a day drops only names of the gate's own shape.
 
@@ -164,6 +165,29 @@ base, read by google-cloud-bigquery, equals the source value by value (read by D
 through `sqlcmd`, an instant cut to the microseconds rivet keeps; batch: with exactly the keys the cycle deleted left
 over; CDC: without the rows flagged `__is_deleted`), and no `__changes` buffer is left. The cleanup deletes both buckets
 and both datasets and looks again; the sweep drops gate-shaped buckets older than a day.
+
+**The MySQL client stack** (MySQL → GCS → BigQuery, `--warehouses bigquery --sources mysql`) adds, on init's configs as
+written: `initial/mysql/<batch|cdc>/load-block-as-written` (init's `load:` block is BigQuery, `layout: base_buffer`,
+`cleanup_source: true`); for every rivet task of each cycle (`run`, `apply.*`, `load.*`, `compact.*`), its XCom unit
+(decision `success`, every unit done, the rows the gate made: a CDC run the cycle's change events, plus the baseline
+on the first; a CDC load its table's; a batch extract or load the source rows past the previous high-water) and its task
+log (the `rivet … →` headline says OK, or SKIPPED where every unit skipped, with the XCom's rows):
+`<cycle>/<dag>/<task>/xcom-unit|task-log`; and `<cycle>/mysql/<kind>/staged-parts-cleaned` (no Parquet left in the
+bucket once loaded). After the cycles, a column added while the CDC run is open (rivet #665): `hot-ddl-open` runs the
+stream in `gate_src_mysql_cdc_hot` (the same config, export and state, paused 45 s at `cdc_after_open`); inside the pause
+the gate reads the source (the run's read bound), runs `ALTER TABLE gate_orders ADD COLUMN note VARCHAR(40) NULL` and
+writes rows that use it (`alter-inside-the-open-run` fails if the pause ended first). init's stream is bounded
+(`until_current: true`), so that run delivers the writes before the ALTER, compared with the source as read in the
+window; `hot-ddl-after` runs the stream and the batch export again: the CDC base equals the source value by value with
+`note` (rows nobody changed after the ALTER read NULL, as at the source; `note-reached` fails when the source holds no
+value of it), the batch base, whose `query:` init wrote with the columns of its day, equals the source on those. Then a
+second CDC config on the first stream's checkpoint (rivet #664): init writes it in a directory of its own (so no sibling
+names its checkpoint), and its DAG (`gate_src_mysql_cdc_shared`) runs in the first stream's `state_dir`, where the
+operator's copies of both configs resolve init's relative `cdc.checkpoint` to one file (`one-checkpoint`). Its run must
+stop on `RIVET_SOURCE_CDC_CHECKPOINT_SHARED`, exit 5, on Airflow's first try, nothing after it running
+(`shared-checkpoint/mysql/cdc/refused-by-code`; when init refuses the config instead, that cell is init's
+`RIVET_INIT_CDC_NAME_TAKEN`, exit 5, nothing written). `shared-checkpoint-after` then runs the first stream over three
+more updates: its base equals the source value by value and its tasks moved those three rows.
 
 `--sources mongodb` and `--sources oracle` (together: `--sources mongodb,oracle`) are the same leg where rivet can run
 it, and a known-limit cell where it cannot. **MongoDB 7** runs as a one-member replica set (a change stream needs one)

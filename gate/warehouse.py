@@ -34,6 +34,10 @@ SECRET_SHAPE = re.compile(r"airflow-connections-afgate_\d{8}[0-9a-f]{4}_\d+_[a-z
 SECRETS_BACKEND = "airflow.providers.google.cloud.secrets.secret_manager.CloudSecretManagerBackend"
 #: The one DAG whose compaction must run: its base_buffer layout keeps the current state in the base only after it.
 MUST_COMPACT = "gate_wh_bigquery_batch"
+#: The cycles whose batch load buffers changes over an existing base. The first load creates the base from its pass
+#: (rivet #652: only an absent name is created, so its compaction has nothing to merge) and the idle load buffers
+#: nothing; a compaction that skips there is right, and the `compacted` cell still holds every cycle to "no buffer left".
+MUST_COMPACT_CYCLES = ("delta",)
 
 
 @dataclass(frozen=True)
@@ -394,11 +398,13 @@ def rivet_tasks(tables: Sequence[str], shorts: Sequence[str], warehouses: Sequen
     return out
 
 
-def may_skip(dag_ids: Sequence[str]) -> dict[str, tuple[str, ...]]:
-    """Task prefixes each DAG may skip: a compaction that has nothing to merge (Snowflake and ClickHouse keep a change log
-    behind a view, BigQuery CDC has no base) skips, except in the BigQuery batch DAG, whose base_buffer layout holds the
-    current state in the base only once `compact` merged the buffer into it."""
-    return {dag: () if dag == MUST_COMPACT else ("compact.",) for dag in dag_ids}
+def may_skip(dag_ids: Sequence[str], cycle: str = "delta") -> dict[str, tuple[str, ...]]:
+    """Task prefixes each DAG may skip in `cycle`: a compaction that has nothing to merge (Snowflake and ClickHouse keep a
+    change log behind a view, BigQuery CDC has no base) skips, except in the BigQuery batch DAG on a cycle whose load
+    buffered changes over its base (`MUST_COMPACT_CYCLES`): base_buffer holds the current state in the base only once
+    `compact` merged the buffer into it."""
+    strict = cycle in MUST_COMPACT_CYCLES
+    return {dag: () if strict and dag == MUST_COMPACT else ("compact.",) for dag in dag_ids}
 
 
 # --- The second-client read-back: canonical values, compared with the source --------------------------------------
