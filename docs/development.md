@@ -231,7 +231,13 @@ folder and the DAG reads the file copied unchanged). `gate_mig_mysql_sqlite` (0.
 moved exactly the changes made since the run before (fewer is a gap, more a duplicate), BigQuery equals the source value
 by value with the deletes applied, the PostgreSQL state holds the SQLite state's rows (per table) and cursors, and the
 checkpoint file is byte for byte what 0.32.1 left, through the copy and the switch. The way back (`gate_mig_mysql_back`:
-this binary on the SQLite file the copy left) is measured, not graded (`MEASURE migrate/mysql/cdc/way-back`). The migration
+this binary on the SQLite file the copy left, whose load ledger knows nothing of the runs loaded on PostgreSQL) runs the
+whole DAG and is graded as `wayback/mysql/cdc/*`: the run moved exactly the new changes, each table's load moved only
+the runs it had not loaded (a PostgreSQL-era run loaded again is a duplicate), BigQuery equals the source, each base holds
+every key once, and no `__changes` buffer is left; the bucket's staged objects before and after and each task's units
+are printed as `MEASURE` lines. The incremental batch pipeline of the same tables goes the same way (rivet 0.32.1's init,
+`gate_migb_mysql_sqlite` / `_pg` / `_back`): `migrate/mysql/batch/*` and `wayback/mysql/batch/*`, with what the extract
+after the way back takes again measured (`MEASURE wayback/mysql/batch/re-exported`). The migration
 database's tables are `mig_customers` / `mig_orders`: rivet refuses an unqualified CDC table another database of the
 server also holds. Last of all, `unqualified/mysql/cdc/same-names-in-another-db` makes that case on purpose: a database
 `rivet_dup` with the scenario's table names, then init's CDC config over `rivet` (its own bucket, dataset and state),

@@ -43,6 +43,20 @@ CONFIG_DIR = "/opt/rivet/configs/mysql_mig"
 INIT_DIR = "/opt/rivet/configs/mysql_mig_init"
 STATE_DIR = "/opt/rivet/state/mysql_mig"
 DAGS = {"sqlite": "gate_mig_mysql_sqlite", "pg": "gate_mig_mysql_pg", "back": "gate_mig_mysql_back"}
+#: The incremental batch pipeline of the same tables, migrated the same way (its own config, state_dir and state).
+B_STATE_DB = state_db(ENGINE, "migb")
+B_STATE_CONN = state_conn_id(ENGINE, "migb")
+B_CONFIG_DIR = "/opt/rivet/configs/mysql_migb"
+B_INIT_DIR = "/opt/rivet/configs/mysql_migb_init"
+B_STATE_DIR = "/opt/rivet/state/mysql_migb"
+B_DAGS = {"sqlite": "gate_migb_mysql_sqlite", "pg": "gate_migb_mysql_pg", "back": "gate_migb_mysql_back"}
+#: The batch steps: updates and inserts only (an incremental extract cannot see a delete), after the stream's steps.
+B_STEPS: dict[str, tuple[str, int]] = {
+    "sqlite-2": ("UPDATE mig_customers SET tier = 'b1' WHERE id IN (14, 15);\n"
+                 "INSERT INTO mig_orders (customer_id, amount, status) VALUES (5, 9.10, 'new');", 3),
+    "pg-1": ("UPDATE mig_customers SET tier = 'b2' WHERE id = 16;", 1),
+    "back": ("UPDATE mig_customers SET tier = 'b3' WHERE id = 17;", 1),
+}  # fmt: skip
 #: The stream's tables: the scenario's under names of their own. rivet refuses an unqualified CDC table another database
 #: of the server also holds (`RIVET_SOURCE_CDC_TABLE_UNRESOLVED`, the binlog is server-wide), and init writes them
 #: unqualified, so the migration database may not reuse the leg's names.
@@ -140,6 +154,21 @@ def stream_equals(
     return problems
 
 
+def load_rows_problems(loaded: dict[str, int | None], expected: dict[str, int]) -> list[str]:
+    """Each table's load moved exactly the rows of the runs it had not loaded (a run loaded again is a duplicate)."""
+    return [
+        f"load.{t} moved {loaded.get(t)} row(s), the runs it had not loaded hold {n}"
+        for t, n in sorted(expected.items())
+        if loaded.get(t) != n
+    ]
+
+
+def duplicate_keys(counts: dict[str, tuple[int, int]]) -> list[str]:
+    """Each base holds every key once (`counts`: table -> (rows, distinct keys)), flagged-deleted rows included."""
+    problems = [f"{t}: {rows} row(s), {keys} key(s)" for t, (rows, keys) in sorted(counts.items()) if rows != keys]
+    return problems or ([] if counts else ["no base read"])
+
+
 def full_copies(names: Sequence[str]) -> list[str]:
     """The provider's copies of the whole config among the state_dir's files: `<stem>.<hash>.yaml`, not the copy cut
     down to one export for a load (`<stem>.<hash>--<export>.yaml`, which a rivet without `--export` on load needs)."""
@@ -173,7 +202,10 @@ class Migration:
         tag = f"{src.cloud.tag}-{src.stack.replace('.', '')}"
         self.bucket = f"rivet-afgate-{tag}-mysqlmig-cdc"
         self.dataset = f"{src.cloud.dataset(src.stack)}_mysqlmig_cdc"
+        self.b_bucket = f"rivet-afgate-{tag}-mysqlmig-batch"
+        self.b_dataset = f"{src.cloud.dataset(src.stack)}_mysqlmig_batch"
         self.stream: dict[str, Any] = {}
+        self.b_exports: list[str] = []
         self.commands: list[str] = []
 
     def command(self, text: str) -> None:
@@ -218,9 +250,47 @@ class Migration:
         if len(streams) != 1:
             raise ValueError(f"rivet 0.32.1's init wrote streams {streams}, expected one")
         self.stream = streams[0]
+        self.b_exports = self.prepare_batch(stand)
         shape = {"config": f"{CONFIG_DIR}/rivet.yaml", "state_dir": STATE_DIR, "stream": self.stream, "dags": DAGS,
-                 "old_bin": OLD_BIN, "url_env": URL_ENV, "conn": CONN, "state_conn": STATE_CONN}  # fmt: skip
+                 "old_bin": OLD_BIN, "url_env": URL_ENV, "conn": CONN, "state_conn": STATE_CONN,
+                 "batch": {"config": f"{B_CONFIG_DIR}/rivet.yaml", "state_dir": B_STATE_DIR, "exports": self.b_exports,
+                           "dags": B_DAGS, "state_conn": B_STATE_CONN}}  # fmt: skip
         (stand.rivet_dir / "configs" / "mysql_migrate.json").write_text(json.dumps(shape))
+
+    def prepare_batch(self, stand: Any) -> list[str]:
+        """rivet 0.32.1's init of the incremental batch config over the same tables (its own bucket, dataset, state)."""
+        from .sources import read_config
+
+        sh(["gcloud", "storage", "buckets", "create", f"gs://{self.b_bucket}", f"--project={self.src.cloud.project}",
+            f"--location={self.src.cloud.location}", "--uniform-bucket-level-access"], timeout=300)  # fmt: skip
+        warehouse._bq(
+            f"--location={self.src.cloud.location}", "mk", "-f", "--dataset", f"{self.src.cloud.project}:{self.b_dataset}"
+        )
+        stand.make_leg_state_db(B_STATE_DB)
+        for sub in ("configs/mysql_migb", "configs/mysql_migb_init", "state/mysql_migb"):
+            (stand.rivet_dir / sub).mkdir(parents=True, exist_ok=True)
+        argv = [
+            OLD_BIN, "init", "--source-env", URL_ENV, "--tls", "disable", "--mode", "incremental", "--gcs-bucket", self.b_bucket,
+            "--bigquery-project", self.src.cloud.project, "--bigquery-dataset", self.b_dataset,
+            "--include", *TABLES, "-o", f"{B_INIT_DIR}/rivet.yaml",
+        ]  # fmt: skip
+        self.command(f"(batch) {URL_ENV}=<mysql url> " + " ".join(argv))
+        stand.compose("exec", "-T", "-e", URL_ENV, "-e", "RIVET_STATE_URL", "airflow-worker", *argv,
+                      extra_env={URL_ENV: self.url(stand), "RIVET_STATE_URL": ""})  # fmt: skip
+        text = (stand.rivet_dir / "configs" / "mysql_migb_init" / "rivet.yaml").read_text()
+        print(f"INIT mysql migrate batch (rivet 0.32.1) config:\n{text}", flush=True)
+        shutil.copyfile(
+            stand.rivet_dir / "configs" / "mysql_migb_init" / "rivet.yaml",
+            stand.rivet_dir / "configs" / "mysql_migb" / "rivet.yaml",
+        )
+        exports = read_config(text, list(TABLES))["exports"]
+        if sorted(exports) != sorted(TABLES):
+            raise ValueError(f"rivet 0.32.1's batch init wrote exports {exports}, expected {sorted(TABLES)}")
+        return exports
+
+    @property
+    def b_tasks(self) -> list[str]:
+        return [f"{g}.{e}" for e in self.b_exports for g in ("apply", "load", "compact")]
 
     def url(self, stand: Any) -> str:
         """The URL init and `rivet state copy` read the migration database with (inside the stack's network)."""
@@ -228,7 +298,7 @@ class Migration:
 
     @property
     def dags(self) -> list[str]:
-        return list(DAGS.values())
+        return [*DAGS.values(), *B_DAGS.values()]
 
     @property
     def tasks(self) -> list[str]:
@@ -370,25 +440,185 @@ class Migration:
         pg_sql, pg_ops = STEPS["pg-2"]
         self.sql(stand, pg_sql)
         self.run(stand, v, wait_runs, "pg-2", DAGS["pg"], events(pg_ops))
-        back_sql, back_ops = STEPS["back"]
-        self.sql(stand, back_sql)
-        self.command(f"(the way back) DAG {DAGS['back']}: rivet_bin=rivet (main), env RIVET_STATE_URL='' (the SQLite "
-                     f"file the copy left), single_host=True, state_dir={STATE_DIR}")  # fmt: skip
-        found = self.run(stand, v, wait_runs, "back", DAGS["back"], events(back_ops), grade=False)
-        print(
-            f"MEASURE migrate/mysql/cdc/way-back: {found or 'the run continued: no gap, no duplicate, BigQuery equals the source'}",
-            flush=True,
-        )
+        self.wayback(stand, v, wait_runs)
+        self.batch(stand, v, wait_runs)
         print("COMMANDS\n" + "\n".join(self.commands), flush=True)
 
+    def objects(self) -> list[str]:
+        out = sh(["gcloud", "storage", "ls", "-r", f"gs://{self.bucket}/**"], timeout=300, check=False).stdout
+        return [line.strip() for line in out.splitlines() if line.strip().startswith("gs://")]
+
+    def bases(self, dataset: str, tables: Sequence[str]) -> tuple[dict[str, tuple[int, int]], set[str]]:
+        """Each base's rows and distinct keys, and every object of the dataset (lower case)."""
+        client = self.src._client()
+        counts = {}
+        for t in tables:
+            row = next(
+                iter(
+                    client.query(
+                        f"SELECT COUNT(*) AS n, COUNT(DISTINCT id) AS k FROM `{self.src.cloud.project}.{dataset}.{t}`"
+                    ).result()
+                )
+            )
+            counts[t] = (row["n"], row["k"])
+        names = {x.table_id.lower() for x in client.list_tables(f"{self.src.cloud.project}.{dataset}")}
+        return counts, names
+
+    def wayback(self, stand: Any, v: Any, wait_runs: Callable[..., Any]) -> None:
+        """The way back: this binary on the SQLite file the copy left (its load ledger knows nothing of the runs loaded
+        while on PostgreSQL), the whole DAG: run, then load and compact of each table. Graded as `wayback/mysql/cdc/*`."""
+        back_sql, back_ops = STEPS["back"]
+        self.sql(stand, back_sql)
+        before = self.objects()
+        print(f"MEASURE wayback/mysql/cdc/staged-before: {len([o for o in before if o.endswith('.parquet')])} Parquet, "
+              f"{len([o for o in before if o.endswith('.json')])} JSON object(s) in gs://{self.bucket}: {before[:40]}", flush=True)  # fmt: skip
+        self.command(f"(the way back) DAG {DAGS['back']}: rivet_bin=rivet (main), env RIVET_STATE_URL='' (the SQLite "
+                     f"file the copy left), single_host=True, state_dir={STATE_DIR}")  # fmt: skip
+        dag, run_id = DAGS["back"], "gate_mig_back"
+        stand.trigger(dag, run_id)
+        state = wait_runs(stand, [dag], run_id).get(dag)
+        tasks = {t: i for t, i in (v.guard("wayback/task-states", stand.tasks, dag, run_id) or {}).items() if t in self.tasks}
+        payloads = {}
+        for t, i in tasks.items():
+            if i.get("state") in ("success", "failed"):
+                try:
+                    payloads[t] = stand.xcom(dag, run_id, t)
+                except Exception as exc:  # the cells read what is there
+                    print(f"WAYBACK no XCom of {t}: {exc}", flush=True)
+        for t, p in sorted(payloads.items()):
+            units = [
+                {k: u.get(k) for k in ("table", "status", "rows", "files", "skip_reason") if k in u} for u in p.get("units") or []
+            ]
+            print(f"MEASURE wayback/mysql/cdc/task {t}: {tasks[t].get('state')}, decision {p.get('decision')}, "
+                  f"error {(p.get('error') or {}).get('code')}, units {units}", flush=True)  # fmt: skip
+        after = self.objects()
+        print(f"MEASURE wayback/mysql/cdc/staged-after: {len([o for o in after if o.endswith('.parquet')])} Parquet, "
+              f"{len([o for o in after if o.endswith('.json')])} JSON object(s)", flush=True)  # fmt: skip
+        v.check(
+            "wayback/mysql/cdc/run",
+            run_problems,
+            state,
+            tasks,
+            payloads.get("run"),
+            events(back_ops),
+            ok=f"{events(back_ops)} row(s)",
+        )
+        loaded = {t.split(".", 1)[1]: (sum(u.get("rows") or 0 for u in p.get("units") or []) if p else None)
+                  for t, p in payloads.items() if t.startswith("load.")}  # fmt: skip
+        expected = {t: sum(back_ops.get(t, {}).values()) for t in TABLES}
+        v.check("wayback/mysql/cdc/loads-moved-only-new-runs", load_rows_problems, loaded, expected, ok=f"{expected}")
+        source = v.guard("wayback/source", self.source_rows, stand)
+        if source is not None:
+            v.check("wayback/mysql/cdc/current-equals-source", lambda: stream_equals(self.warehouse_rows(), source, dict(TABLES)),
+                    ok=", ".join(f"{t} {len(r)} row(s)" for t, r in sorted(source.items())))  # fmt: skip
+        found = v.guard("wayback/bases", self.bases, self.dataset, list(TABLES))
+        if found is not None:
+            counts, names = found
+            print(f"MEASURE wayback/mysql/cdc/bases: {counts}; objects {sorted(names)}", flush=True)
+            v.check("wayback/mysql/cdc/base-unique-keys", duplicate_keys, counts, ok=f"{counts}")
+            v.check(
+                "wayback/mysql/cdc/no-buffer-left",
+                lambda: [p for t in TABLES for p in warehouse.compacted(names, t, t)],
+                ok="each base, no __changes",
+            )
+
+    def batch(self, stand: Any, v: Any, wait_runs: Callable[..., Any]) -> None:
+        """The incremental batch pipeline the same way: 0.32.1 on SQLite (baseline, a delta), `rivet state copy`, this
+        binary on PostgreSQL (a delta), then back to the SQLite file (a delta): what it extracts again is measured;
+        BigQuery is graded against the source and for duplicate keys (`wayback/mysql/batch/*`)."""
+        tables = list(TABLES)
+        self.run_batch(stand, v, wait_runs, "sqlite-1", B_DAGS["sqlite"], None)
+        for step, dag in (("sqlite-2", B_DAGS["sqlite"]),):
+            sql, rows = B_STEPS[step]
+            self.sql(stand, sql)
+            self.run_batch(stand, v, wait_runs, step, dag, rows)
+        names = sorted(p.name for p in (stand.rivet_dir / "state" / "mysql_migb").glob("rivet.*.yaml"))
+        copies = full_copies(names)
+        if len(copies) != 1:
+            v.grade(
+                "migrate/mysql/batch/state-copy", [f"whole config copies in the state_dir: {copies} of {names}, expected one"]
+            )
+            return
+        argv = ["rivet", "state", "copy", "-c", f"{B_STATE_DIR}/{copies[0]}"]
+        self.command(
+            f"(batch) RIVET_STATE_URL=postgresql://rivet_state:<password>@postgres:5432/{B_STATE_DB}?sslmode=disable {' '.join(argv)}"
+        )
+        done = stand.compose("exec", "-T", "-e", "RIVET_STATE_URL", "-e", URL_ENV, "airflow-worker", *argv, check=False,
+                             extra_env={"RIVET_STATE_URL": stand.leg_state_url(B_STATE_DB), URL_ENV: self.url(stand)})  # fmt: skip
+        said = ((done.stdout or "") + (done.stderr or "")).strip()
+        print(f"MIGRATE batch state copy -> exit {done.returncode}\n{said}", flush=True)
+        v.grade(
+            "migrate/mysql/batch/state-copy",
+            [] if done.returncode == 0 else [f"exit {done.returncode}: {said[-1500:]}"],
+            ok="exit 0",
+        )
+        sql, rows = B_STEPS["pg-1"]
+        self.sql(stand, sql)
+        self.run_batch(stand, v, wait_runs, "pg-1", B_DAGS["pg"], rows)
+        sql, rows = B_STEPS["back"]
+        self.sql(stand, sql)
+        moved = self.run_batch(stand, v, wait_runs, "back", B_DAGS["back"], None)
+        print(f"MEASURE wayback/mysql/batch/re-exported: the extract after the way back moved {moved}; the source changed "
+              f"{rows} row(s) since the last run (on PostgreSQL)", flush=True)  # fmt: skip
+        found = v.guard("wayback/batch/bases", self.bases, self.b_dataset, tables)
+        if found is not None:
+            counts, names = found
+            print(f"MEASURE wayback/mysql/batch/bases: {counts}; objects {sorted(names)}", flush=True)
+            v.check("wayback/mysql/batch/base-unique-keys", duplicate_keys, counts, ok=f"{counts}")
+            v.check("wayback/mysql/batch/no-buffer-left", lambda: [p for t in tables for p in warehouse.compacted(names, t, t)],
+                    ok="each base, no __changes")  # fmt: skip
+
+    def run_batch(
+        self, stand: Any, v: Any, wait_runs: Callable[..., Any], step: str, dag: str, rows: int | None
+    ) -> dict[str, Any]:
+        """Run the batch DAG once: the run and its tasks succeed, the extracts moved `rows` (None: not counted), BigQuery
+        equals the source. Returns what each extract reported (rows, files)."""
+        run_id = f"gate_migb_{step}"
+        stand.trigger(dag, run_id)
+        state = wait_runs(stand, [dag], run_id).get(dag)
+        tasks = {
+            t: i
+            for t, i in (v.guard(f"migrate/batch/{step}/task-states", stand.tasks, dag, run_id) or {}).items()
+            if t in self.b_tasks
+        }
+        moved: dict[str, Any] = {}
+        for t in [t for t in self.b_tasks if t.startswith("apply.") and tasks.get(t, {}).get("state") == "success"]:
+            units = (v.guard(f"migrate/batch/{step}/xcom", stand.xcom, dag, run_id, t) or {}).get("units") or []
+            moved[t] = {"rows": sum(u.get("rows") or 0 for u in units), "files": sum(u.get("files") or 0 for u in units)}
+        total = sum(m["rows"] for m in moved.values()) if moved else None
+        print(
+            f"MIGRATE batch {step} {dag}: run {state}, {json.dumps({t: i.get('state') for t, i in tasks.items()})}, extracts {moved}",
+            flush=True,
+        )
+        problems = [] if state == "success" else [f"run {state}"]
+        bad = {t: i.get("state") for t, i in tasks.items() if i.get("state") not in ("success", "skipped")}
+        if bad or not tasks:
+            problems.append(f"tasks {bad or 'none'}")
+        if rows is not None and total != rows:
+            problems.append(f"the extracts moved {total} row(s), the source changed {rows}")
+        family = "wayback" if step == "back" else "migrate"
+        v.grade(f"{family}/mysql/batch/{step}/run", problems, ok=f"{total} row(s)")
+        source = v.guard(f"migrate/batch/{step}/source", self.source_rows, stand)
+        if source is not None:
+            client = self.src._client()
+            v.check(
+                f"{family}/mysql/batch/{step}/current-equals-source",
+                lambda: [p for t in TABLES for p in warehouse.current_state(
+                    [dict(r.items()) for r in client.query(f"SELECT * FROM `{self.src.cloud.project}.{self.b_dataset}.{t}`").result()],
+                    source[t], TABLES[t], "id", 0, t)],
+                ok=", ".join(f"{t} {len(r)} row(s)" for t, r in sorted(source.items())),
+            )  # fmt: skip
+        return moved
+
     def cleanup(self) -> None:
-        sh(["gcloud", "storage", "rm", "-r", "--quiet", f"gs://{self.bucket}"], timeout=600, check=False)
-        warehouse._bq("rm", "-r", "-f", "--dataset", f"{self.src.cloud.project}:{self.dataset}", check=False)
         left = []
-        if sh(["gcloud", "storage", "buckets", "describe", f"gs://{self.bucket}"], timeout=300, check=False).returncode == 0:
-            left.append(f"gcs:{self.bucket}")
-        if sh(["bq", "--quiet", "--headless", "show", f"{self.src.cloud.project}:{self.dataset}"], check=False).returncode == 0:
-            left.append(f"bq:{self.dataset}")
+        for bucket, dataset in ((self.bucket, self.dataset), (self.b_bucket, self.b_dataset)):
+            sh(["gcloud", "storage", "rm", "-r", "--quiet", f"gs://{bucket}"], timeout=600, check=False)
+            warehouse._bq("rm", "-r", "-f", "--dataset", f"{self.src.cloud.project}:{dataset}", check=False)
+            if sh(["gcloud", "storage", "buckets", "describe", f"gs://{bucket}"], timeout=300, check=False).returncode == 0:
+                left.append(f"gcs:{bucket}")
+            if sh(["bq", "--quiet", "--headless", "show", f"{self.src.cloud.project}:{dataset}"], check=False).returncode == 0:
+                left.append(f"bq:{dataset}")
         if left:
             raise RuntimeError(f"cloud cleanup left behind {left}")
 

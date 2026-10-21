@@ -294,6 +294,20 @@ if os.path.exists(f"{ROOT}/configs/mysql_migrate.json"):
             operator_kwargs={**kwargs, "connections": ["gate_gcp"]},
             tags=["rivet", "gate", "migrate"],
         )
+    # The incremental batch pipeline of the same tables, migrated the same way.
+    b = mig["batch"]
+    on_sqlite_b = {**on_sqlite, "env_from_connections": {mig["url_env"]: mig["conn"]}}
+    on_pg_b = {"env_from_connections": {mig["url_env"]: mig["conn"], "RIVET_STATE_URL": b["state_conn"]}}
+    for kind, kwargs in (("sqlite", {**on_sqlite_b, "rivet_bin": mig["old_bin"]}), ("pg", on_pg_b), ("back", on_sqlite_b)):
+        globals()[b["dags"][kind]] = build_batch_dag(
+            b["dags"][kind],
+            config=b["config"],
+            state_dir=b["state_dir"],
+            exports=b["exports"],
+            compact_exports=b["exports"],
+            operator_kwargs={**kwargs, "connections": ["gate_gcp"]},
+            tags=["rivet", "gate", "migrate"],
+        )
 
 
 # The config `rivet init` writes beside a database of the same table names (sources.py `unqualified_phase`), made after

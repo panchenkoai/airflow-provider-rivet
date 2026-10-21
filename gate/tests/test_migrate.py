@@ -137,3 +137,31 @@ def test_the_state_is_copied_from_the_whole_config_not_a_loads_cut() -> None:
     # to the stream). Mutant: every `rivet.*.yaml` taken (two copies: the leg stops before the copy).
     assert migrate.full_copies(["rivet.f8546eeb--cdc.yaml", "rivet.f8546eeb.yaml"]) == ["rivet.f8546eeb.yaml"]
     assert migrate.full_copies(["rivet.f8546eeb--gate_orders.yaml"]) == []
+
+
+def test_the_way_back_loads_only_the_runs_its_ledger_had_not_loaded() -> None:
+    assert migrate.load_rows_problems({"mig_customers": 1, "mig_orders": 1}, {"mig_customers": 1, "mig_orders": 1}) == []
+    # Mutant: the per-table rows not compared (a load that took the PostgreSQL-era runs again passes).
+    assert migrate.load_rows_problems({"mig_customers": 3, "mig_orders": 1}, {"mig_customers": 1, "mig_orders": 1}) == [
+        "load.mig_customers moved 3 row(s), the runs it had not loaded hold 1"
+    ]
+    assert migrate.load_rows_problems({"mig_orders": 1}, {"mig_customers": 1, "mig_orders": 1}) == [
+        "load.mig_customers moved None row(s), the runs it had not loaded hold 1"
+    ]
+
+
+def test_a_base_holds_each_key_once() -> None:
+    assert migrate.duplicate_keys({"mig_orders": (5003, 5003)}) == []
+    # Mutant: rows and keys not compared (a base that holds a key twice passes).
+    assert migrate.duplicate_keys({"mig_orders": (5004, 5003)}) == ["mig_orders: 5004 row(s), 5003 key(s)"]
+    assert migrate.duplicate_keys({}) == ["no base read"]
+
+
+def test_the_batch_pipeline_migrates_with_its_own_config_state_and_dags() -> None:
+    dag = (Path(migrate.__file__).parent / "stand" / "dags" / "rivet_gate.py").read_text()
+    block = dag[dag.index("# The incremental batch pipeline of the same tables") :]
+    # Mutant: the batch PostgreSQL DAG on the stream's state, or the batch way back on the old binary.
+    assert '"RIVET_STATE_URL": b["state_conn"]' in block
+    assert '(("sqlite", {**on_sqlite_b, "rivet_bin": mig["old_bin"]}), ("pg", on_pg_b), ("back", on_sqlite_b))' in block
+    assert migrate.B_STATE_DB != migrate.STATE_DB and migrate.B_STATE_DIR != migrate.STATE_DIR
+    assert all("DELETE" not in sql for sql, _ in migrate.B_STEPS.values()), "an incremental extract cannot see a delete"

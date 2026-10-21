@@ -318,6 +318,7 @@ class Stand:
         return unq | {
             "rivet_gate_mysql_mig": {**mysql[0].connection(self.secrets), "schema": "rivet_mig"},
             state_conn_id("mysql", "mig"): self.leg_state_conn(state_db("mysql", "mig")),
+            state_conn_id("mysql", "migb"): self.leg_state_conn(state_db("mysql", "migb")),
         }
 
     def leg_state_sql(self, db: str, sql: str) -> str:
