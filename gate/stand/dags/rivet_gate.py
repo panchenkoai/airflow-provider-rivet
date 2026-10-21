@@ -115,12 +115,14 @@ for engine in filter(None, os.environ.get("GATE_SOURCES", "").split(",")):
             operator_kwargs=leg_kwargs(engine, "batch"),
             tags=["rivet", "gate", "source", engine],
         )
+    # The stream's config: init's file, or the same text read through a git-sync checkout (`repo -> rev-<n>`).
+    cdc_config = shape.get("cdc_config", f"{ROOT}/configs/{engine}_cdc/rivet.yaml")
     # One DAG per CDC stream: one over every table, or one per table where the engine captures per table (SQL Server,
     # MongoDB).
     for stream in shape.get("cdc", {}).get("streams", []):
         globals()[f"gate_src_{engine}{stream['dag']}"] = build_cdc_dag(
             f"gate_src_{engine}{stream['dag']}",
-            config=f"{ROOT}/configs/{engine}_cdc/rivet.yaml",
+            config=cdc_config,
             export=stream["name"],
             tables=stream["tables"],
             state_dir=f"{ROOT}/state/{engine}_cdc",
@@ -135,7 +137,7 @@ for engine in filter(None, os.environ.get("GATE_SOURCES", "").split(",")):
         hot_kwargs["env"] = {"RIVET_TEST_PAUSE_AT": hot["pause"], "RIVET_TEST_PAUSE_MARKER": hot["marker"]}
         globals()[hot["dag"]] = build_cdc_dag(
             hot["dag"],
-            config=f"{ROOT}/configs/{engine}_cdc/rivet.yaml",
+            config=cdc_config,
             export=hot["stream"]["name"],
             tables=hot["stream"]["tables"],
             state_dir=f"{ROOT}/state/{engine}_cdc",

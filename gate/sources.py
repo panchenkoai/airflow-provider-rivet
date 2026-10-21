@@ -7,8 +7,11 @@ wrote (nothing is edited). The warehouse is read back by a client the loader doe
 from __future__ import annotations
 
 import base64
+import hashlib
 import json
+import os
 import re
+import shutil
 import time
 import uuid
 from collections.abc import Callable, Sequence
@@ -119,6 +122,9 @@ class Engine:
     #: After the hot ALTER: a second CDC config on the first stream's checkpoint must be refused, and these changes
     #: (with their events) must then reach the first stream intact.
     shared: tuple[str, dict[str, dict[str, int]]] | None = None
+    #: The stream's config read through a git-sync checkout (`repo -> rev-A`), flipped to `rev-B` after the other phases;
+    #: then these changes (with their events) must reach the stream intact.
+    git_sync: tuple[str, dict[str, dict[str, int]]] | None = None
 
     @property
     def service(self) -> str:
@@ -219,6 +225,7 @@ DELETE FROM gate_orders WHERE id = 100;
         deleted=1,
     ),
     shared=("UPDATE gate_customers SET tier = 'gold' WHERE id <= 3;", {"gate_customers": {"update": 3}, "gate_orders": {}}),
+    git_sync=("UPDATE gate_customers SET tier = 'synced' WHERE id BETWEEN 4 AND 6;", {"gate_customers": {"update": 3}}),
 )
 MSSQL = Engine(
     name="mssql",
@@ -537,6 +544,8 @@ class SourceLeg:
         self.high_water: dict[str, Any] = {}
         #: The DAG of the stream whose run pauses after it opened (the hot ALTER), when the engine has one.
         self.hot_dag = ""
+        #: The config copy a previous provider left in the stream's state_dir (git-sync leg), placed before the cycles.
+        self.stale_copy: Path | None = None
         #: The second CDC config on the first stream's checkpoint: init's answer, and its DAG when init wrote it.
         self.shared: dict[str, Any] = {}
         self.shared_dag = ""
@@ -654,6 +663,17 @@ class SourceLeg:
             }
             if self.engine.shared is not None:
                 self.prepare_shared(stand, f"{prefix}_cdc_shared")
+        if self.engine.git_sync is not None:
+            # The stream's DAGs read init's config through a git-sync checkout from the first cycle on.
+            self.shape["cdc_config"] = git_sync_layout(
+                stand.rivet_dir / "configs" / f"{self.engine.name}_cdc_sync", self.texts["cdc"]
+            )
+            # What the previous provider left in the state_dir: its copy of the config, named by the RESOLVED path (the
+            # revision's), with the same text and no `.owner` record (rivet <= 0.32.1 wrote none).
+            resolved = self.shape["cdc_config"].replace("/repo/", "/rev-A/")
+            state_dir = stand.rivet_dir / "state" / f"{self.engine.name}_cdc"
+            self.stale_copy = state_dir / old_copy_name(resolved)
+            self.stale_copy.write_text(self.texts["cdc"])
         # A compaction with nothing to merge skips; the `compacted` cell holds every cycle to "no buffer left".
         self.may_skip = {dag: ("compact.",) for dag in self.tasks}
         # The DAG file reads which exports and stream to build from here (the names are init's, not the gate's).
@@ -806,6 +826,15 @@ class SourceLeg:
             return
         deleted = {"batch": {t: deleted_by_batch(name, t) for t in self.engine.tables}}
         self.grade_targets(v, name, source, self.engine.kinds, deleted)
+        if self.stale_copy is not None and name == "initial" and run_id:
+            dag = next(d for d in self.dags if d.endswith("_cdc"))
+            v.check(
+                f"git-sync/{self.engine.name}/cdc/stale-copy-of-old-provider-not-refused",
+                lambda: stale_copy_problems(
+                    stand.run_state(dag, run_id), stand.xcom(dag, run_id, "run"), self.stale_copy.exists()
+                ),
+                ok=f"{self.stale_copy.name} in the state_dir, the run through repo/ succeeded",
+            )
         if self.engine.ops and run_id:
             ops = self.engine.ops.get(name, {})
             self.grade_tasks(stand, v, name, run_id, self.dags, source, ops, baseline=name == "initial")
@@ -1004,6 +1033,43 @@ class SourceLeg:
         self.grade_tasks(stand, v, name, run_id, [dag], old, ops, baseline=False)
         self.grade_staged(v, name, ("cdc",))
 
+    def git_sync_phase(self, stand: Any, v: Any, wait_runs: Callable[..., dict[str, str]]) -> None:
+        """git-sync publishes a new revision of the DAG folder: the config, unchanged, in `rev-B`, and the `repo` link
+        flipped to it atomically (the old revision removed). The stream's next run must succeed and deliver intact."""
+        assert self.engine.git_sync is not None and self.engine.hot is not None
+        name, eng, hot = "git-sync", self.engine.name, self.engine.hot
+        dag = next(d for d in self.dags if d.endswith("_cdc"))
+        copies = stand.rivet_dir / "state" / f"{eng}_cdc"
+        print(f"GIT-SYNC copies before the flip: {sorted(p.name for p in copies.glob('rivet.*.yaml'))}", flush=True)
+        flipped = v.guard(f"{name}/{eng}/cdc/flip", flip, stand.rivet_dir / "configs" / f"{eng}_cdc_sync")
+        if flipped is None:
+            return
+        print(f"GIT-SYNC repo -> {flipped}", flush=True)
+        changes, ops = self.engine.git_sync
+        self.sql(stand, changes)
+        run_id = f"gate_{eng}_git_sync"
+        stand.trigger(dag, run_id)
+        state = wait_runs(stand, [dag], run_id).get(dag)
+        tasks = v.guard(f"{name}/{eng}/cdc/task-states", stand.tasks, dag, run_id) or {}
+        payload = None
+        if tasks.get("run", {}).get("state") in ("success", "failed"):
+            payload = v.guard(f"{name}/{eng}/cdc/xcom", stand.xcom, dag, run_id, "run")
+        print(f"GIT-SYNC copies after: {sorted(p.name for p in copies.glob('rivet.*.yaml'))}; run {state}, "
+              f"{json.dumps({t: i.get('state') for t, i in tasks.items()})} {json.dumps(payload, default=str)}", flush=True)  # fmt: skip
+        events = sum(n for per in ops.values() for n in per.values())
+        v.check(f"{name}/{eng}/cdc/run-after-flip", run_after_flip, state, tasks, payload, events, ok=f"{events} row(s)")
+        source = v.guard(f"{name}/{eng}/source", self.source_rows, stand, {hot.table: [hot.column]})
+        if source is None:
+            return
+        cols = {t: [*c, *([hot.column] if t == hot.table else [])] for t, c in self.engine.tables.items()}
+        v.check(
+            f"{name}/{eng}/cdc/current-equals-source",
+            lambda: stream_equals_source(
+                {t: self.read("cdc", self.targets["cdc"][t]) for t in self.engine.tables}, source, cols, self.engine.key
+            ),
+            ok=", ".join(f"{t} {len(rows)} row(s)" for t, rows in sorted(source.items())),
+        )
+
     def _compare(
         self, kind: str, table: str, source: list[dict[str, Any]], cols: list[str], deleted: int
     ) -> Callable[[], list[str]]:
@@ -1012,6 +1078,71 @@ class SourceLeg:
         return lambda: warehouse.current_state(
             self.read(kind, target), source, cols, self.engine.key, deleted, what, flagged=kind == "cdc"
         )
+
+
+def git_sync_layout(root: Path, text: str, name: str = "rivet.yaml") -> str:
+    """A git-sync checkout of the config: `root/rev-A/<name>` holding init's text unchanged, `root/repo -> rev-A` (a
+    relative link, so it resolves the same in the containers); the path the DAG reads, in the containers."""
+    (root / "rev-A").mkdir(parents=True, exist_ok=True)
+    (root / "rev-A" / name).write_text(text)
+    (root / "repo").symlink_to("rev-A")
+    return f"/opt/rivet/{root.relative_to(root.parents[1])}/repo/{name}"
+
+
+def old_copy_name(resolved: str, name: str = "rivet.yaml") -> str:
+    """The name the previous provider gave a config's copy: its stem and the first 8 hex digits of the sha256 of the
+    symlink-RESOLVED path (`copy_name(Path(config).resolve())`)."""
+    stem, _, suffix = name.rpartition(".")
+    return f"{stem}.{hashlib.sha256(resolved.encode()).hexdigest()[:8]}.{suffix}"
+
+
+def stale_copy_problems(state: str | None, payload: dict[str, Any] | None, present: bool) -> list[str]:
+    """With the old provider's copy (no owner record) in the state_dir, the stream's run succeeded, not refused."""
+    problems = [] if present else ["no stale copy in the state_dir: the cell proves nothing"]
+    if state != "success":
+        problems.append(f"run {state}")
+    error = (payload or {}).get("error") or {}
+    if error or (payload or {}).get("decision") != "success":
+        problems.append(f"rivet stopped [{error.get('code')}] decision {(payload or {}).get('decision')!r}")
+    return problems
+
+
+def flip(root: Path) -> str:
+    """What git-sync does on a new revision: the worktree `rev-B` (the config copied unchanged), a new link renamed over
+    `repo` in one step, and the old worktree removed. The revision `repo` names now."""
+    old = os.readlink(root / "repo")
+    new = "rev-B" if old != "rev-B" else "rev-A"
+    shutil.copytree(root / old, root / new)
+    tmp = root / f".repo.{new}.tmp"
+    tmp.unlink(missing_ok=True)
+    tmp.symlink_to(new)
+    os.replace(tmp, root / "repo")
+    shutil.rmtree(root / old)
+    return os.readlink(root / "repo")
+
+
+def run_after_flip(state: str | None, tasks: dict[str, dict[str, Any]], payload: dict[str, Any] | None, events: int) -> list[str]:
+    """The stream's first run after the flip succeeded, every task of it too, and its run moved the changes made."""
+    problems = [] if state == "success" else [f"run {state}"]
+    bad = {t: i.get("state") for t, i in tasks.items() if i.get("state") not in ("success", "skipped")}
+    if bad or not tasks:
+        problems.append(f"tasks {bad or 'none'}")
+    error = (payload or {}).get("error") or {}
+    if error:
+        problems.append(f"rivet stopped [{error.get('code')}] exit {(payload or {}).get('exit_status')}")
+    elif payload is not None and unit_rows(payload) != events:
+        problems.append(f"the run moved {unit_rows(payload)} row(s), the source changed {events}")
+    return problems
+
+
+def stream_equals_source(
+    got: dict[str, list[dict[str, Any]]], source: dict[str, list[dict[str, Any]]], cols: dict[str, list[str]], key: str
+) -> list[str]:
+    """Every table of the stream: its BigQuery base without the rows flagged deleted equals the source, value by value."""
+    problems = []
+    for table in sorted(source):
+        problems += warehouse.current_state(got.get(table, []), source[table], cols[table], key, 0, table, flagged=True)
+    return problems
 
 
 #: rivet #664: a checkpoint is read by one config; init refuses a name another config in its directory takes.
