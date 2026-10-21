@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import shutil
 from collections.abc import Callable, Sequence
 from pathlib import Path
@@ -137,6 +138,12 @@ def stream_equals(
     for table in sorted(source):
         problems += warehouse.current_state(got.get(table, []), source[table], cols[table], "id", 0, table, flagged=True)
     return problems
+
+
+def full_copies(names: Sequence[str]) -> list[str]:
+    """The provider's copies of the whole config among the state_dir's files: `<stem>.<hash>.yaml`, not the copy cut
+    down to one export for a load (`<stem>.<hash>--<export>.yaml`, which a rivet without `--export` on load needs)."""
+    return [n for n in names if re.fullmatch(r"[^.]+\.[0-9a-f]{8}\.yaml", n)]
 
 
 def fingerprints(folder: Path) -> dict[str, str]:
@@ -328,9 +335,10 @@ class Migration:
         print(f"MIGRATE SQLite state {json.dumps(sqlite)}; checkpoints {ckpt}", flush=True)
         before_sql, before_ops = STEPS["before-switch"]
         self.sql(stand, before_sql)
-        copies = sorted(p.name for p in (stand.rivet_dir / "state" / "mysql_mig").glob("rivet.*.yaml"))
+        names = sorted(p.name for p in (stand.rivet_dir / "state" / "mysql_mig").glob("rivet.*.yaml"))
+        copies = full_copies(names)
         if len(copies) != 1:
-            v.grade("migrate/mysql/cdc/state-copy", [f"config copies in the state_dir: {copies}, expected one"])
+            v.grade("migrate/mysql/cdc/state-copy", [f"whole config copies in the state_dir: {copies} of {names}, expected one"])
             return
         argv = ["rivet", "state", "copy", "-c", f"{STATE_DIR}/{copies[0]}"]
         self.command(

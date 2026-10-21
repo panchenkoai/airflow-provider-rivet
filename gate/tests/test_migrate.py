@@ -130,3 +130,10 @@ def test_the_migration_tables_share_no_name_with_the_legs() -> None:
     assert sorted(migrate.TABLES) == ["mig_customers", "mig_orders"]
     assert "gate_" not in MYSQL.seed.replace("gate_", "mig_")
     assert all("gate_" not in sql and set(ops) <= set(migrate.TABLES) for sql, ops in migrate.STEPS.values())
+
+
+def test_the_state_is_copied_from_the_whole_config_not_a_loads_cut() -> None:
+    # Live (3.3.2, 0.32.1): the state_dir held `rivet.f8546eeb.yaml` and `rivet.f8546eeb--cdc.yaml` (the load's copy, cut
+    # to the stream). Mutant: every `rivet.*.yaml` taken (two copies: the leg stops before the copy).
+    assert migrate.full_copies(["rivet.f8546eeb--cdc.yaml", "rivet.f8546eeb.yaml"]) == ["rivet.f8546eeb.yaml"]
+    assert migrate.full_copies(["rivet.f8546eeb--gate_orders.yaml"]) == []
