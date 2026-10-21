@@ -59,8 +59,10 @@ def test_compose_postgres_state_is_a_role_and_a_database_on_airflows_server(tmp_
     conn = client.connections()["rivet_gate_state_mysql_cdc"]
     # Mutant: the client mode left on the gate's own state server, or the gate's role.
     assert (conn["host"], conn["login"], conn["schema"]) == ("postgres", ROLE, "rivet_state_mysql_cdc")
-    assert conn["password"] == client.secrets.compose_state != client.secrets.state and "extra" not in conn
-    assert client.leg_state_url("d") == f"postgresql://{ROLE}:{client.secrets.compose_state}@postgres:5432/d"
+    assert conn["password"] == client.secrets.compose_state != client.secrets.state
+    # Mutant: no `sslmode` (rivet refuses a remote state URL that names none, RIVET_STATE_URL_TLS_REQUIRED, exit 5).
+    assert conn["extra"] == {"rivet_params": "sslmode=disable"}
+    assert client.leg_state_url("d") == f"postgresql://{ROLE}:{client.secrets.compose_state}@postgres:5432/d?sslmode=disable"
     # The default is unchanged: the gate's TLS state server.
     assert stand.connections()["rivet_gate_state_mysql_cdc"]["host"] == "gate-state"
     assert stand.leg_state_url("d") == stand.state_url("d")

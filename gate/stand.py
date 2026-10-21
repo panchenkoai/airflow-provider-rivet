@@ -503,6 +503,9 @@ class Stand:
                 "login": COMPOSE_STATE_ROLE,
                 "password": self.secrets.compose_state,
                 "schema": db,
+                # The compose `postgres` has no TLS: rivet refuses a remote state URL without an `sslmode`
+                # (RIVET_STATE_URL_TLS_REQUIRED), so plaintext on the compose network is said, not assumed.
+                "extra": {"rivet_params": "sslmode=disable"},
             }
         return {
             "conn_type": "postgres",
@@ -517,7 +520,7 @@ class Stand:
     def leg_state_url(self, db: str) -> str:
         """A source leg config's state as `rivet init` reads it inside the stack's network (its Connection's URL)."""
         if self.state_place == "compose-postgres":
-            return f"postgresql://{COMPOSE_STATE_ROLE}:{self.secrets.compose_state}@postgres:5432/{db}"
+            return f"postgresql://{COMPOSE_STATE_ROLE}:{self.secrets.compose_state}@postgres:5432/{db}?sslmode=disable"
         return self.state_url(db)
 
     def make_leg_state_db(self, db: str) -> None:

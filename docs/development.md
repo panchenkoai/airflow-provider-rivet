@@ -215,7 +215,8 @@ code (`RIVET_AIRFLOW_EXPORT_BUSY`, the provider's export lock, or rivet's `RIVET
 **The client stack.** `--state compose-postgres` keeps the source legs' state where the client does: in a database of
 its own (`rivet_state_<engine>_<kind>`), owned by a role of its own (`rivet_state`, LOGIN, its own password), on the
 compose file's `postgres` server beside Airflow's metadata database `airflow`, reached through a Connection
-(`postgresql://rivet_state:…@postgres:5432/<db>`) the DAGs read with `env_from_connections={"RIVET_STATE_URL": …}`; init
+(`postgresql://rivet_state:…@postgres:5432/<db>?sslmode=disable`: the compose `postgres` has no TLS, and rivet refuses a
+remote state URL that names no `sslmode`, `RIVET_STATE_URL_TLS_REQUIRED`) the DAGs read with `env_from_connections={"RIVET_STATE_URL": …}`; init
 runs with that `RIVET_STATE_URL`. `compose-pg/mysql/state-in-own-database` reads the server as its superuser: each state
 database is owned by `rivet_state` and holds tables owned by it, and `airflow` holds none of rivet's tables (none of
 their names, none owned by the role). The default (`--state gate`, the gate's TLS `gate-state`) is unchanged.

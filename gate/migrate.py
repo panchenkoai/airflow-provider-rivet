@@ -328,7 +328,9 @@ class Migration:
             v.grade("migrate/mysql/cdc/state-copy", [f"config copies in the state_dir: {copies}, expected one"])
             return
         argv = ["rivet", "state", "copy", "-c", f"{STATE_DIR}/{copies[0]}"]
-        self.command(f"RIVET_STATE_URL=postgresql://rivet_state:<password>@postgres:5432/{STATE_DB} {' '.join(argv)}")
+        self.command(
+            f"RIVET_STATE_URL=postgresql://rivet_state:<password>@postgres:5432/{STATE_DB}?sslmode=disable {' '.join(argv)}"
+        )
         done = stand.compose("exec", "-T", "-e", "RIVET_STATE_URL", "-e", URL_ENV, "airflow-worker", *argv, check=False,
                              extra_env={"RIVET_STATE_URL": stand.leg_state_url(STATE_DB), URL_ENV: self.url(stand)})  # fmt: skip
         said = ((done.stdout or "") + (done.stderr or "")).strip()
@@ -344,7 +346,7 @@ class Migration:
         v.check("migrate/mysql/cdc/checkpoint-untouched-by-copy", checkpoint_problems, ckpt, self.checkpoints(stand), "the copy",
                 ok=f"{sorted(ckpt)}")  # fmt: skip
         self.command(f"DAG {DAGS['pg']}: rivet_bin=rivet (main), env_from_connections RIVET_STATE_URL={STATE_CONN} "
-                     f"(postgresql://rivet_state:...@postgres:5432/{STATE_DB}), state_dir={STATE_DIR}")  # fmt: skip
+                     f"(postgresql://rivet_state:...@postgres:5432/{STATE_DB}?sslmode=disable), state_dir={STATE_DIR}")  # fmt: skip
         after_sql, after_ops = STEPS["after-switch"]
         self.sql(stand, after_sql)
         held = self.checkpoints(stand)
