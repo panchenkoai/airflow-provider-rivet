@@ -347,9 +347,10 @@ def play(
     leg: warehouse.Leg | None = None,
     src_legs: list[sources.SourceLeg] | None = None,
     dest_legs: list[destinations.S3Leg] | None = None,
+    mig_legs: list[Any] | None = None,
 ) -> None:
-    """Seed, configure, and run the three cycles (then each destination leg's missing-bucket run)."""
-    src_legs, dest_legs = src_legs or [], dest_legs or []
+    """Seed, configure, and run the three cycles (then each destination leg's missing-bucket run, and the migration)."""
+    src_legs, dest_legs, mig_legs = src_legs or [], dest_legs or [], mig_legs or []
     stand.psql("gate-source", "rivet", SEED)
     write_configs(stand.rivet_dir)
     if leg:
@@ -358,10 +359,13 @@ def play(
         src.prepare(stand)
     for dest in dest_legs:
         dest.prepare(stand, SEED)
+    for mig in mig_legs:
+        mig.prepare(stand)
     stand.wait_dags(
-        DAGS
+        [d for mig in mig_legs for d in mig.dags]
+        + DAGS
         + (leg.dags if leg else [])
-        + [d for src in src_legs for d in [*src.dags, *filter(None, [src.hot_dag, src.shared_dag])]]
+        + [d for src in src_legs for d in [*src.dags, *filter(None, [src.hot_dag, src.shared_dag, src.overlap_dag])]]
         + [d for x in dest_legs for d in [*x.dags, *x.probe_dags]]
     )
     files: set[str] = set()
@@ -376,8 +380,17 @@ def play(
             src.hot_phase(stand, v, wait_runs, grade_runs)
         if src.engine.shared is not None and src.shared:
             src.shared_phase(stand, v, wait_runs, grade_runs)
+        if src.engine.overlap is not None and src.overlap_dag:
+            src.overlap_phase(stand, v, wait_runs)
+        if src.engine.recreate is not None:
+            src.recreate_phase(stand, v, wait_runs)
         if src.engine.git_sync is not None:
             src.git_sync_phase(stand, v, wait_runs)
+    for mig in mig_legs:
+        mig.play(stand, v, wait_runs)
+    for src in src_legs:
+        if src.engine.duplicate_db:
+            src.unqualified_phase(stand, v, wait_runs)
     for dest in dest_legs:
         dest.missing_bucket_probe(stand, v, wait_runs)
         dest.cleanup_probe(stand, v, wait_runs)

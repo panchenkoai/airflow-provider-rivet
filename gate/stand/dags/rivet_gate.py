@@ -144,6 +144,22 @@ for engine in filter(None, os.environ.get("GATE_SOURCES", "").split(",")):
             operator_kwargs=hot_kwargs,
             tags=["rivet", "gate", "source", engine],
         )
+    # The second of two overlapping runs of the stream (the hot DAG's held run is the first): a short wait for the
+    # provider's export lock, then one retry a minute later.
+    overlap = shape.get("overlap")
+    if overlap:
+        from datetime import timedelta
+
+        globals()[overlap["dag"]] = build_cdc_dag(
+            overlap["dag"],
+            config=cdc_config,
+            export=overlap["stream"]["name"],
+            tables=overlap["stream"]["tables"],
+            state_dir=f"{ROOT}/state/{engine}_cdc",
+            operator_kwargs={**leg_kwargs(engine, "cdc"), "lock_wait": overlap["lock_wait"]},
+            default_args={"retries": 1, "retry_delay": timedelta(seconds=60)},
+            tags=["rivet", "gate", "source", engine],
+        )
     # A second CDC config init wrote in a directory of its own, run in the first stream's state_dir: its copy there
     # names the same checkpoint file, which another config owns (rivet #664 refuses the run by code).
     shared = shape.get("shared")
@@ -259,3 +275,52 @@ if os.environ.get("GATE_WORKERS", "1") != "1" and os.path.exists(MULTIHOST_SHAPE
                 "RIVET_TEST_PAUSE_MARKER": f"{ROOT}/markers/mh_{mh['paused']}",
             }
         globals()[f"gate_mh_{name}"] = dag
+
+
+# The migration leg (gate/migrate.py): one MySQL CDC config and one state_dir, run by rivet 0.32.1 on SQLite, then by this
+# binary on the PostgreSQL state `rivet state copy` filled, then (the way back) by this binary on the SQLite file again.
+if os.path.exists(f"{ROOT}/configs/mysql_migrate.json"):
+    with open(f"{ROOT}/configs/mysql_migrate.json") as handle:
+        mig = json.load(handle)
+    on_sqlite = {"env_from_connections": {mig["url_env"]: mig["conn"]}, "env": {"RIVET_STATE_URL": ""}, "single_host": True}
+    on_pg = {"env_from_connections": {mig["url_env"]: mig["conn"], "RIVET_STATE_URL": mig["state_conn"]}}
+    for kind, kwargs in (("sqlite", {**on_sqlite, "rivet_bin": mig["old_bin"]}), ("pg", on_pg), ("back", on_sqlite)):
+        globals()[mig["dags"][kind]] = build_cdc_dag(
+            mig["dags"][kind],
+            config=mig["config"],
+            export=mig["stream"]["name"],
+            tables=mig["stream"]["tables"],
+            state_dir=mig["state_dir"],
+            operator_kwargs={**kwargs, "connections": ["gate_gcp"]},
+            tags=["rivet", "gate", "migrate"],
+        )
+    # The incremental batch pipeline of the same tables, migrated the same way.
+    b = mig["batch"]
+    on_sqlite_b = {**on_sqlite, "env_from_connections": {mig["url_env"]: mig["conn"]}}
+    on_pg_b = {"env_from_connections": {mig["url_env"]: mig["conn"], "RIVET_STATE_URL": b["state_conn"]}}
+    for kind, kwargs in (("sqlite", {**on_sqlite_b, "rivet_bin": mig["old_bin"]}), ("pg", on_pg_b), ("back", on_sqlite_b)):
+        globals()[b["dags"][kind]] = build_batch_dag(
+            b["dags"][kind],
+            config=b["config"],
+            state_dir=b["state_dir"],
+            exports=b["exports"],
+            compact_exports=b["exports"],
+            operator_kwargs={**kwargs, "connections": ["gate_gcp"]},
+            tags=["rivet", "gate", "migrate"],
+        )
+
+
+# The config `rivet init` writes beside a database of the same table names (sources.py `unqualified_phase`), made after
+# everything else; its DAG appears once the gate writes the shape.
+if os.path.exists(f"{ROOT}/configs/mysql_unq.json"):
+    with open(f"{ROOT}/configs/mysql_unq.json") as handle:
+        unq = json.load(handle)
+    globals()[unq["dag"]] = build_cdc_dag(
+        unq["dag"],
+        config=unq["config"],
+        export=unq["stream"]["name"],
+        tables=unq["stream"]["tables"],
+        state_dir=unq["state_dir"],
+        operator_kwargs=leg_kwargs("mysql", "unq"),
+        tags=["rivet", "gate", "source", "mysql"],
+    )

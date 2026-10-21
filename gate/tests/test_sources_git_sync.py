@@ -88,7 +88,7 @@ def test_the_streams_dags_read_the_config_through_the_checkout(tmp_path: Path, m
     assert (stand.rivet_dir / "configs" / "mysql_cdc_sync" / "repo").is_symlink()
     dag = (Path(sources.__file__).parent / "stand" / "dags" / "rivet_gate.py").read_text()
     block = dag[dag.index("cdc_config = shape.get") : dag.index("# A second CDC config")]
-    assert block.count("config=cdc_config") == 2, "the stream's DAG and the hot DAG read one config path"
+    assert block.count("config=cdc_config") == 3, "the stream's, the hot and the second overlapping DAG read one config path"
 
 
 def test_the_stale_copy_carries_the_name_the_previous_provider_gave_it() -> None:

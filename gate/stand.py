@@ -28,6 +28,12 @@ HOST_DISK = "/opt/rivet-host"
 HOST_DIRS = ("batch", "cdc", "sqlite", "local", "chain")
 #: The Celery app every Airflow worker runs (the provider's; the official healthcheck names the same).
 CELERY_APP = "airflow.providers.celery.executors.celery_executor.app"
+#: Where the source legs keep rivet's state: `gate` (the gate's own TLS PostgreSQL, `gate-state`) or `compose-postgres`
+#: (the client's: a database of its own, owned by a role of its own, on the compose file's `postgres` server, beside
+#: Airflow's metadata database `airflow`).
+STATE_PLACES = ("gate", "compose-postgres")
+COMPOSE_STATE_ROLE = "rivet_state"
+METASTORE_DB = "airflow"
 #: The queues of the multi-host leg; each task of its DAGs names one, and the gate moves a queue between the workers.
 GATE_QUEUES = ("gate_a", "gate_b", "gate_cdc")
 
@@ -50,6 +56,7 @@ class StandSecrets:
     mongodb_root: str
     oracle: str
     minio: str
+    compose_state: str
     fernet: str
 
     @classmethod
@@ -204,8 +211,16 @@ class Stand:
         sources: tuple[Any, ...] = (),
         workers: int = 1,
         destinations: tuple[Any, ...] = (),
+        state_place: str = "gate",
+        migrate_from: Path | None = None,
     ) -> None:
         self.flavor = FLAVORS[version]
+        if state_place not in STATE_PLACES:
+            raise ValueError(f"state place {state_place!r}: one of {STATE_PLACES}")
+        #: Where the source legs' configs keep rivet's state (`STATE_PLACES`).
+        self.state_place = state_place
+        #: rivet 0.32.1 for the migration leg (gate/migrate.py), mounted at /opt/rivet/bin/rivet-0.32.1.
+        self.migrate_from = migrate_from
         #: 1: one Celery worker on the shared volume; 2: the multi-host leg, two workers with a disk each.
         self.workers = workers
         # The run tag keeps two gate runs of one Airflow version apart: each `down -v` and image build is its own.
@@ -255,17 +270,7 @@ class Stand:
             # A database of its own per config of a source leg: SQL Server's init names its CDC exports after their
             # tables, as the batch ones, and an export's state is keyed by its name and source (one state, one name).
             **{
-                state_conn_id(e.name, kind): {
-                    "conn_type": "postgres",
-                    "host": "gate-state",
-                    "port": 5432,
-                    "login": "rivet",
-                    "password": self.secrets.state,
-                    "schema": state_db(e.name, kind),
-                    "extra": {"rivet_params": "sslmode=require"},
-                }
-                for e in self.sources
-                for kind in e.kinds
+                state_conn_id(e.name, kind): self.leg_state_conn(state_db(e.name, kind)) for e in self.sources for kind in e.kinds
             },
             **(
                 {
@@ -297,8 +302,30 @@ class Stand:
                 for d in self.destinations
                 for kind in d.configs
             },
+            **self.migration_connections(),
             **self.extra_connections,
         }
+
+    def migration_connections(self) -> dict[str, dict[str, Any]]:
+        """The migration leg's (gate/migrate.py): its MySQL database and its PostgreSQL state, where `state_place` says."""
+        mysql = [e for e in self.sources if e.name == "mysql"]
+        if not mysql:
+            return {}
+        # The config init writes beside a database of the same table names (sources.SourceLeg.unqualified_phase).
+        unq = {state_conn_id("mysql", "unq"): self.leg_state_conn(state_db("mysql", "unq"))}
+        if not self.migrate_from:
+            return unq
+        return unq | {
+            "rivet_gate_mysql_mig": {**mysql[0].connection(self.secrets), "schema": "rivet_mig"},
+            state_conn_id("mysql", "mig"): self.leg_state_conn(state_db("mysql", "mig")),
+            state_conn_id("mysql", "migb"): self.leg_state_conn(state_db("mysql", "migb")),
+        }
+
+    def leg_state_sql(self, db: str, sql: str) -> str:
+        """Read a source leg config's state database (the gate's state server, or the compose `postgres` as its owner)."""
+        if self.state_place == "compose-postgres":
+            return self.metastore_sql(db, sql)
+        return self.psql("gate-state", db, sql)
 
     @property
     def hosts(self) -> tuple[str, ...]:
@@ -376,6 +403,11 @@ class Stand:
             for sub in HOST_DIRS:
                 (self.host_disk(host) / sub).mkdir(parents=True)
         shutil.copy2(HERE / "stand" / "dags" / "rivet_gate.py", self.dir / "dags" / "rivet_gate.py")
+        if self.migrate_from:
+            # The previous release the migration leg starts on, in the mount every container has (/opt/rivet/bin).
+            (self.rivet_dir / "bin").mkdir(parents=True, exist_ok=True)
+            shutil.copy2(self.migrate_from, self.rivet_dir / "bin" / "rivet-0.32.1")
+            (self.rivet_dir / "bin" / "rivet-0.32.1").chmod(0o755)
         services = "\n".join(
             f"  {s}:\n    <<: *rivet"
             + (
@@ -465,6 +497,56 @@ class Stand:
     def state_url(self, db: str = "rivet_state") -> str:
         """A PostgreSQL state of the stack as `rivet init` reads it inside the stack's network (the Connection of `db`)."""
         return f"postgresql://rivet:{self.secrets.state}@gate-state:5432/{db}?sslmode=require"
+
+    def leg_state_conn(self, db: str) -> dict[str, Any]:
+        """The Connection of a source leg config's state database, where `state_place` puts it."""
+        if self.state_place == "compose-postgres":
+            return {
+                "conn_type": "postgres",
+                "host": "postgres",
+                "port": 5432,
+                "login": COMPOSE_STATE_ROLE,
+                "password": self.secrets.compose_state,
+                "schema": db,
+                # The compose `postgres` has no TLS: rivet refuses a remote state URL without an `sslmode`
+                # (RIVET_STATE_URL_TLS_REQUIRED), so plaintext on the compose network is said, not assumed.
+                "extra": {"rivet_params": "sslmode=disable"},
+            }
+        return {
+            "conn_type": "postgres",
+            "host": "gate-state",
+            "port": 5432,
+            "login": "rivet",
+            "password": self.secrets.state,
+            "schema": db,
+            "extra": {"rivet_params": "sslmode=require"},
+        }
+
+    def leg_state_url(self, db: str) -> str:
+        """A source leg config's state as `rivet init` reads it inside the stack's network (its Connection's URL)."""
+        if self.state_place == "compose-postgres":
+            return f"postgresql://{COMPOSE_STATE_ROLE}:{self.secrets.compose_state}@postgres:5432/{db}?sslmode=disable"
+        return self.state_url(db)
+
+    def make_leg_state_db(self, db: str) -> None:
+        """Create a source leg config's state database: on `gate-state`, or on the compose `postgres` server owned by the
+        role `rivet_state` (made once, LOGIN, its own password; the statement goes in on stdin, never on an argv)."""
+        if self.state_place != "compose-postgres":
+            self.psql("gate-state", "rivet_state", f"CREATE DATABASE {db};")
+            return
+        role, password = COMPOSE_STATE_ROLE, self.secrets.compose_state
+        self.metastore_sql(
+            METASTORE_DB,
+            f"DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{role}') THEN "
+            f"CREATE ROLE {role} LOGIN PASSWORD '{password}'; END IF; END $$;",
+        )
+        self.metastore_sql(METASTORE_DB, f"CREATE DATABASE {db} OWNER {role};")
+
+    def metastore_sql(self, db: str, sql: str) -> str:
+        """SQL on the compose file's `postgres` server as its superuser `airflow` (setup and the placement oracle)."""
+        return self.compose(
+            "exec", "-T", "postgres", "psql", "-v", "ON_ERROR_STOP=1", "-At", "-U", "airflow", "-d", db, input=sql
+        ).stdout
 
     def psql(self, service: str, db: str, sql: str) -> str:
         """Run SQL through psql inside a database container; the unaligned result."""

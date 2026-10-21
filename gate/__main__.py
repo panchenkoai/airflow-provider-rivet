@@ -18,7 +18,7 @@ import time
 from pathlib import Path
 
 from . import conns as proofs
-from . import destinations, multihost, sources
+from . import destinations, migrate, multihost, sources
 from .scenario import TABLES, Verdicts, play
 from .stand import FLAVORS, Stand
 from .warehouse import (
@@ -53,6 +53,19 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         help=f"comma-separated destination legs ({','.join(destinations.DESTINATIONS)}): MinIO in the stack, the configs "
         "`rivet init --s3-bucket` writes, extract-only and loaded into the stack's ClickHouse",
+    )
+    ap.add_argument(
+        "--state",
+        choices=["gate", "compose-postgres"],
+        default="gate",
+        help="where the source legs keep rivet's state: the gate's own TLS PostgreSQL, or (the client's) a database and a "
+        "role of its own on the compose file's `postgres` server, beside Airflow's metadata database",
+    )
+    ap.add_argument(
+        "--migrate-from",
+        type=Path,
+        help="rivet 0.32.1 (Linux): the migration leg, a MySQL CDC stream on SQLite state under it, carried to PostgreSQL "
+        "state with this --rivet-bin's `rivet state copy` (needs --sources with mysql)",
     )
     ap.add_argument(
         "--workers",
@@ -112,6 +125,10 @@ def main(argv: list[str] | None = None) -> int:
     engines = tuple(e for e in args.sources.split(",") if e)
     if set(engines) - set(sources.ENGINES):
         ap.error(f"unknown source(s) {sorted(set(engines) - set(sources.ENGINES))}; known: {list(sources.ENGINES)}")
+    if args.migrate_from and "mysql" not in engines:
+        ap.error("--migrate-from runs beside the MySQL source leg: pass --sources with mysql")
+    if args.state != "gate" and not engines:
+        ap.error("--state compose-postgres places the source legs' state: pass --sources")
     if engines and "bigquery" not in warehouses:
         ap.error("--sources loads into BigQuery: pass --warehouses with bigquery")
     dests = tuple(d for d in args.destinations.split(",") if d)
@@ -165,10 +182,13 @@ def main(argv: list[str] | None = None) -> int:
             sources=sources.engines(engines),
             destinations=tuple(destinations.legs(dests)),
             workers=args.workers,
+            state_place=args.state,
+            migrate_from=args.migrate_from.resolve() if args.migrate_from else None,
         )
         leg = Leg(cloud, version, TABLES, warehouses) if cloud and warehouses else None
         hosts = multihost.MultiHost(stand, Verdicts(version), cloud) if cloud and args.workers > 1 else None
         src_legs = sources.legs(cloud, version, engines)
+        mig_legs = migrate.legs(src_legs, args.migrate_from)
         dest_legs = list(stand.destinations)
         verdicts = hosts.v if hosts else Verdicts(version)
         try:
@@ -184,7 +204,7 @@ def main(argv: list[str] | None = None) -> int:
                 if hosts:
                     verdicts.guard("multihost", hosts.play)
                 else:
-                    verdicts.guard("scenario", play, stand, verdicts, args.sabotage, leg, src_legs, dest_legs)
+                    verdicts.guard("scenario", play, stand, verdicts, args.sabotage, leg, src_legs, dest_legs, mig_legs)
                 verdicts.guard("proofs", proofs.prove, stand, verdicts, cloud if warehouses else None)
         finally:
             if not args.keep:
@@ -195,6 +215,8 @@ def main(argv: list[str] | None = None) -> int:
                     verdicts.guard("cloud-cleanup/multihost", hosts.cleanup)
                 for src in src_legs:
                     verdicts.guard(f"cloud-cleanup/{src.engine.name}", src.cleanup)
+                for mig in mig_legs:
+                    verdicts.guard("cloud-cleanup/migrate", mig.cleanup)
                 if gsm:
                     verdicts.guard("gsm-cleanup", delete_connections, cloud, version)
         rows += verdicts.rows
