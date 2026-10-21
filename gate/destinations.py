@@ -9,7 +9,8 @@ not exist is a coded refusal Airflow does not retry.
 
 init writes one fixed replication slot per schema (`rivet_public_cdc`) and `cleanup_source: true` in every `load:`
 block (the staged parts are deleted once loaded), so the extract-only half (its Parquet stays to be read) and the load
-half run against two postgres servers: `gate-source` and `gate-source-s3`, which play the same scenario.
+half run against two postgres servers: `gate-source` and `gate-source-s3`, which play the same scenario. After the
+cycles, one more config grades what `cleanup_source` deletes and keeps (gate/cleanup.py).
 """
 
 from __future__ import annotations

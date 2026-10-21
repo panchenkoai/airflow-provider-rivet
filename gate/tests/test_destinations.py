@@ -30,7 +30,7 @@ TABLES = list(destinations.TABLES)
 # --- init's configs ---------------------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("kind", ["batch", "cdc", "ch_batch", "ch_cdc"])
+@pytest.mark.parametrize("kind", ["batch", "cdc", "ch_batch", "ch_cdc", "cleanup"])
 def test_the_configs_init_writes_have_the_shape_the_leg_runs(kind: str) -> None:
     text = (FIXTURES / f"init_s3_{kind}_0.32.1.yaml").read_text()
     shape = read_config(text, TABLES)
@@ -45,6 +45,8 @@ def test_the_configs_init_writes_have_the_shape_the_leg_runs(kind: str) -> None:
     if CONFIGS[kind].clickhouse_db:
         assert load["target"] == "clickhouse" and load["database"] == CONFIGS[kind].clickhouse_db
         assert load["password_env"] == "CLICKHOUSE_PASSWORD"
+        # The cleanup cells (gate/cleanup.py) grade the default init writes, not one the gate sets.
+        assert load["cleanup_source"] is True
     else:
         assert load is None
 
