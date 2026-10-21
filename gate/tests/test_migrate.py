@@ -109,7 +109,9 @@ def test_the_old_binary_and_the_connections_reach_the_stack(tmp_path: Path) -> N
     # Mutant: the migration database's Connection on the leg's own database.
     assert conns["rivet_gate_mysql_mig"]["schema"] == "rivet_mig" and conns["rivet_gate_mysql"]["schema"] == "rivet"
     assert conns["rivet_gate_state_mysql_mig"]["host"] == "postgres"
-    assert Stand("3.3.2", Path("/bin/true"), tmp_path / "x", sources=(MYSQL,)).migration_connections() == {}
+    assert list(Stand("3.3.2", Path("/bin/true"), tmp_path / "x", sources=(MYSQL,)).migration_connections()) == [
+        "rivet_gate_state_mysql_unq"
+    ], "without --migrate-from, only the state of the config beside the same-named database"
     stand.lay_out()
     copied = stand.rivet_dir / "bin" / "rivet-0.32.1"
     assert copied.read_text() == "#!/bin/sh\n" and copied.stat().st_mode & 0o111

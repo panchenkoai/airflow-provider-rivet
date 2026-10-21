@@ -294,3 +294,19 @@ if os.path.exists(f"{ROOT}/configs/mysql_migrate.json"):
             operator_kwargs={**kwargs, "connections": ["gate_gcp"]},
             tags=["rivet", "gate", "migrate"],
         )
+
+
+# The config `rivet init` writes beside a database of the same table names (sources.py `unqualified_phase`), made after
+# everything else; its DAG appears once the gate writes the shape.
+if os.path.exists(f"{ROOT}/configs/mysql_unq.json"):
+    with open(f"{ROOT}/configs/mysql_unq.json") as handle:
+        unq = json.load(handle)
+    globals()[unq["dag"]] = build_cdc_dag(
+        unq["dag"],
+        config=unq["config"],
+        export=unq["stream"]["name"],
+        tables=unq["stream"]["tables"],
+        state_dir=unq["state_dir"],
+        operator_kwargs=leg_kwargs("mysql", "unq"),
+        tags=["rivet", "gate", "source", "mysql"],
+    )

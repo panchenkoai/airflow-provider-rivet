@@ -231,7 +231,12 @@ folder and the DAG reads the file copied unchanged). `gate_mig_mysql_sqlite` (0.
 moved exactly the changes made since the run before (fewer is a gap, more a duplicate), BigQuery equals the source value
 by value with the deletes applied, the PostgreSQL state holds the SQLite state's rows (per table) and cursors, and the
 checkpoint file is byte for byte what 0.32.1 left, through the copy and the switch. The way back (`gate_mig_mysql_back`:
-this binary on the SQLite file the copy left) is measured, not graded (`MEASURE migrate/mysql/cdc/way-back`). Every
+this binary on the SQLite file the copy left) is measured, not graded (`MEASURE migrate/mysql/cdc/way-back`). The migration
+database's tables are `mig_customers` / `mig_orders`: rivet refuses an unqualified CDC table another database of the
+server also holds. Last of all, `unqualified/mysql/cdc/same-names-in-another-db` makes that case on purpose: a database
+`rivet_dup` with the scenario's table names, then init's CDC config over `rivet` (its own bucket, dataset and state),
+used as written, run once. It must run (init named `<db>.<table>`: BigQuery equals the source) or be refused by code at
+exit 5 on Airflow's first try; it is a known red (`KNOWN`, panchenkoai/rivet#675: the run stops at exit 1). Every
 command a client runs is printed as a `COMMAND` line.
 
 `--sources mongodb` and `--sources oracle` (together: `--sources mongodb,oracle`) are the same leg where rivet can run

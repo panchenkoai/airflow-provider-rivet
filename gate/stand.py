@@ -309,9 +309,13 @@ class Stand:
     def migration_connections(self) -> dict[str, dict[str, Any]]:
         """The migration leg's (gate/migrate.py): its MySQL database and its PostgreSQL state, where `state_place` says."""
         mysql = [e for e in self.sources if e.name == "mysql"]
-        if not self.migrate_from or not mysql:
+        if not mysql:
             return {}
-        return {
+        # The config init writes beside a database of the same table names (sources.SourceLeg.unqualified_phase).
+        unq = {state_conn_id("mysql", "unq"): self.leg_state_conn(state_db("mysql", "unq"))}
+        if not self.migrate_from:
+            return unq
+        return unq | {
             "rivet_gate_mysql_mig": {**mysql[0].connection(self.secrets), "schema": "rivet_mig"},
             state_conn_id("mysql", "mig"): self.leg_state_conn(state_db("mysql", "mig")),
         }

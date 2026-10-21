@@ -81,6 +81,9 @@ RIVET_TASKS = {f"gate_batch_{s}": [f"apply.{s}_{short}" for short, _ in TABLES.v
 #: so the entry is removed when the fix lands.
 KNOWN = {
     "initial/mysql/cdc/staged-parts-cleaned": "panchenkoai/rivet#671 (cleanup_source skips the CDC baseline, 0.32.3)",
+    "unqualified/mysql/cdc/same-names-in-another-db": (
+        "panchenkoai/rivet#675 (init writes unqualified CDC tables its own run refuses, at exit 1 not 5), 0.32.3"
+    ),
 }
 
 
@@ -388,6 +391,9 @@ def play(
             src.git_sync_phase(stand, v, wait_runs)
     for mig in mig_legs:
         mig.play(stand, v, wait_runs)
+    for src in src_legs:
+        if src.engine.duplicate_db:
+            src.unqualified_phase(stand, v, wait_runs)
     for dest in dest_legs:
         dest.missing_bucket_probe(stand, v, wait_runs)
         dest.cleanup_probe(stand, v, wait_runs)

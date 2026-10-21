@@ -127,6 +127,9 @@ class Engine:
     git_sync: tuple[str, dict[str, dict[str, int]]] | None = None
     #: After the worker container is recreated: these changes (with their events) must reach the stream intact.
     recreate: tuple[str, dict[str, dict[str, int]]] | None = None
+    #: A database of the same server holding the scenario's table names, made last: init's CDC config over the leg's
+    #: database must run (it names `<db>.<table>`) or be refused by code at exit 5 (panchenkoai/rivet#675).
+    duplicate_db: str = ""
     #: Two overlapping runs of the stream (one held inside rivet, one started beside it): these changes, once.
     overlap: tuple[str, dict[str, dict[str, int]]] | None = None
 
@@ -230,6 +233,7 @@ DELETE FROM gate_orders WHERE id = 100;
     ),
     shared=("UPDATE gate_customers SET tier = 'gold' WHERE id <= 3;", {"gate_customers": {"update": 3}, "gate_orders": {}}),
     git_sync=("UPDATE gate_customers SET tier = 'synced' WHERE id BETWEEN 4 AND 6;", {"gate_customers": {"update": 3}}),
+    duplicate_db="rivet_dup",
     overlap=(
         "UPDATE gate_customers SET tier = 'overlap' WHERE id IN (12, 13);\nDELETE FROM gate_orders WHERE id = 103;",
         {"gate_customers": {"update": 2}, "gate_orders": {"delete": 1}},
@@ -545,6 +549,9 @@ class SourceLeg:
         # inside the batch export's `exports/<table>/`, which `rivet load` lists recursively as its own runs.
         self.buckets = {k: f"rivet-afgate-{tag}-{engine.name}-{k}" for k in ("batch", "cdc")}
         self.datasets = {k: f"{cloud.dataset(stack)}_{engine.name}_{k}" for k in ("batch", "cdc")}
+        #: The bucket and dataset of the config made beside a database of the same table names (made only then).
+        self.unq_bucket = f"rivet-afgate-{tag}-{engine.name}unq-cdc"
+        self.unq_dataset = f"{cloud.dataset(stack)}_{engine.name}unq_cdc"
         self.dags: list[str] = []  # the DAGs init's configs make (one CDC DAG per stream), known after `prepare`
         self.shape: dict[str, dict[str, Any]] = {}
         self.tasks: dict[str, list[str]] = {}
@@ -754,9 +761,9 @@ class SourceLeg:
     def cleanup(self) -> None:
         """Remove both buckets and both datasets, then look again: anything left raises."""
         self._bq = None
-        for bucket in self.buckets.values():
+        for bucket in [*self.buckets.values(), self.unq_bucket]:
             sh(["gcloud", "storage", "rm", "-r", "--quiet", f"gs://{bucket}"], timeout=600, check=False)
-        for ds in self.datasets.values():
+        for ds in [*self.datasets.values(), self.unq_dataset]:
             warehouse._bq("rm", "-r", "-f", "--dataset", f"{self.cloud.project}:{ds}", check=False)
         left = self.leftovers()
         if left:
@@ -764,13 +771,13 @@ class SourceLeg:
 
     def leftovers(self) -> list[str]:
         left = []
-        for ds in self.datasets.values():
+        for ds in [*self.datasets.values(), self.unq_dataset]:
             shown = sh(["bq", "--quiet", "--headless", "show", "--format=json", f"{self.cloud.project}:{ds}"], check=False)
             if shown.returncode == 0:
                 left.append(f"bq:{ds}")
             elif "Not found" not in (shown.stdout + shown.stderr):
                 raise RuntimeError(f"cannot tell whether {ds} is gone: {(shown.stderr or shown.stdout).strip()[-500:]}")
-        for bucket in self.buckets.values():
+        for bucket in [*self.buckets.values(), self.unq_bucket]:
             listed = sh(["gcloud", "storage", "buckets", "describe", f"gs://{bucket}"], timeout=300, check=False)
             if listed.returncode == 0:
                 left.append(f"gcs:{bucket}")
@@ -1073,6 +1080,79 @@ class SourceLeg:
             tables[db] = _rows(stand.metastore_sql(db, USER_TABLES))
         return owners, tables, _rows(stand.metastore_sql(METASTORE_DB, USER_TABLES)), COMPOSE_STATE_ROLE
 
+    def unqualified_phase(self, stand: Any, v: Any, wait_runs: Callable[..., dict[str, str]]) -> None:
+        """Last of all (it would stop the leg's own stream): another database of the server holds the scenario's table
+        names, and init writes a CDC config over the leg's database, used as written, run once by Airflow. It must run
+        (init named `<db>.<table>`; then BigQuery equals the leg's source) or be refused by code at exit 5, never retried
+        (panchenkoai/rivet#675: init writes the bare names and the run stops at exit 1)."""
+        assert self.engine.duplicate_db and self.engine.hot is not None
+        eng, dup, hot = self.engine.name, self.engine.duplicate_db, self.engine.hot
+        cell = f"unqualified/{eng}/cdc/same-names-in-another-db"
+        self.sql(stand, f"CREATE DATABASE {dup};\nGRANT ALL ON {dup}.* TO 'rivet'@'%';\nUSE {dup};\n{self.engine.seed}")
+        sh(["gcloud", "storage", "buckets", "create", f"gs://{self.unq_bucket}", f"--project={self.cloud.project}",
+            f"--location={self.cloud.location}", "--uniform-bucket-level-access"], timeout=300)  # fmt: skip
+        warehouse._bq(f"--location={self.cloud.location}", "mk", "-f", "--dataset", f"{self.cloud.project}:{self.unq_dataset}")
+        stand.make_leg_state_db(state_db(eng, "unq"))
+        (stand.rivet_dir / "configs" / f"{eng}_unq").mkdir(parents=True, exist_ok=True)
+        (stand.rivet_dir / "state" / f"{eng}_unq").mkdir(parents=True, exist_ok=True)
+        out = f"/opt/rivet/configs/{eng}_unq/{eng}_unq.yaml"
+        argv = init_argv("cdc", self.engine, self.unq_bucket, self.cloud.project, self.unq_dataset, out)
+        done = stand.compose(
+            "exec", "-T", "-e", self.engine.url_env, "-e", "RIVET_STATE_URL", "airflow-worker", *argv, check=False,
+            extra_env={self.engine.url_env: self.engine.url(stand.secrets), "RIVET_STATE_URL": stand.leg_state_url(state_db(eng, "unq"))},
+        )  # fmt: skip
+        said = ((done.stdout or "") + (done.stderr or "")).strip()
+        written = stand.rivet_dir / "configs" / f"{eng}_unq" / f"{eng}_unq.yaml"
+        text = written.read_text() if written.exists() else None
+        print(f"INIT {eng} cdc beside {dup}: {' '.join(argv)} -> exit {done.returncode}\n{said}\n{text or ''}", flush=True)
+        if done.returncode != 0 or text is None:
+            v.check(cell, unqualified_problems, done.returncode, said, None, [], None, [], ok="init refused by code, exit 5")
+            return
+        streams = read_config(text, list(self.engine.tables))["streams"]
+        if len(streams) != 1:
+            v.grade(cell, [f"init wrote streams {streams}, expected one over {list(self.engine.tables)}"])
+            return
+        dag = f"gate_src_{eng}_cdc_unq"
+        shape = {"dag": dag, "config": out, "stream": streams[0], "state_dir": f"/opt/rivet/state/{eng}_unq"}
+        (stand.rivet_dir / "configs" / f"{eng}_unq.json").write_text(json.dumps(shape))
+        stand.wait_dags([dag])
+        run_id = f"gate_{eng}_unq"
+        stand.trigger(dag, run_id)
+        state = wait_runs(stand, [dag], run_id, timeout=900).get(dag)
+        tries = v.guard(cell + "/tries", stand.tries, dag, run_id, "run") or []
+        payload = None
+        try:
+            payload = stand.xcom(dag, run_id, "run")
+        except Exception as exc:  # no XCom: the cell says so through the payload it lacks
+            print(f"UNQUALIFIED no XCom: {exc}", flush=True)
+        print(f"UNQUALIFIED run {state}, tries {[t.get('state') for t in tries]}, {json.dumps(payload, default=str)}", flush=True)
+        warehouse_problems: list[str] = []
+        if state == "success":
+            source = self.source_rows(stand, {hot.table: [hot.column]})
+            cols = {t: [*c, *([hot.column] if t == hot.table else [])] for t, c in self.engine.tables.items()}
+            client = self._client()
+            got = {
+                t: [
+                    dict(r.items())
+                    for r in client.query(
+                        f"SELECT * FROM `{self.cloud.project}.{self.unq_dataset}.{warehouse_table(t)}`"
+                    ).result()
+                ]
+                for t in self.engine.tables
+            }
+            warehouse_problems = stream_equals_source(got, source, cols, self.engine.key)
+        v.check(
+            cell,
+            unqualified_problems,
+            0,
+            said,
+            state,
+            tries,
+            payload,
+            warehouse_problems,
+            ok="the stream ran or was refused at exit 5",
+        )
+
     def overlap_phase(self, stand: Any, v: Any, wait_runs: Callable[..., dict[str, str]]) -> None:
         """Two runs of the stream at once: the hot DAG's run, held inside rivet after it opened (its pause), and a run of
         the second DAG started beside it (`lock_wait` 30 s, one retry after 60 s). One goes through, the other ends its
@@ -1228,6 +1308,35 @@ def git_sync_layout(root: Path, text: str, name: str = "rivet.yaml") -> str:
     (root / "rev-A" / name).write_text(text)
     (root / "repo").symlink_to("rev-A")
     return f"/opt/rivet/{root.relative_to(root.parents[1])}/repo/{name}"
+
+
+def unqualified_problems(
+    init_exit: int,
+    init_said: str,
+    state: str | None,
+    tries: list[dict[str, Any]],
+    payload: dict[str, Any] | None,
+    warehouse_problems: list[str],
+) -> list[str]:
+    """What rivet 0.32.3 should do with init's CDC config beside a database of the same table names: init refuses it by
+    code at exit 5, or the stream runs and lands the leg's rows, or its run is refused by code at exit 5 on Airflow's
+    first try (a refusal is never retried)."""
+    if init_exit != 0:
+        code = re.search(r"\[(RIVET_[A-Z0-9_]+)\]", init_said)
+        return (
+            [] if init_exit == REFUSED_EXIT and code else [f"init exited {init_exit} {code.group(1) if code else 'with no code'}"]
+        )
+    if state == "success":
+        return warehouse_problems
+    error = (payload or {}).get("error") or {}
+    problems = []
+    if not error.get("code") or (payload or {}).get("exit_status") != REFUSED_EXIT:
+        problems.append(
+            f"the run stopped [{error.get('code')}] exit {(payload or {}).get('exit_status')}, not a refusal at exit {REFUSED_EXIT}"
+        )
+    if len(tries) != 1:
+        problems.append(f"the run's `run` was tried {len(tries)} time(s): a refusal is never retried")
+    return problems
 
 
 #: The second overlapping run's wait for the provider's export lock: shorter than the held run's pause.

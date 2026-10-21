@@ -145,3 +145,38 @@ def test_a_try_log_is_read_by_its_number(tmp_path: Path) -> None:
     assert sources.task_log(stand, "d", "r", "run", attempt=1) == "first"
     assert sources.task_log(stand, "d", "r", "run") == "second"
     assert sources.task_log(stand, "d", "r", "run", attempt=3) is None
+
+
+# --- init's CDC config beside a database of the same table names (panchenkoai/rivet#675) --------------------------------
+
+
+def test_the_unqualified_config_must_run_or_be_refused_at_exit_5() -> None:
+    from test_conns import CLOUD
+
+    from gate.scenario import KNOWN
+    from gate.sources import BUCKET_SHAPE, SourceLeg, unqualified_problems
+    from gate.warehouse import DATASET_SHAPE
+
+    refused = {"error": {"code": "RIVET_SOURCE_CDC_TABLE_UNRESOLVED"}, "exit_status": 5}
+    one = [{"state": "failed"}]
+    assert unqualified_problems(0, "", "failed", one, refused, []) == []
+    # Today (#675): the same code at exit 1. Mutant: the exit not compared (the cell would pass today).
+    assert unqualified_problems(0, "", "failed", one, {**refused, "exit_status": 1}, []) == [
+        "the run stopped [RIVET_SOURCE_CDC_TABLE_UNRESOLVED] exit 1, not a refusal at exit 5"
+    ]
+    # Mutant: the tries not counted (a refusal Airflow retried passes).
+    assert unqualified_problems(0, "", "failed", one * 3, refused, []) == [
+        "the run's `run` was tried 3 time(s): a refusal is never retried"
+    ]
+    # The other way 0.32.3 may go: init names `<db>.<table>` and the stream runs; then BigQuery is graded.
+    assert unqualified_problems(0, "", "success", one, None, []) == []
+    assert unqualified_problems(0, "", "success", one, None, ["gate_orders: 1 missing row(s)"]) == [
+        "gate_orders: 1 missing row(s)"
+    ]
+    # Or init refuses it, by code at exit 5. Mutant: any init failure accepted.
+    assert unqualified_problems(5, "Error: [RIVET_INIT_X] ...", None, [], None, []) == []
+    assert unqualified_problems(1, "Error: boom", None, [], None, []) == ["init exited 1 with no code"]
+    assert unqualified_problems(1, "Error: [RIVET_INIT_X] ...", None, [], None, []) == ["init exited 1 RIVET_INIT_X"]
+    assert "panchenkoai/rivet#675" in KNOWN["unqualified/mysql/cdc/same-names-in-another-db"]
+    leg = SourceLeg(CLOUD, "3.3.2", MYSQL)
+    assert BUCKET_SHAPE.fullmatch(leg.unq_bucket) and DATASET_SHAPE.fullmatch(leg.unq_dataset), "the sweep drops them"
