@@ -205,6 +205,15 @@ exactly the keys the cycle deleted left over, CDC without the rows flagged `__is
 bucket that is never made: its DAG (`gate_s3_missing`) runs once after the cycles and must stop on
 `RIVET_DEST_CONTAINER_NOT_FOUND` within 120 s with exit 1 (rivet declares the code an `environment` error: 2 only
 when transient), on Airflow's first try (`s3/missing-bucket/coded-final-stop`).
+One more config (init's `--mode incremental` with ClickHouse, over a database of its own, `cleanup_source: true` as
+init writes it) grades rivet's three promises about deleting staged Parquet (`gate/cleanup.py`, cells `cleanup/...`),
+with the bucket listed by `mc`, the ledger read with psql and ClickHouse compared with the source: a load narrowed
+to one export cleans that export's prefix and keeps the other's unloaded runs, which the other's own load later takes
+(`unloaded-runs-survive`); a load whose ClickHouse table refuses every row (a CHECK constraint) fails with a code and
+deletes nothing, and once mended the next load delivers every row and cleans (`failed-load-deletes-nothing`); while
+an extract is held `running` after its snapshot opened (`RIVET_TEST_PAUSE_AT=pg_after_snapshot_open`), a load of
+its export succeeds and deletes nothing, a load of the other export beside it cleans, and after the run ends the next
+load cleans (`live-run-blocks`).
 Everything lives in the stack and goes with its `down -v`.
 
 There is no Azure leg: rivet 0.32's `init` has no Azure destination flag (only `--gcs-bucket` and `--s3-bucket`), and

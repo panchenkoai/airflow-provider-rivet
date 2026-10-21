@@ -4,8 +4,11 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import datetime
 
+from airflow_provider_rivet._compat import DAG
 from airflow_provider_rivet.dags import build_batch_dag, build_cdc_dag
+from airflow_provider_rivet.operators import RivetLoadOperator
 
 ROOT = "/opt/rivet"
 SOURCE = {"RIVET_GATE_SOURCE_URL": "rivet_gate_source"}
@@ -138,6 +141,27 @@ if "s3" in os.environ.get("GATE_DESTINATIONS", "").split(",") and os.path.exists
         }
         dag_id = f"gate_s3_{kind}"
         tags = ["rivet", "gate", "destination", "s3"]
+        if cfg.get("cleanup"):
+            # `cleanup_source` (gate/cleanup.py): extract, extract with one apply held live, and load one export per
+            # DAG; nothing retries, so a failed load is the run's verdict.
+            c = cfg["cleanup"]
+            once = {"default_args": {"retries": 0}}
+            common = {"config": cfg["config"], "state_dir": cfg["state_dir"], "operator_kwargs": kwargs, "tags": tags}
+            globals()[c["extract"]] = build_batch_dag(c["extract"], exports=cfg["exports"], load=False, **common, **once)
+            held = build_batch_dag(c["paused"], exports=cfg["exports"], load=False, **common, **once)
+            held.get_task(f"apply.{c['pause']['export']}").env = {
+                "RIVET_TEST_PAUSE_AT": c["pause"]["at"],
+                "RIVET_TEST_PAUSE_MARKER": c["pause"]["marker"],
+            }
+            globals()[c["paused"]] = held
+            for export, load_id in c["loads"].items():
+                with DAG(
+                    dag_id=load_id, schedule=None, start_date=datetime(2026, 1, 1), catchup=False, max_active_runs=1,
+                    default_args={"retries": 0}, tags=tags,
+                ) as only_load:  # fmt: skip
+                    RivetLoadOperator(task_id="load", export=export, config=cfg["config"], state_dir=cfg["state_dir"], **kwargs)
+                globals()[load_id] = only_load
+            continue
         if cfg["streams"]:
             stream = cfg["streams"][0]
             globals()[dag_id] = build_cdc_dag(
