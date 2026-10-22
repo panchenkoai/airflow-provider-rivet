@@ -8,7 +8,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/panchenkoai/airflow-provider-rivet/blob/main/airflow_provider_rivet/__init__.py"><img src="https://img.shields.io/badge/version-0.1.0%20alpha-orange" alt="version"></a>
+  <a href="https://github.com/panchenkoai/airflow-provider-rivet/blob/main/airflow_provider_rivet/__init__.py"><img src="https://img.shields.io/badge/version-0.2.0%20alpha-orange" alt="version"></a>
   <a href="https://github.com/panchenkoai/airflow-provider-rivet/blob/main/pyproject.toml"><img src="https://img.shields.io/badge/python-3.12%20%7C%203.13%20%7C%203.14-blue" alt="python"></a>
   <a href="https://github.com/panchenkoai/airflow-provider-rivet/blob/main/pyproject.toml"><img src="https://img.shields.io/badge/airflow-2.10%2B%20%7C%203.x-017CEE" alt="airflow"></a>
   <a href="https://github.com/panchenkoai/airflow-provider-rivet/actions/workflows/ci.yml?query=branch%3Amain"><img src="https://github.com/panchenkoai/airflow-provider-rivet/actions/workflows/ci.yml/badge.svg?branch=main" alt="CI"></a>
@@ -41,7 +41,7 @@ rivet itself (sources, destinations, warehouses, CDC, configs): **<https://githu
   the task; nothing secret is in argv, XCom or the task log.
 
 Status: alpha. It is versioned independently of the binary and checks
-the binary's version at run time (minimum **rivet 0.32.1**; a lower one is refused with both
+the binary's version at run time (minimum **rivet 0.32.2**; a lower one is refused with both
 versions in the message). Supported: Airflow 2.10+ and 3.x, Python 3.12+ (Airflow 2.10 only on 3.12).
 
 ## Install
@@ -62,7 +62,7 @@ RUN pip install --no-cache-dir airflow-provider-rivet
 
 The operators run `rivet` from the worker's `PATH`, else the binary `rivet-cli` installed into
 Airflow's environment. To run another build, pass `rivet_bin="/abs/path/rivet"` (for example one
-copied from `ghcr.io/panchenkoai/rivet:v0.32.1`).
+copied from `ghcr.io/panchenkoai/rivet:v0.32.2`).
 
 ## Quickstart
 
