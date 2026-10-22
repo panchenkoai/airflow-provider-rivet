@@ -348,9 +348,10 @@ def play(
     src_legs: list[sources.SourceLeg] | None = None,
     dest_legs: list[destinations.S3Leg] | None = None,
     mig_legs: list[Any] | None = None,
+    readme_legs: list[Any] | None = None,
 ) -> None:
     """Seed, configure, and run the three cycles (then each destination leg's missing-bucket run, and the migration)."""
-    src_legs, dest_legs, mig_legs = src_legs or [], dest_legs or [], mig_legs or []
+    src_legs, dest_legs, mig_legs, readme_legs = src_legs or [], dest_legs or [], mig_legs or [], readme_legs or []
     stand.psql("gate-source", "rivet", SEED)
     write_configs(stand.rivet_dir)
     if leg:
@@ -361,6 +362,8 @@ def play(
         dest.prepare(stand, SEED)
     for mig in mig_legs:
         mig.prepare(stand)
+    for readme in readme_legs:
+        readme.prepare(stand)
     stand.wait_dags(
         [d for mig in mig_legs for d in mig.dags]
         + DAGS
@@ -388,6 +391,9 @@ def play(
             src.git_sync_phase(stand, v, wait_runs)
     for mig in mig_legs:
         mig.play(stand, v, wait_runs)
+    # Before the same-names phase: rivet 0.32.1 (the cron job) refuses unqualified tables another database holds.
+    for readme in readme_legs:
+        readme.play(stand, v, wait_runs)
     for src in src_legs:
         if src.engine.duplicate_db:
             src.unqualified_phase(stand, v, wait_runs)

@@ -16,7 +16,7 @@ from collections.abc import Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
-from .stand import ADC_IN_CONTAINER, sh
+from .stand import ADC_IN_CONTAINER, CLIENT_STATE_DB, GCP_KEY_IN_CONTAINER, sh
 from .warehouse import _secrets
 
 #: Extras of a google_cloud_platform Connection that carry or point at a credential.
@@ -77,6 +77,90 @@ def keyless(resolved: Mapping[str, Any] | None, container_envs: Mapping[str, Seq
     if adc_writable:
         problems.append("the mounted credential is writable from the worker")
     return problems
+
+
+def env_key_file(
+    resolved: Mapping[str, Any] | None,
+    container_envs: Mapping[str, Sequence[str] | None],
+    key_writable: bool,
+    tasks: Mapping[str, Mapping[str, Any]],
+) -> list[str]:
+    """Problems with the claim that rivet authenticated to GCP with the key file the compose env names, and nothing
+    else: no GCP Connection, GOOGLE_APPLICATION_CREDENTIALS=/etc/gcloud_cred.json in every worker, the file read-only,
+    and the stream's run and loads (GCS, BigQuery) went through."""
+    problems = []
+    if resolved is not None:
+        problems.append("a gate_gcp Connection resolves")
+    workers = {n: env for n, env in container_envs.items() if n.startswith("airflow-worker")}
+    if not workers:
+        problems.append("no worker container inspected")
+    for name, env in sorted(workers.items()):
+        if env is None or f"GOOGLE_APPLICATION_CREDENTIALS={GCP_KEY_IN_CONTAINER}" not in env:
+            problems.append(f"{name}: GOOGLE_APPLICATION_CREDENTIALS is not {GCP_KEY_IN_CONTAINER}")
+    carriers = sorted(n for n, env in container_envs.items() if env and any(e.startswith("AIRFLOW_CONN_GATE_GCP=") for e in env))
+    if carriers:
+        problems.append(f"AIRFLOW_CONN_GATE_GCP is set in {carriers}")
+    if key_writable:
+        problems.append("the key file is writable from the worker")
+    gcp = {t: i.get("state") for t, i in tasks.items() if t == "run" or t.startswith("load.")}
+    if not gcp or any(state != "success" for state in gcp.values()):
+        problems.append(f"the stream's run and loads did not all succeed: {gcp or 'none'}")
+    return problems
+
+
+def env_json_connection(
+    container_envs: Mapping[str, Sequence[str] | None],
+    resolved: Mapping[str, Any] | None,
+    stream_rows: int,
+    tasks: Mapping[str, Mapping[str, Any]],
+) -> list[str]:
+    """Problems with the claim that the client's `rivet_state` Connection, an AIRFLOW_CONN_* JSON variable, reached
+    rivet with `sslmode=disable`: in every worker's env (host rivet-state, rivet_params sslmode=disable), resolved by
+    Airflow, and the stream's state rows are in its database after a run that succeeded."""
+    problems = []
+    workers = {n: env for n, env in container_envs.items() if n.startswith("airflow-worker")}
+    if not workers:
+        problems.append("no worker container inspected")
+    for name, env in sorted(workers.items()):
+        value = next((e.split("=", 1)[1] for e in env or [] if e.startswith("AIRFLOW_CONN_RIVET_STATE=")), None)
+        if value is None:
+            problems.append(f"{name}: no AIRFLOW_CONN_RIVET_STATE")
+            continue
+        try:
+            conn = json.loads(value)
+        except json.JSONDecodeError:
+            problems.append(f"{name}: AIRFLOW_CONN_RIVET_STATE is not JSON")
+            continue
+        extra = conn.get("extra") or {}
+        if (
+            conn.get("host") != "rivet-state"
+            or (extra.get("rivet_params") if isinstance(extra, dict) else None) != "sslmode=disable"
+        ):
+            problems.append(
+                f"{name}: host {conn.get('host')!r}, rivet_params {extra.get('rivet_params') if isinstance(extra, dict) else extra!r}"
+            )
+    if resolved is None:
+        problems.append("`airflow connections get rivet_state` resolved nothing")
+    elif resolved.get("host") != "rivet-state" or "sslmode=disable" not in json.dumps(
+        resolved.get("extra_dejson") or resolved.get("extra") or {}
+    ):
+        problems.append(f"rivet_state resolved to host {resolved.get('host')!r} without sslmode=disable")
+    if stream_rows <= 0:
+        problems.append("no state row of the stream in the client's rivet_state database")
+    if (tasks.get("run") or {}).get("state") != "success":
+        problems.append(f"the stream's run {(tasks.get('run') or {}).get('state')}")
+    return problems
+
+
+def as_delivered(copied: Mapping[str, str], now: Mapping[str, str]) -> list[str]:
+    """The client's files the stack ran are byte for byte the ones copied from the delivery (sha256 by name)."""
+    if not copied:
+        return ["no client file copied"]
+    return [
+        f"{name}: {copied[name][:12]} copied, {now.get(name, 'missing')[:12]} at the end"
+        for name in sorted(copied)
+        if now.get(name) != copied[name]
+    ]
 
 
 def log_hygiene(texts: Mapping[str, str], word: str) -> list[str]:
@@ -144,6 +228,34 @@ def adc_writable(stand: Any, path: str) -> bool:
     return stand.compose("exec", "-T", "airflow-worker", "test", "-w", path, check=False).returncode == 0
 
 
+def stream_tasks(stand: Any) -> dict[str, dict[str, Any]]:
+    """The MySQL stream's task instances (its run and its loads read GCS and BigQuery): under `client-override` the
+    README's stream (gate/client.py), on the client's Connections; else the leg's first cycle."""
+    dag, run_id = (
+        ("gate_client_cron", "gate_client_cron_1")
+        if getattr(stand, "client_override", None)
+        else ("gate_src_mysql_cdc", "gate_1_initial")
+    )
+    try:
+        return stand.tasks(dag, run_id)
+    except Exception:  # no such run: the cells say "none"
+        return {}
+
+
+def stream_state_rows(stand: Any) -> int:
+    """How many rows of the client's state database hold the stream's progress (export_state and run_status)."""
+    text = stand.state_admin_sql(
+        CLIENT_STATE_DB, "SELECT (SELECT count(*) FROM export_state) + (SELECT count(*) FROM run_status);"
+    )
+    return int(text.strip() or 0)
+
+
+def client_file_hashes(stand: Any) -> dict[str, str]:
+    import hashlib
+
+    return {n: hashlib.sha256((Path(stand.dir) / n).read_bytes()).hexdigest() for n in stand.client_files}
+
+
 def task_logs(stand: Any) -> dict[str, str]:
     """Every task log file of the stack, by path relative to its logs folder."""
     root = Path(stand.dir) / "logs"
@@ -177,6 +289,33 @@ def prove(stand: Any, v: Any, cloud: Any | None) -> None:
                 ),
                 ok=cloud.secret(stand.flavor.version, conn_id),
             )
+    if cloud.gcp_auth == "env-file":
+        family = "client-override" if getattr(stand, "client_override", None) else "connections"
+        stream = stream_tasks(stand)
+        v.check(
+            f"{family}/gcp/env-key-file",
+            lambda: env_key_file(resolve(stand, "gate_gcp"), envs, adc_writable(stand, GCP_KEY_IN_CONTAINER), stream),
+            ok=f"GOOGLE_APPLICATION_CREDENTIALS={GCP_KEY_IN_CONTAINER} (read-only), no GCP Connection, run and loads ok",
+        )
+    if getattr(stand, "client_override", None):
+        # README step 5 builds a state URL from $RIVET_STATE_USER / _PASSWORD / _DB inside the worker: are they there?
+        names = ("RIVET_STATE_USER", "RIVET_STATE_PASSWORD", "RIVET_STATE_DB")
+        worker = next((env for n, env in envs.items() if n.startswith("airflow-worker") and env), [])
+        print(
+            f"MEASURE client-override/readme/step5-variables: {[(n, any(e.startswith(n + '=') for e in worker)) for n in names]}",
+            flush=True,
+        )
+        stream = stream_tasks(stand)
+        v.check(
+            "client-override/conn/env-json-connection",
+            lambda: env_json_connection(envs, resolve(stand, "rivet_state"), stream_state_rows(stand), stream),
+            ok="AIRFLOW_CONN_RIVET_STATE (JSON, host rivet-state, sslmode=disable) resolved; the stream's rows in rivet_state",
+        )
+        v.check(
+            "client-override/files/as-delivered",
+            lambda: as_delivered(stand.client_files, client_file_hashes(stand)),
+            ok=", ".join(f"{n} {h[:12]}" for n, h in sorted(stand.client_files.items())),
+        )
     if cloud.gcp_auth == "adc":
         v.check(
             "connections/gate_gcp/keyless",

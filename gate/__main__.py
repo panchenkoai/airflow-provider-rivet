@@ -17,8 +17,8 @@ import tempfile
 import time
 from pathlib import Path
 
+from . import client, destinations, migrate, multihost, sources
 from . import conns as proofs
-from . import destinations, migrate, multihost, sources
 from .scenario import TABLES, Verdicts, play
 from .stand import FLAVORS, Stand
 from .warehouse import (
@@ -62,6 +62,13 @@ def main(argv: list[str] | None = None) -> int:
         "role of its own on the compose file's `postgres` server, beside Airflow's metadata database",
     )
     ap.add_argument(
+        "--client-override",
+        type=Path,
+        help="the client's delivered compose files (docker-compose.rivet.yml, Dockerfile.rivet, env.rivet.example, "
+        "README.md): run them as delivered on top of the official file (--airflow 2.10.2, --sources mysql); implies "
+        "--gcp-auth env-file",
+    )
+    ap.add_argument(
         "--migrate-from",
         type=Path,
         help="rivet 0.32.1 (Linux): the migration leg, a MySQL CDC stream on SQLite state under it, carried to PostgreSQL "
@@ -93,10 +100,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument(
         "--gcp-auth",
-        choices=["key", "adc"],
+        choices=["key", "adc", "env-file"],
         default="key",
         help="key: gate_gcp carries the credential; adc: gate_gcp holds only `project`, and rivet runs as the "
-        "containers' identity (--gcp-keyfile mounted read-only where Google's default chain looks)",
+        "containers' identity (--gcp-keyfile mounted read-only where Google's default chain looks); env-file (the "
+        "client's): no GCP Connection, --gcp-keyfile mounted read-only at /etc/gcloud_cred.json and named by "
+        "GOOGLE_APPLICATION_CREDENTIALS, the DAGs pass it with cloud_credentials=['gcp']",
     )
     ap.add_argument(
         "--gsm-reader",
@@ -125,6 +134,13 @@ def main(argv: list[str] | None = None) -> int:
     engines = tuple(e for e in args.sources.split(",") if e)
     if set(engines) - set(sources.ENGINES):
         ap.error(f"unknown source(s) {sorted(set(engines) - set(sources.ENGINES))}; known: {list(sources.ENGINES)}")
+    if args.client_override:
+        if versions != ["2.10.2"] or "mysql" not in engines or not args.migrate_from:
+            ap.error(
+                "--client-override runs the client's stack and its README's migration from a rivet 0.32.1 cron job: "
+                "--airflow 2.10.2, --sources with mysql and --migrate-from"
+            )
+        args.gcp_auth = "env-file"  # the client's: GOOGLE_APPLICATION_CREDENTIALS, no GCP Connection
     if args.migrate_from and "mysql" not in engines:
         ap.error("--migrate-from runs beside the MySQL source leg: pass --sources with mysql")
     if args.state != "gate" and not engines:
@@ -179,6 +195,8 @@ def main(argv: list[str] | None = None) -> int:
             secrets_backend=cloud.secrets_backend(version) if gsm else None,
             # The secrets backend and a keyless gate_gcp both run as the containers' identity: this file, read-only.
             adc=cloud.keyfile.resolve() if cloud and (gsm or cloud.gcp_auth == "adc") else None,
+            gcp_key_file=cloud.keyfile.resolve() if cloud and cloud.gcp_auth == "env-file" else None,
+            client_override=args.client_override.resolve() if args.client_override else None,
             sources=sources.engines(engines),
             destinations=tuple(destinations.legs(dests)),
             workers=args.workers,
@@ -189,6 +207,7 @@ def main(argv: list[str] | None = None) -> int:
         hosts = multihost.MultiHost(stand, Verdicts(version), cloud) if cloud and args.workers > 1 else None
         src_legs = sources.legs(cloud, version, engines)
         mig_legs = migrate.legs(src_legs, args.migrate_from)
+        readme_legs = client.legs(src_legs, args.client_override)
         dest_legs = list(stand.destinations)
         verdicts = hosts.v if hosts else Verdicts(version)
         try:
@@ -204,7 +223,9 @@ def main(argv: list[str] | None = None) -> int:
                 if hosts:
                     verdicts.guard("multihost", hosts.play)
                 else:
-                    verdicts.guard("scenario", play, stand, verdicts, args.sabotage, leg, src_legs, dest_legs, mig_legs)
+                    verdicts.guard(
+                        "scenario", play, stand, verdicts, args.sabotage, leg, src_legs, dest_legs, mig_legs, readme_legs
+                    )
                 verdicts.guard("proofs", proofs.prove, stand, verdicts, cloud if warehouses else None)
         finally:
             if not args.keep:
@@ -217,6 +238,8 @@ def main(argv: list[str] | None = None) -> int:
                     verdicts.guard(f"cloud-cleanup/{src.engine.name}", src.cleanup)
                 for mig in mig_legs:
                     verdicts.guard("cloud-cleanup/migrate", mig.cleanup)
+                for readme in readme_legs:
+                    verdicts.guard("cloud-cleanup/client-readme", readme.cleanup)
                 if gsm:
                     verdicts.guard("gsm-cleanup", delete_connections, cloud, version)
         rows += verdicts.rows
