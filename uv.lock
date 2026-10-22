@@ -232,7 +232,7 @@ gate = [
 requires-dist = [
     { name = "apache-airflow", specifier = ">=2.10" },
     { name = "apache-airflow-providers-slack", marker = "extra == 'slack'", specifier = ">=8.0" },
-    { name = "rivet-cli", specifier = ">=0.32.1" },
+    { name = "rivet-cli", specifier = ">=0.32.2" },
 ]
 provides-extras = ["slack"]
 
@@ -3158,13 +3158,13 @@ wheels = [
 
 [[package]]
 name = "rivet-cli"
-version = "0.32.1"
+version = "0.32.2"
 source = { registry = "https://pypi.org/simple" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/e7/19/af77317edc82d0296db033d32a493ecf24f97cf32582edd10bca8721700c/rivet_cli-0.32.1-py3-none-macosx_10_12_x86_64.whl", hash = "sha256:e70ad0d480c24e386905161e6080719f656b3924f12c1246f32a2029896cbead", size = 19586874 },
-    { url = "https://files.pythonhosted.org/packages/80/e5/83e545d7dd5f3ff05c42fbc6073c35a40161b12543a905d93ef2c3aba9c1/rivet_cli-0.32.1-py3-none-macosx_11_0_arm64.whl", hash = "sha256:23acc2ba6fb7073f70d5c200fbbd03a601b0ad1ad3872a332ec4a7fd506aede6", size = 18482929 },
-    { url = "https://files.pythonhosted.org/packages/f9/ca/92abdfa8c31ce89b8e7cc457d57e9d5de6d2cf4b1237ef9cd618b39cac23/rivet_cli-0.32.1-py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:d57ecaab24a954d73e7f31c72bd48292d61312bb52f2df0d6a8acae46e56402f", size = 21964270 },
-    { url = "https://files.pythonhosted.org/packages/74/6f/cd6c4bd75022b553b6da49ec9107f9d7749805b61c4f42f2473281dbfcb2/rivet_cli-0.32.1-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:1f7b9d2608f1f6b25ca723fee3f8e11d105e6d6d6ef6d29ce39b6d5197e5eb1f", size = 22531910 },
+    { url = "https://files.pythonhosted.org/packages/0b/fa/c9490008ca9892c191e2acc182ef8e4fee58e818adc70674eaa1b7e0b039/rivet_cli-0.32.2-py3-none-macosx_10_12_x86_64.whl", hash = "sha256:996a22e51fb44c98a47442dfd21263b09b39ac1e36a67f27b6690d7aecf5c755", size = 19706846 },
+    { url = "https://files.pythonhosted.org/packages/c3/74/046bd5f946e7dff29e2ca7bb173eed9330c17cb6e3e8403a651d03b6badf/rivet_cli-0.32.2-py3-none-macosx_11_0_arm64.whl", hash = "sha256:a61b10808f74e71c76ad23874409eb40053c770300892f44daa669194ba69793", size = 18586375 },
+    { url = "https://files.pythonhosted.org/packages/19/82/140969eef199dca72d4d60801ab9c5b5630aab0e40894f29b49ab0283feb/rivet_cli-0.32.2-py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:998d1ff7025352f1d743eba37378584ec649a7aea11e0d2efc9a734a2294cfa3", size = 22077185 },
+    { url = "https://files.pythonhosted.org/packages/a4/29/26d2b14fb81aed8735287e5659e8327ee257697aafd61c8d08c66adc55ae/rivet_cli-0.32.2-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:d945614240b6ac7023cb26a343286fa266ce0a106eb8c1b2b43f230c427b82f3", size = 22657160 },
 ]
 
 [[package]]

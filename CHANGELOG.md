@@ -3,9 +3,9 @@
 All notable changes to `airflow-provider-rivet`. The package is versioned independently of the
 rivet binary; its release tags will use the prefix `airflow-v`.
 
-## 0.2.0 (unreleased)
+## 0.2.0 (2026-10-22)
 
-Against rivet 0.32.1 (the minimum) and 0.32.2, and the contract of ADR-0039 on rivet main.
+Against rivet 0.32.2 (the minimum) and the contract of ADR-0039 at rivet 0.32.2.
 
 ### Added
 
@@ -29,7 +29,7 @@ Against rivet 0.32.1 (the minimum) and 0.32.2, and the contract of ADR-0039 on r
 
 ### Changed
 
-- **Minimum rivet 0.32.1** (`rivet-cli>=0.32.1`); an older binary is refused before it starts
+- **Minimum rivet 0.32.2** (`rivet-cli>=0.32.2`); an older binary is refused before it starts
   (`RIVET_AIRFLOW_BINARY_TOO_OLD`).
 - SQLite state is refused under an executor that may run tasks on several hosts (Celery, Kubernetes, Edge): a task on
   another worker started from an empty state and re-read every table (`RIVET_AIRFLOW_STATE_SQLITE_MULTI_HOST`).
