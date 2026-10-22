@@ -229,9 +229,15 @@ def adc_writable(stand: Any, path: str) -> bool:
 
 
 def stream_tasks(stand: Any) -> dict[str, dict[str, Any]]:
-    """The MySQL stream's task instances on the first cycle (its run and its loads read GCS and BigQuery)."""
+    """The MySQL stream's task instances (its run and its loads read GCS and BigQuery): under `client-override` the
+    README's stream (gate/client.py), on the client's Connections; else the leg's first cycle."""
+    dag, run_id = (
+        ("gate_client_cron", "gate_client_cron_1")
+        if getattr(stand, "client_override", None)
+        else ("gate_src_mysql_cdc", "gate_1_initial")
+    )
     try:
-        return stand.tasks("gate_src_mysql_cdc", "gate_1_initial")
+        return stand.tasks(dag, run_id)
     except Exception:  # no such run: the cells say "none"
         return {}
 

@@ -862,14 +862,6 @@ class SourceLeg:
                 ok=f"{', '.join(state_db(self.engine.name, k) for k in self.engine.kinds)} owned by {COMPOSE_STATE_ROLE}, "
                 f"nothing of rivet's in {METASTORE_DB}",
             )
-        if name == "initial" and getattr(stand, "client_override", None):
-            folder = stand.source_state_host / leg_sub(stand, self.engine.name, "cdc")
-            v.check(
-                f"client-override/{self.engine.name}/cdc/checkpoint-on-host",
-                checkpoint_on_host,
-                folder,
-                ok=f"{sorted(str(p.relative_to(stand.dir)) for p in folder.glob('cdc/*.ckpt'))}",
-            )
         if self.stale_copy is not None and name == "initial" and run_id:
             dag = next(d for d in self.dags if d.endswith("_cdc"))
             v.check(

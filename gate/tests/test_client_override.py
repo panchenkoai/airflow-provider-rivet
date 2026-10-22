@@ -14,7 +14,7 @@ import yaml
 from test_stand_hygiene import Loader
 
 from gate import __main__ as gate_main
-from gate import conns, sources
+from gate import client, conns, sources
 from gate.sources import MYSQL
 from gate.stand import (
     CLIENT_FILES,
@@ -64,18 +64,19 @@ def client_stand(tmp_path: Path) -> Stand:
     return Stand("2.10.2", Path("/bin/true"), tmp_path / "w", sources=(MYSQL,), client_override=client_dir(tmp_path))
 
 
-def test_the_stream_reads_the_clients_state_and_the_other_configs_their_own(tmp_path: Path) -> None:
+def test_the_clients_state_is_left_to_its_readme_stream(tmp_path: Path) -> None:
     stand = client_stand(tmp_path)
-    # Mutant: the client mode not taken (the gate's own state server for the client's stream).
     assert stand.state_place == "client-override"
-    assert stand.leg_db("mysql", "cdc") == CLIENT_STATE_DB and stand.leg_db("mysql", "batch") == "rivet_state_mysql_batch"
-    assert stand.leg_state_sub("mysql", "cdc") == "mysql" and stand.leg_state_sub("mysql", "batch") == "mysql_batch"
+    # The gate's own configs keep a database and a state_dir of their own: `rivet state copy` needs the client's
+    # `rivet_state` empty, and its README stream takes `./rivet-state/mysql`. Mutant: the leg's stream on the client's.
+    assert stand.leg_db("mysql", "cdc") == "rivet_state_mysql_cdc" != CLIENT_STATE_DB
+    assert stand.leg_state_sub("mysql", "cdc") == "mysql_cdc"
     assert stand.source_state_root == "/opt/airflow/rivet-state" and stand.source_state_host == stand.dir / "rivet-state"
     conns_ = stand.connections()
-    # Mutant: the gate defines the stream's state Connection itself (the client's AIRFLOW_CONN_RIVET_STATE untested).
-    assert "rivet_gate_state_mysql_cdc" not in conns_ and "rivet_state" not in conns_
-    batch = conns_["rivet_gate_state_mysql_batch"]
-    assert (batch["host"], batch["login"], batch["extra"]) == ("rivet-state", "rivet", {"rivet_params": "sslmode=disable"})
+    # The client's own Connections (rivet_state, rivet_mysql) come from its compose file, never from the gate.
+    assert "rivet_state" not in conns_ and "rivet_mysql" not in conns_
+    cdc = conns_["rivet_gate_state_mysql_cdc"]
+    assert (cdc["host"], cdc["login"], cdc["extra"]) == ("rivet-state", "rivet", {"rivet_params": "sslmode=disable"})
     assert stand.leg_state_url("rivet_state").endswith("@rivet-state:5432/rivet_state?sslmode=disable")
 
 
@@ -115,12 +116,43 @@ def test_the_gates_overlay_adds_the_key_and_leaves_the_clients_variables(tmp_pat
     assert "gate_gcp" not in stand.connections()
 
 
-def test_the_dag_file_gives_the_stream_the_clients_connection_and_state_dir() -> None:
+def test_the_readme_dag_takes_its_step_6_kwargs() -> None:
     dag = (Path(sources.__file__).parent / "stand" / "dags" / "rivet_gate.py").read_text()
-    # Mutant: the client's README kwargs not used (the gate's Connection, or its own state_dir naming).
-    assert 'state = "rivet_state" if CLIENT and (engine, kind) == ("mysql", "cdc")' in dag
-    assert 'return f"{SOURCE_STATE}/mysql" if CLIENT and (engine, kind) == ("mysql", "cdc")' in dag
+    block = dag[dag.index("# The client's README (gate/client.py") :]
+    # Mutant: the gate's own Connections or state_dir for the README's stream.
+    assert '"env_from_connections": {"RIVET_STATE_URL": "rivet_state", "RIVET_MYSQL_URL": "rivet_mysql"}' in block
+    assert '"cloud_credentials": ["gcp"]' in block and 'state_dir=readme["state_dir"]' in block
+    assert client.STATE_DIR == "/opt/airflow/rivet-state/mysql"
     assert 'GCP = {"cloud_credentials": ["gcp"]} if ENV_KEY else {"connections": ["gate_gcp"]}' in dag
+
+
+README_LINE = (
+    "`docker compose ... exec airflow-worker bash -c 'RIVET_STATE_URL=\"postgresql://$RIVET_STATE_USER:$RIVET_STATE_PASSWORD"
+    "@rivet-state:5432/$RIVET_STATE_DB?sslmode=disable\" rivet state copy -c /opt/airflow/rivet-state/migration-src/<config file>'`"
+)
+
+
+def test_step_5_runs_the_readmes_own_line() -> None:
+    copied = "copied 20 table(s), 83 row(s), from `…/.rivet_state.db`"
+    assert client.step5_problems(0, copied, README_LINE) == []
+    # Mutant: the README not compared (a command the gate rewrote would pass as the README's).
+    assert client.step5_problems(0, copied, README_LINE.replace("$RIVET_STATE_DB", "rivet_state")) == [
+        "the command run is not the README's step 5 line"
+    ]
+    assert client.step5_problems(1, "Error: …", README_LINE) == ["exit 1", "no `copied … table(s)` line: Error: …"]
+
+
+def test_the_stream_continues_from_the_cron_jobs_position() -> None:
+    tasks = {"run": {"state": "success"}, "load.gate_orders": {"state": "success"}}
+    assert client.continues_problems("success", tasks, {"units": [{"rows": 4}]}, 4) == []
+    # Mutant: the rows not compared (a new baseline, the whole table, passes as a continuation).
+    assert client.continues_problems("success", tasks, {"units": [{"rows": 6120}]}, 4) == [
+        "the run moved 6120 row(s), the changes since cron stopped are 4"
+    ]
+    refused = {"error": {"code": "RIVET_SOURCE_CDC_CHECKPOINT_INVALID"}, "exit_status": 5}
+    assert client.continues_problems("failed", {"run": {"state": "failed"}}, refused, 4)[-1] == (
+        "rivet stopped [RIVET_SOURCE_CDC_CHECKPOINT_INVALID] exit 5"
+    )
 
 
 WORKER = "airflow-worker/abc"
@@ -188,3 +220,14 @@ def test_the_client_stack_is_the_clients_airflow(capsys) -> None:
         gate_main.main(["--rivet-bin", "x", "--client-override", "d", "--airflow", "2.10.5", "--warehouses", "bigquery",
                         "--sources", "mysql"])  # fmt: skip
     assert "--airflow 2.10.2" in capsys.readouterr().err
+
+
+def test_the_provider_wheel_carries_the_version_the_clients_dockerfile_pins(tmp_path: Path) -> None:
+    from gate.stand import CLIENT_PROVIDER_VERSION, provider_wheel
+
+    wheel = provider_wheel(tmp_path, CLIENT_PROVIDER_VERSION)
+    # Mutant: the checkout's own version kept (`--find-links` would not find `airflow-provider-rivet==0.2.0`).
+    assert wheel.name.startswith(f"airflow_provider_rivet-{CLIENT_PROVIDER_VERSION}-")
+    with zipfile.ZipFile(wheel) as z:
+        meta = z.read(f"airflow_provider_rivet-{CLIENT_PROVIDER_VERSION}.dist-info/METADATA").decode()
+    assert f"Version: {CLIENT_PROVIDER_VERSION}\n" in meta

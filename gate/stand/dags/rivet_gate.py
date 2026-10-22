@@ -90,14 +90,9 @@ for wh in filter(None, os.environ.get("GATE_WAREHOUSES", "").split(",")):
     )
 
 
-# `--client-override`: the client's own compose files; its MySQL stream reads the `rivet_state` Connection its compose
-# file defines (AIRFLOW_CONN_RIVET_STATE), from the state_dir its README names (step 6).
-CLIENT = os.environ.get("GATE_CLIENT_OVERRIDE") == "1"
-
-
 def leg_kwargs(engine: str, kind: str) -> dict:
     """The config's own PostgreSQL state: the one `rivet init` recorded the source's primary keys in."""
-    state = "rivet_state" if CLIENT and (engine, kind) == ("mysql", "cdc") else f"rivet_gate_state_{engine}_{kind}"
+    state = f"rivet_gate_state_{engine}_{kind}"
     return {
         "env_from_connections": {f"RIVET_GATE_{engine.upper()}_URL": f"rivet_gate_{engine}", "RIVET_STATE_URL": state},
         **GCP,
@@ -105,8 +100,8 @@ def leg_kwargs(engine: str, kind: str) -> dict:
 
 
 def leg_state_dir(engine: str, kind: str) -> str:
-    """The config's state_dir (the client's `<mount>/mysql` for its stream)."""
-    return f"{SOURCE_STATE}/mysql" if CLIENT and (engine, kind) == ("mysql", "cdc") else f"{SOURCE_STATE}/{engine}_{kind}"
+    """The config's state_dir under the source state root."""
+    return f"{SOURCE_STATE}/{engine}_{kind}"
 
 
 # Source legs (gate/sources.py): another engine to GCS and BigQuery, on the configs `rivet init` wrote; the export and
@@ -338,4 +333,23 @@ if os.path.exists(f"{ROOT}/configs/mysql_unq.json"):
         state_dir=unq["state_dir"],
         operator_kwargs=leg_kwargs("mysql", "unq"),
         tags=["rivet", "gate", "source", "mysql"],
+    )
+
+
+# The client's README (gate/client.py, `--client-override`): the stream a cron job ran with rivet 0.32.1, moved into
+# Airflow by its steps 5 and 6 — the cron config as it ran, the client's own Connections and state_dir, verbatim.
+if os.path.exists(f"{ROOT}/configs/client_readme.json"):
+    with open(f"{ROOT}/configs/client_readme.json") as handle:
+        readme = json.load(handle)
+    globals()[readme["dag"]] = build_cdc_dag(
+        readme["dag"],
+        config=readme["config"],
+        export=readme["stream"]["name"],
+        tables=readme["stream"]["tables"],
+        state_dir=readme["state_dir"],
+        operator_kwargs={
+            "env_from_connections": {"RIVET_STATE_URL": "rivet_state", "RIVET_MYSQL_URL": "rivet_mysql"},
+            "cloud_credentials": ["gcp"],
+        },
+        tags=["rivet", "gate", "client"],
     )

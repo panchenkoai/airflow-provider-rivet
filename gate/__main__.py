@@ -17,8 +17,8 @@ import tempfile
 import time
 from pathlib import Path
 
+from . import client, destinations, migrate, multihost, sources
 from . import conns as proofs
-from . import destinations, migrate, multihost, sources
 from .scenario import TABLES, Verdicts, play
 from .stand import FLAVORS, Stand
 from .warehouse import (
@@ -135,8 +135,11 @@ def main(argv: list[str] | None = None) -> int:
     if set(engines) - set(sources.ENGINES):
         ap.error(f"unknown source(s) {sorted(set(engines) - set(sources.ENGINES))}; known: {list(sources.ENGINES)}")
     if args.client_override:
-        if versions != ["2.10.2"] or "mysql" not in engines:
-            ap.error("--client-override runs the client's stack: --airflow 2.10.2 and --sources with mysql")
+        if versions != ["2.10.2"] or "mysql" not in engines or not args.migrate_from:
+            ap.error(
+                "--client-override runs the client's stack and its README's migration from a rivet 0.32.1 cron job: "
+                "--airflow 2.10.2, --sources with mysql and --migrate-from"
+            )
         args.gcp_auth = "env-file"  # the client's: GOOGLE_APPLICATION_CREDENTIALS, no GCP Connection
     if args.migrate_from and "mysql" not in engines:
         ap.error("--migrate-from runs beside the MySQL source leg: pass --sources with mysql")
@@ -204,6 +207,7 @@ def main(argv: list[str] | None = None) -> int:
         hosts = multihost.MultiHost(stand, Verdicts(version), cloud) if cloud and args.workers > 1 else None
         src_legs = sources.legs(cloud, version, engines)
         mig_legs = migrate.legs(src_legs, args.migrate_from)
+        readme_legs = client.legs(src_legs, args.client_override)
         dest_legs = list(stand.destinations)
         verdicts = hosts.v if hosts else Verdicts(version)
         try:
@@ -219,7 +223,9 @@ def main(argv: list[str] | None = None) -> int:
                 if hosts:
                     verdicts.guard("multihost", hosts.play)
                 else:
-                    verdicts.guard("scenario", play, stand, verdicts, args.sabotage, leg, src_legs, dest_legs, mig_legs)
+                    verdicts.guard(
+                        "scenario", play, stand, verdicts, args.sabotage, leg, src_legs, dest_legs, mig_legs, readme_legs
+                    )
                 verdicts.guard("proofs", proofs.prove, stand, verdicts, cloud if warehouses else None)
         finally:
             if not args.keep:
@@ -232,6 +238,8 @@ def main(argv: list[str] | None = None) -> int:
                     verdicts.guard(f"cloud-cleanup/{src.engine.name}", src.cleanup)
                 for mig in mig_legs:
                     verdicts.guard("cloud-cleanup/migrate", mig.cleanup)
+                for readme in readme_legs:
+                    verdicts.guard("cloud-cleanup/client-readme", readme.cleanup)
                 if gsm:
                     verdicts.guard("gsm-cleanup", delete_connections, cloud, version)
         rows += verdicts.rows

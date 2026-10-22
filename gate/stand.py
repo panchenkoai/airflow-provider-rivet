@@ -48,6 +48,36 @@ def path(name: str = "rivet") -> str:
 '''
 
 
+#: The provider version the client's Dockerfile.rivet pins. Not released yet: the gate builds this checkout under it
+#: (an adaptation, reported), since `--find-links` only finds a wheel of the pinned version.
+CLIENT_PROVIDER_VERSION = "0.2.0"
+
+
+def provider_wheel(out: Path, version: str) -> Path:
+    """This checkout's provider as a wheel of `version` (the package's `__version__` set to it in a copy)."""
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        src = Path(tmp) / "provider"
+        for name in PACKAGE_FILES:
+            if (REPO / name).is_dir():
+                shutil.copytree(REPO / name, src / name, ignore=shutil.ignore_patterns("__pycache__"))
+            else:
+                src.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(REPO / name, src / name)
+        init = src / "airflow_provider_rivet" / "__init__.py"
+        text = init.read_text()
+        bumped = re.sub(r'^__version__ = "[^"]+"', f'__version__ = "{version}"', text, count=1, flags=re.M)
+        if bumped == text and f'__version__ = "{version}"' not in text:
+            raise ValueError("no __version__ line in airflow_provider_rivet/__init__.py")
+        init.write_text(bumped)
+        sh(["uv", "build", "--wheel", "--out-dir", str(out), str(src)], timeout=600)
+    found = sorted(out.glob(f"airflow_provider_rivet-{version}-*.whl"))
+    if len(found) != 1:
+        raise RuntimeError(f"uv build left {sorted(out.glob('*.whl'))} in {out}, expected one provider wheel {version}")
+    return found[0]
+
+
 def rivet_version(shown: str) -> str:
     """`rivet 0.32.2 (7fba31c4)` -> `0.32.2`."""
     found = re.search(r"\brivet (\d+\.\d+\.\d+)\b", shown)
@@ -127,7 +157,7 @@ METASTORE_DB = "airflow"
 #: state server `rivet-state` (postgres:16, its own volume, no port, no TLS), its `rivet_state` Connection (an
 #: AIRFLOW_CONN_* JSON variable) and its state_dir mount, as delivered. The gate supplies the variables they read.
 RIVET_SERVICE = "rivet-state"
-CLIENT_FILES = ("docker-compose.rivet.yml", "Dockerfile.rivet", "env.rivet.example", "README.md")
+CLIENT_FILES = ("docker-compose.rivet.yml", "Dockerfile.rivet", "env.rivet.example", "README.md", "README.en.md")
 CLIENT_STATE_USER = "rivet"
 CLIENT_STATE_DB = "rivet_state"
 CLIENT_STATE_CONN = "rivet_state"
@@ -484,6 +514,13 @@ class Stand:
                     "RIVET_STATE_PASSWORD": self.secrets.compose_state,
                     "RIVET_STATE_DB": CLIENT_STATE_DB,
                     "RIVET_AIRFLOW_IMAGE": self.image,
+                    # The client's `rivet_mysql` Connection (AIRFLOW_CONN_RIVET_MYSQL from RIVET_MYSQL_*): the stack's MySQL,
+                    # spelled as the cron config reaches it.
+                    "RIVET_MYSQL_HOST": "gate-mysql",
+                    "RIVET_MYSQL_PORT": "3306",
+                    "RIVET_MYSQL_USER": "rivet",
+                    "RIVET_MYSQL_PASSWORD": self.secrets.mysql,
+                    "RIVET_MYSQL_DB": "rivet",
                 }
                 if self.client_override
                 else {}
@@ -498,11 +535,9 @@ class Stand:
         """The Airflow image with the rivet binary under test and this provider."""
         ctx = self.dir / "image"
         if self.client_override:
-            # The client's Dockerfile.rivet, its pins taken from the local wheels (rivet-cli 0.32.2 and the provider are
-            # not on PyPI yet): Dockerfile.client does what it does, with `pip install <wheels>` for the two pins.
-            sh(["docker", "build", "-q", "-t", self.image, "--build-arg", f"AIRFLOW_BASE_IMAGE=apache/airflow:{self.flavor.version}",
-                "--build-arg", f"AIRFLOW_VERSION={self.flavor.version}", "-f", str(HERE / "stand" / "Dockerfile.client"), str(ctx)],
-               timeout=1800)  # fmt: skip
+            # The client's own build: its compose file's `build:` (Dockerfile.rivet, context the stack's folder), the
+            # two pins found in ./wheels (`--find-links`), tagged by its RIVET_AIRFLOW_IMAGE.
+            self.compose("build", "airflow-worker", timeout=1800)
             return
         shutil.copy2(self.rivet_bin, ctx / "rivet")
         for name in PACKAGE_FILES:
@@ -576,27 +611,22 @@ class Stand:
         write_env_file(self.dir / "gate-connections.env", self.connection_variables())
 
     def lay_out_client(self) -> None:
-        """The client's files, copied as delivered (their sha256 kept for the `as-delivered` cell), and the build
-        context of its image: `rivet-cli` (the binary under test, laid out as rivet's own wheel) and this provider's
-        wheel, which `Dockerfile.rivet` would take from PyPI."""
+        """The client's files, copied as delivered (their sha256 kept for the `as-delivered` cell), and its `./wheels`:
+        `rivet-cli` (the binary under test, laid out as rivet's own wheel) and this provider's wheel, which its
+        Dockerfile.rivet finds there before PyPI."""
         assert self.client_override is not None
         self.client_files = {}
         for name in CLIENT_FILES:
             shutil.copy2(self.client_override / name, self.dir / name)
             self.client_files[name] = hashlib.sha256((self.dir / name).read_bytes()).hexdigest()
         (self.dir / "rivet-state").mkdir(parents=True, exist_ok=True)
-        out = self.dir / "image" / "wheels"
+        out = self.dir / "wheels"
         out.mkdir(parents=True, exist_ok=True)
         shown = sh(["docker", "run", "--rm", "--entrypoint", "/rivet", "-v", f"{self.rivet_bin}:/rivet:ro",
                     f"apache/airflow:{self.flavor.version}", "--version"]).stdout  # fmt: skip
         cli = rivet_cli_wheel(self.rivet_bin, rivet_version(shown), out)
-        sh(["uv", "build", "--wheel", "--out-dir", str(out), str(REPO)], timeout=600)
-        provider = sorted(out.glob("airflow_provider_rivet-*.whl"))
-        if len(provider) != 1:
-            raise RuntimeError(f"uv build left {provider} in {out}, expected one provider wheel")
-        print(
-            f"CLIENT image {self.image}: {cli.name} {provider[0].name} ({shown.strip()}); files {self.client_files}", flush=True
-        )
+        provider = provider_wheel(out, CLIENT_PROVIDER_VERSION)
+        print(f"CLIENT wheels {cli.name} {provider.name} ({shown.strip()}); files {self.client_files}", flush=True)
 
     def worker_yaml(self, host: str) -> str:
         """One host of the multi-host leg: a Celery worker with its own hostname, its own disk at HOST_DISK, and the
@@ -692,16 +722,12 @@ class Stand:
         return self.dir / "rivet-state" if self.client_override else self.rivet_dir / "state"
 
     def leg_db(self, engine: str, kind: str) -> str:
-        """The state database of a source leg's config: the client's own `rivet_state` for the MySQL stream under
-        `client-override` (its `rivet_state` Connection), else one of the gate's per config."""
-        if self.client_override and (engine, kind) == ("mysql", "cdc"):
-            return CLIENT_STATE_DB
+        """The state database of one of the gate's source configs (a database of its own, also under
+        `client-override`: the client's `rivet_state` is the README stream's, `gate/client.py`)."""
         return state_db(engine, kind)
 
     def leg_state_sub(self, engine: str, kind: str) -> str:
-        """The state_dir of a source leg's config under the source state root (the client's `mysql` for its stream)."""
-        if self.client_override and (engine, kind) == ("mysql", "cdc"):
-            return CLIENT_CDC_STATE_SUB
+        """The state_dir of a source leg's config under the source state root."""
         return f"{engine}_{kind}"
 
     def leg_state_conn(self, db: str) -> dict[str, Any]:

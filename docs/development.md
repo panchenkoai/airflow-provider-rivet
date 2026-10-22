@@ -213,26 +213,29 @@ code (`RIVET_AIRFLOW_EXPORT_BUSY`, the provider's export lock, or rivet's `RIVET
 `RIVET_STATE_LOCK_TIMEOUT`, read from that try's task log) and its retry goes through, and the two moved each change once;
 `overlap/mysql/cdc/current-equals-source`: BigQuery equals the source value by value.
 
-**The client's own files.** `--client-override <dir> --airflow 2.10.2` runs the client's delivered compose override
-(`docker-compose.rivet.yml`, `Dockerfile.rivet`, `env.rivet.example`, `README.md`, copied as delivered) between the
-official 2.10.2 `docker-compose.yaml` (`gate/stand/airflow-2.10.2.yaml`, the official file unchanged, metadata on
-postgres:13) and the gate's overlay: `docker compose -f docker-compose.yaml -f docker-compose.rivet.yml -f
-docker-compose.gate.yaml`. Its state server `rivet-state` (postgres:16, its own volume, no port, no TLS), its
-`rivet_state` Connection (`AIRFLOW_CONN_RIVET_STATE`, JSON with `rivet_params: sslmode=disable`), its `./rivet-state`
-mount and its `GOOGLE_APPLICATION_CREDENTIALS=/etc/gcloud_cred.json` run as written; the MySQL stream's DAGs take its
-README's kwargs (`env_from_connections` `RIVET_STATE_URL` -> `rivet_state`, `cloud_credentials=["gcp"]`, `state_dir`
-`/opt/airflow/rivet-state/mysql`), and no GCP Connection exists (`--gcp-auth env-file`). What the gate adds on top, each a
-gap in the delivered files: the image (its two PyPI pins are not published yet: `gate/stand/Dockerfile.client` does what
-`Dockerfile.rivet` does with a `rivet-cli` wheel of the binary under test, laid out as rivet's own, and this provider's
-wheel, named through the file's `RIVET_AIRFLOW_IMAGE`), the key file mounted at `/etc/gcloud_cred.json`, the
-`RIVET_STATE_*` values, the MySQL source and its Connection, and a state database of its own on `rivet-state` for each of
-the gate's other configs. Cells: `client-override/files/as-delivered` (the files ran byte for byte as copied),
-`client-override/conn/env-json-connection` (the JSON variable in every worker, host `rivet-state`, `sslmode=disable`,
-resolved by Airflow, the stream's state rows in `rivet_state`), `client-override/gcp/env-key-file` (the variable in every
-worker, the key read-only, no GCP Connection, the stream's run and loads went through) and
-`client-override/mysql/cdc/checkpoint-on-host` (`./rivet-state/mysql/cdc/<name>.ckpt`), beside every cell of the MySQL
-leg and the migration. `MEASURE client-override/readme/step5-variables` says whether the `RIVET_STATE_*` variables its
-README's step 5 reads are in the worker's environment.
+**The client's own files.** `--client-override <dir> --airflow 2.10.2 --migrate-from <rivet 0.32.1>` runs the client's
+delivered compose override (`docker-compose.rivet.yml`, `Dockerfile.rivet`, `env.rivet.example`, `README.md`,
+`README.en.md`, copied as delivered) between the official 2.10.2 `docker-compose.yaml` (`gate/stand/airflow-2.10.2.yaml`,
+the official file unchanged, metadata on postgres:13) and the gate's overlay: `docker compose -f docker-compose.yaml -f
+docker-compose.rivet.yml -f docker-compose.gate.yaml`. Its image is built by its own `build:` (`Dockerfile.rivet`, its two
+pins found in `./wheels`: a `rivet-cli` wheel of the binary under test, laid out as rivet's own, and this provider's wheel
+built under the version the file pins), its state server `rivet-state`, its `rivet_state` and `rivet_mysql` Connections
+(AIRFLOW_CONN_* JSON from `RIVET_STATE_*` / `RIVET_MYSQL_*`), its `./rivet-state` mount and its
+`GOOGLE_APPLICATION_CREDENTIALS=/etc/gcloud_cred.json` run as written, and no GCP Connection exists (`--gcp-auth
+env-file`). The gate's own configs keep a state database and a state_dir of their own on that server. Its README's
+migration runs as written (`gate/client.py`): a cron job (rivet 0.32.1 in a folder of its own: the config, its
+`.rivet_state.db`, `cdc/`) runs, loads and compacts twice; step 5 copies the folder to `./rivet-state/migration-src`, runs
+its `rivet state copy` line verbatim (`client-override/readme/step5-verbatim`: the line is the README's, exit 0) and
+copies the checkpoint to `./rivet-state/mysql/cdc/`; step 6 runs the same config under Airflow with its kwargs, and the
+stream must continue (`client-override/readme/step6-continues`: exactly the changes made since the cron job stopped;
+`client-override/readme/current-equals-source`; `client-override/mysql/cdc/checkpoint-on-host`). With it:
+`client-override/files/as-delivered`, `client-override/conn/env-json-connection` (the JSON variable in every worker, host
+`rivet-state`, `sslmode=disable`, resolved by Airflow, the stream's rows in `rivet_state`) and
+`client-override/gcp/env-key-file` (the variable in every worker, the key read-only, no GCP Connection, the stream's run
+and loads went through). What the gate adds on top, each a gap in the delivered files: the wheels, the key file mounted
+at `/etc/gcloud_cred.json` (the files say the base compose mounts it), the variables `env.rivet.example` lists, and the
+MySQL source. `MEASURE client-override/readme/step5-variables` says whether the `RIVET_STATE_*` variables step 5 reads
+are in the worker's environment.
 
 **The client stack.** `--state compose-postgres` keeps the source legs' state where the client does: in a database of
 its own (`rivet_state_<engine>_<kind>`), owned by a role of its own (`rivet_state`, LOGIN, its own password), on the
