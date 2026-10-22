@@ -163,5 +163,5 @@ def test_the_batch_pipeline_migrates_with_its_own_config_state_and_dags() -> Non
     # Mutant: the batch PostgreSQL DAG on the stream's state, or the batch way back on the old binary.
     assert '"RIVET_STATE_URL": b["state_conn"]' in block
     assert '(("sqlite", {**on_sqlite_b, "rivet_bin": mig["old_bin"]}), ("pg", on_pg_b), ("back", on_sqlite_b))' in block
-    assert migrate.B_STATE_DB != migrate.STATE_DB and migrate.B_STATE_DIR != migrate.STATE_DIR
+    assert migrate.B_STATE_DB != migrate.STATE_DB and migrate.B_STATE_SUB != migrate.STATE_SUB
     assert all("DELETE" not in sql for sql, _ in migrate.B_STEPS.values()), "an incremental extract cannot see a delete"

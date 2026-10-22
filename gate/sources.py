@@ -610,14 +610,14 @@ class SourceLeg:
         """Seed the source; the buckets and datasets; `rivet init` writes each config inside the stack's network (and,
         for a kind the engine cannot run, shows its known limit)."""
         for kind in self.datasets:
-            (stand.rivet_dir / "state" / f"{self.engine.name}_{kind}").mkdir(parents=True, exist_ok=True)
+            (stand.source_state_host / leg_sub(stand, self.engine.name, kind)).mkdir(parents=True, exist_ok=True)
         self.wait_ready(stand)
         self.sql(stand, self.engine.setup.replace("{password}", getattr(stand.secrets, self.engine.name)))
         self.sql(stand, self.engine.seed.replace("{orders_instance}", self.capture_instance(stand)))
         for kind, ds in self.datasets.items():
             sh(["gcloud", "storage", "buckets", "create", f"gs://{self.buckets[kind]}", f"--project={self.cloud.project}",
                 f"--location={self.cloud.location}", "--uniform-bucket-level-access"], timeout=300)  # fmt: skip
-            stand.make_leg_state_db(state_db(self.engine.name, kind))
+            stand.make_leg_state_db(leg_db(stand, self.engine.name, kind))
             warehouse._bq(f"--location={self.cloud.location}", "mk", "-f", "--dataset", f"{self.cloud.project}:{ds}")
             host = stand.rivet_dir / "configs" / f"{self.engine.name}_{kind}"
             host.mkdir(parents=True, exist_ok=True)
@@ -628,7 +628,7 @@ class SourceLeg:
                 "exec", "-T", "-e", self.engine.url_env, "-e", "RIVET_STATE_URL", "airflow-worker", *argv,
                 extra_env={
                     self.engine.url_env: self.engine.url(stand.secrets),
-                    "RIVET_STATE_URL": stand.leg_state_url(state_db(self.engine.name, kind)),
+                    "RIVET_STATE_URL": stand.leg_state_url(leg_db(stand, self.engine.name, kind)),
                 },
                 check=limit is None,
             )  # fmt: skip
@@ -700,7 +700,7 @@ class SourceLeg:
             # What the previous provider left in the state_dir: its copy of the config, named by the RESOLVED path (the
             # revision's), with the same text and no `.owner` record (rivet <= 0.32.1 wrote none).
             resolved = self.shape["cdc_config"].replace("/repo/", "/rev-A/")
-            state_dir = stand.rivet_dir / "state" / f"{self.engine.name}_cdc"
+            state_dir = stand.source_state_host / leg_sub(stand, self.engine.name, "cdc")
             self.stale_copy = state_dir / old_copy_name(resolved)
             self.stale_copy.write_text(self.texts["cdc"])
         # A compaction with nothing to merge skips; the `compacted` cell holds every cycle to "no buffer left".
@@ -721,7 +721,7 @@ class SourceLeg:
             "exec", "-T", "-e", self.engine.url_env, "-e", "RIVET_STATE_URL", "airflow-worker", *argv,
             extra_env={
                 self.engine.url_env: self.engine.url(stand.secrets),
-                "RIVET_STATE_URL": stand.leg_state_url(state_db(eng, "cdc")),
+                "RIVET_STATE_URL": stand.leg_state_url(leg_db(stand, eng, "cdc")),
             },
             check=False,
         )  # fmt: skip
@@ -861,6 +861,14 @@ class SourceLeg:
                 lambda: placement_problems(*self.placement(stand)),
                 ok=f"{', '.join(state_db(self.engine.name, k) for k in self.engine.kinds)} owned by {COMPOSE_STATE_ROLE}, "
                 f"nothing of rivet's in {METASTORE_DB}",
+            )
+        if name == "initial" and getattr(stand, "client_override", None):
+            folder = stand.source_state_host / leg_sub(stand, self.engine.name, "cdc")
+            v.check(
+                f"client-override/{self.engine.name}/cdc/checkpoint-on-host",
+                checkpoint_on_host,
+                folder,
+                ok=f"{sorted(str(p.relative_to(stand.dir)) for p in folder.glob('cdc/*.ckpt'))}",
             )
         if self.stale_copy is not None and name == "initial" and run_id:
             dag = next(d for d in self.dags if d.endswith("_cdc"))
@@ -1094,7 +1102,7 @@ class SourceLeg:
         warehouse._bq(f"--location={self.cloud.location}", "mk", "-f", "--dataset", f"{self.cloud.project}:{self.unq_dataset}")
         stand.make_leg_state_db(state_db(eng, "unq"))
         (stand.rivet_dir / "configs" / f"{eng}_unq").mkdir(parents=True, exist_ok=True)
-        (stand.rivet_dir / "state" / f"{eng}_unq").mkdir(parents=True, exist_ok=True)
+        (stand.source_state_host / f"{eng}_unq").mkdir(parents=True, exist_ok=True)
         out = f"/opt/rivet/configs/{eng}_unq/{eng}_unq.yaml"
         argv = init_argv("cdc", self.engine, self.unq_bucket, self.cloud.project, self.unq_dataset, out)
         done = stand.compose(
@@ -1113,7 +1121,7 @@ class SourceLeg:
             v.grade(cell, [f"init wrote streams {streams}, expected one over {list(self.engine.tables)}"])
             return
         dag = f"gate_src_{eng}_cdc_unq"
-        shape = {"dag": dag, "config": out, "stream": streams[0], "state_dir": f"/opt/rivet/state/{eng}_unq"}
+        shape = {"dag": dag, "config": out, "stream": streams[0], "state_dir": f"{stand.source_state_root}/{eng}_unq"}
         (stand.rivet_dir / "configs" / f"{eng}_unq.json").write_text(json.dumps(shape))
         stand.wait_dags([dag])
         run_id = f"gate_{eng}_unq"
@@ -1260,7 +1268,7 @@ class SourceLeg:
         assert self.engine.git_sync is not None and self.engine.hot is not None
         name, eng, hot = "git-sync", self.engine.name, self.engine.hot
         dag = next(d for d in self.dags if d.endswith("_cdc"))
-        copies = stand.rivet_dir / "state" / f"{eng}_cdc"
+        copies = stand.source_state_host / leg_sub(stand, eng, "cdc")
         print(f"GIT-SYNC copies before the flip: {sorted(p.name for p in copies.glob('rivet.*.yaml'))}", flush=True)
         flipped = v.guard(f"{name}/{eng}/cdc/flip", flip, stand.rivet_dir / "configs" / f"{eng}_cdc_sync")
         if flipped is None:
@@ -1555,6 +1563,26 @@ def stderr_tail(stand: Any, payload: dict[str, Any], lines: int = 40) -> str:
 def headline(text: str | None) -> str:
     heads = list(HEADLINE.finditer(text or ""))
     return heads[-1].group(0).strip() if heads else ""
+
+
+def checkpoint_on_host(folder: Path) -> list[str]:
+    """The stream's checkpoint file is on the host where the client's README says (`<state_dir>/cdc/<name>.ckpt`, the
+    config's relative `./cdc/` resolved from the state_dir), not one level off."""
+    found = sorted(folder.glob("cdc/*.ckpt"))
+    if found:
+        return []
+    near = sorted(str(p.relative_to(folder.parent)) for p in folder.parent.rglob("*.ckpt"))
+    return [f"no checkpoint at {folder.name}/cdc/*.ckpt; checkpoints under the mount: {near or 'none'}"]
+
+
+def leg_db(stand: Any, engine: str, kind: str) -> str:
+    """A config's state database on this stand (a stand without the method: the gate's own, per config)."""
+    return stand.leg_db(engine, kind) if hasattr(stand, "leg_db") else state_db(engine, kind)
+
+
+def leg_sub(stand: Any, engine: str, kind: str) -> str:
+    """A config's state_dir under the stand's source state root."""
+    return stand.leg_state_sub(engine, kind) if hasattr(stand, "leg_state_sub") else f"{engine}_{kind}"
 
 
 def short(table: str) -> str:

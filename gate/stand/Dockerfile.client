@@ -1,0 +1,14 @@
+# The client's Dockerfile.rivet (rivet-compose-2026-10-23), with its two PyPI pins installed from the local wheels the
+# gate builds: rivet-cli (the binary under test, laid out as rivet's own wheel) and this provider from the checkout.
+ARG AIRFLOW_BASE_IMAGE=apache/airflow:2.10.2
+FROM ${AIRFLOW_BASE_IMAGE}
+
+ARG AIRFLOW_VERSION=2.10.2
+ARG PYTHON_VERSION=3.12
+
+COPY --chown=airflow:root wheels /tmp/rivet-wheels
+RUN pip install --no-cache-dir \
+      --constraint "https://raw.githubusercontent.com/apache/airflow/constraints-${AIRFLOW_VERSION}/constraints-${PYTHON_VERSION}.txt" \
+      /tmp/rivet-wheels/rivet_cli-*.whl \
+      /tmp/rivet-wheels/airflow_provider_rivet-*.whl \
+ && rivet --version

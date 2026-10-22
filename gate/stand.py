@@ -4,14 +4,18 @@ from __future__ import annotations
 
 import ast
 import base64
+import hashlib
+import io
 import json
 import os
+import re
 import secrets
 import shutil
 import subprocess
 import time
 import urllib.error
 import urllib.request
+import zipfile
 from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
@@ -19,6 +23,91 @@ from typing import Any
 HERE = Path(__file__).resolve().parent
 REPO = HERE.parent
 PACKAGE_FILES = ("airflow_provider_rivet", "pyproject.toml", "README.md", "LICENSE", "CHANGELOG.md")
+#: The client's GCP key file, named by GOOGLE_APPLICATION_CREDENTIALS in the compose env (`--gcp-auth env-file`).
+GCP_KEY_IN_CONTAINER = "/etc/gcloud_cred.json"
+#: ELF `e_machine` -> the manylinux platform tag of a `rivet-cli` wheel (rivet's dev/pytools/pypi_wheels.py tags).
+ELF_PLATFORMS = {0xB7: "manylinux_2_28_aarch64", 0x3E: "manylinux_2_28_x86_64"}
+RIVET_CLI_MODULE = '''"""The rivet binaries this wheel installed."""
+
+import os
+import shutil
+import sysconfig
+
+__version__ = "{version}"
+
+
+def path(name: str = "rivet") -> str:
+    """Absolute path of `name` from this wheel: the environment's scripts directory, else PATH."""
+    candidate = os.path.join(sysconfig.get_path("scripts"), name)
+    if os.access(candidate, os.X_OK):
+        return candidate
+    found = shutil.which(name)
+    if found is None:
+        raise FileNotFoundError(f"{{name}} is not in {{sysconfig.get_path('scripts')}} nor on PATH")
+    return found
+'''
+
+
+def rivet_version(shown: str) -> str:
+    """`rivet 0.32.2 (7fba31c4)` -> `0.32.2`."""
+    found = re.search(r"\brivet (\d+\.\d+\.\d+)\b", shown)
+    if not found:
+        raise ValueError(f"no rivet version in {shown!r}")
+    return found.group(1)
+
+
+def elf_platform(data: bytes) -> str:
+    """The wheel platform tag of a Linux rivet binary, from its ELF header (a binary of no known machine raises)."""
+    if data[:4] != b"\x7fELF":
+        raise ValueError("not an ELF binary: the client image installs a Linux rivet")
+    machine = int.from_bytes(data[18:20], "little")
+    if machine not in ELF_PLATFORMS:
+        raise ValueError(f"ELF machine {machine:#x}: no wheel platform for it")
+    return ELF_PLATFORMS[machine]
+
+
+def rivet_cli_wheel(binary: Path, version: str, out: Path) -> Path:
+    """`rivet_cli-<version>-py3-none-<platform>.whl` holding `binary` as the `rivet` script, the layout of rivet's own
+    `rivet-cli` wheels (dev/pytools/pypi_wheels.py): what `pip install rivet-cli==<version>` would install."""
+    data = binary.read_bytes()
+    platform = elf_platform(data)
+    dist = "rivet_cli"
+    info = f"{dist}-{version}.dist-info"
+    files = [
+        (f"{dist}-{version}.data/scripts/rivet", data, 0o755),
+        (f"{dist}/__init__.py", RIVET_CLI_MODULE.format(version=version).encode(), 0o644),
+        (
+            f"{info}/METADATA",
+            f"Metadata-Version: 2.1\nName: rivet-cli\nVersion: {version}\nRequires-Python: >=3.8\n".encode(),
+            0o644,
+        ),
+        (
+            f"{info}/WHEEL",
+            f"Wheel-Version: 1.0\nGenerator: airflow-provider-rivet gate\nRoot-Is-Purelib: false\nTag: py3-none-{platform}\n".encode(),
+            0o644,
+        ),
+        (f"{info}/top_level.txt", f"{dist}\n".encode(), 0o644),
+    ]
+    record = (
+        "".join(
+            f"{name},sha256={base64.urlsafe_b64encode(hashlib.sha256(body).digest()).rstrip(b'=').decode()},{len(body)}\n"
+            for name, body, _ in files
+        )
+        + f"{info}/RECORD,,\n"
+    )
+    files.append((f"{info}/RECORD", record.encode(), 0o644))
+    path = out / f"{dist}-{version}-py3-none-{platform}.whl"
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+        for name, body, mode in files:
+            entry = zipfile.ZipInfo(name, date_time=(2026, 1, 1, 0, 0, 0))
+            entry.external_attr = (0o100000 | mode) << 16
+            entry.compress_type = zipfile.ZIP_DEFLATED
+            z.writestr(entry, body)
+    path.write_bytes(buf.getvalue())
+    return path
+
+
 SOURCE_DSN = "host=127.0.0.1 port={port} dbname=rivet user=rivet password={password}"
 #: Where a mounted credential sits in the containers: the path Google's default chain (and rivet's) reads under HOME.
 ADC_IN_CONTAINER = "/home/airflow/.config/gcloud/application_default_credentials.json"
@@ -31,9 +120,21 @@ CELERY_APP = "airflow.providers.celery.executors.celery_executor.app"
 #: Where the source legs keep rivet's state: `gate` (the gate's own TLS PostgreSQL, `gate-state`) or `compose-postgres`
 #: (the client's: a database of its own, owned by a role of its own, on the compose file's `postgres` server, beside
 #: Airflow's metadata database `airflow`).
-STATE_PLACES = ("gate", "compose-postgres")
+STATE_PLACES = ("gate", "compose-postgres", "client-override")
 COMPOSE_STATE_ROLE = "rivet_state"
 METASTORE_DB = "airflow"
+#: `client-override`: the client's own compose files on top of the official one (`--client-override <dir>`): its
+#: state server `rivet-state` (postgres:16, its own volume, no port, no TLS), its `rivet_state` Connection (an
+#: AIRFLOW_CONN_* JSON variable) and its state_dir mount, as delivered. The gate supplies the variables they read.
+RIVET_SERVICE = "rivet-state"
+CLIENT_FILES = ("docker-compose.rivet.yml", "Dockerfile.rivet", "env.rivet.example", "README.md")
+CLIENT_STATE_USER = "rivet"
+CLIENT_STATE_DB = "rivet_state"
+CLIENT_STATE_CONN = "rivet_state"
+#: The client's state_dir of its MySQL stream (its README, step 6), under its mount.
+CLIENT_CDC_STATE_SUB = "mysql"
+#: The client's state_dir mount (the source legs' state_dirs live under it in `client-override`).
+CLIENT_STATE_ROOT = "/opt/airflow/rivet-state"
 #: The queues of the multi-host leg; each task of its DAGs names one, and the gate moves a queue between the workers.
 GATE_QUEUES = ("gate_a", "gate_b", "gate_cdc")
 
@@ -94,6 +195,15 @@ class Flavor:
 
 
 FLAVORS = {
+    # The client's Airflow: the official 2.10.2 compose file (Python 3.12, Debian 12).
+    "2.10.2": Flavor(
+        "2.10.2",
+        "/api/v1",
+        "airflow-webserver",
+        "/health",
+        ("airflow-webserver", "airflow-scheduler", "airflow-worker", "airflow-triggerer", "airflow-init", "airflow-cli"),
+        "db+postgresql",
+    ),
     "2.10.5": Flavor(
         "2.10.5",
         "/api/v1",
@@ -133,10 +243,13 @@ x-rivet: &rivet
     GATE_SOURCES: '{sources}'
     GATE_WORKERS: '{workers}'
     GATE_DESTINATIONS: '{destinations}'
-{backend}  env_file: [gate-connections.env]
+    GATE_SOURCE_STATE_ROOT: '{source_state_root}'
+    GATE_GCP_AUTH: '{gcp_auth}'
+    GATE_CLIENT_OVERRIDE: '{client}'
+{gcp_env}{backend}  env_file: [gate-connections.env]
   volumes:
     - {rivet_dir}:/opt/rivet
-{adc}services:
+{extra_volumes}{adc}services:
 {services}
   postgres:
     environment: {{ POSTGRES_PASSWORD: {metastore} }}
@@ -213,12 +326,21 @@ class Stand:
         destinations: tuple[Any, ...] = (),
         state_place: str = "gate",
         migrate_from: Path | None = None,
+        gcp_key_file: Path | None = None,
+        client_override: Path | None = None,
     ) -> None:
         self.flavor = FLAVORS[version]
+        #: The client's delivered compose files (`--client-override`): the stack runs them as delivered, on top of the
+        #: official file; the gate's overlay goes on top of both.
+        self.client_override = client_override
+        if client_override is not None:
+            state_place = "client-override"
         if state_place not in STATE_PLACES:
             raise ValueError(f"state place {state_place!r}: one of {STATE_PLACES}")
         #: Where the source legs' configs keep rivet's state (`STATE_PLACES`).
         self.state_place = state_place
+        #: `--gcp-auth env-file`: the GCP key every container reads at GCP_KEY_IN_CONTAINER (GOOGLE_APPLICATION_CREDENTIALS).
+        self.gcp_key_file = gcp_key_file
         #: rivet 0.32.1 for the migration leg (gate/migrate.py), mounted at /opt/rivet/bin/rivet-0.32.1.
         self.migrate_from = migrate_from
         #: 1: one Celery worker on the shared volume; 2: the multi-host leg, two workers with a disk each.
@@ -229,7 +351,9 @@ class Stand:
         self.dir = work / f"airflow-{version}"
         self.rivet_dir = self.dir / "rivet"
         self.project = f"rivet-gate-af{version.replace('.', '')}-{self.tag}"
-        self.image = f"rivet-gate-airflow:{version}-{self.tag}"
+        #: The gate's own image of this run: the client's (`Dockerfile.rivet`'s install from local wheels) in
+        #: `client-override`, which its compose file reads as RIVET_AIRFLOW_IMAGE.
+        self.image = f"rivet-gate-{'client' if client_override else 'airflow'}:{version}-{self.tag}"
         self.ui_port = 0
         self.source_dsn = ""
         self.clickhouse_port = 0
@@ -269,8 +393,12 @@ class Stand:
             **{e.conn_id: e.connection(self.secrets) for e in self.sources},
             # A database of its own per config of a source leg: SQL Server's init names its CDC exports after their
             # tables, as the batch ones, and an export's state is keyed by its name and source (one state, one name).
+            # Under `client-override` the MySQL stream reads the client's own `rivet_state` (its compose file defines it).
             **{
-                state_conn_id(e.name, kind): self.leg_state_conn(state_db(e.name, kind)) for e in self.sources for kind in e.kinds
+                state_conn_id(e.name, kind): self.leg_state_conn(state_db(e.name, kind))
+                for e in self.sources
+                for kind in e.kinds
+                if self.leg_db(e.name, kind) == state_db(e.name, kind)
             },
             **(
                 {
@@ -323,8 +451,8 @@ class Stand:
 
     def leg_state_sql(self, db: str, sql: str) -> str:
         """Read a source leg config's state database (the gate's state server, or the compose `postgres` as its owner)."""
-        if self.state_place == "compose-postgres":
-            return self.metastore_sql(db, sql)
+        if self.state_place in ("compose-postgres", "client-override"):
+            return self.state_admin_sql(db, sql)
         return self.psql("gate-state", db, sql)
 
     @property
@@ -344,10 +472,22 @@ class Stand:
 
     def compose(self, *args: str, extra_env: dict[str, str] | None = None, **kw: Any) -> subprocess.CompletedProcess:
         """`docker compose` on this stack's project; `extra_env` reaches `exec -e NAME` without a value on any argv."""
-        files = ["-f", str(self.dir / "docker-compose.yaml"), "-f", str(self.dir / "docker-compose.gate.yaml")]
+        client = ["-f", str(self.dir / "docker-compose.rivet.yml")] if self.client_override else []
+        files = ["-f", str(self.dir / "docker-compose.yaml"), *client, "-f", str(self.dir / "docker-compose.gate.yaml")]
         env = {
             **os.environ,
             **(extra_env or {}),
+            # What the client's compose file reads (its env.rivet.example), and its image as the gate built it.
+            **(
+                {
+                    "RIVET_STATE_USER": CLIENT_STATE_USER,
+                    "RIVET_STATE_PASSWORD": self.secrets.compose_state,
+                    "RIVET_STATE_DB": CLIENT_STATE_DB,
+                    "RIVET_AIRFLOW_IMAGE": self.image,
+                }
+                if self.client_override
+                else {}
+            ),
             "AIRFLOW_UID": str(os.getuid()),
             "AIRFLOW_PROJ_DIR": str(self.dir),
             "_AIRFLOW_WWW_USER_PASSWORD": self.secrets.admin,
@@ -357,6 +497,13 @@ class Stand:
     def build(self) -> None:
         """The Airflow image with the rivet binary under test and this provider."""
         ctx = self.dir / "image"
+        if self.client_override:
+            # The client's Dockerfile.rivet, its pins taken from the local wheels (rivet-cli 0.32.2 and the provider are
+            # not on PyPI yet): Dockerfile.client does what it does, with `pip install <wheels>` for the two pins.
+            sh(["docker", "build", "-q", "-t", self.image, "--build-arg", f"AIRFLOW_BASE_IMAGE=apache/airflow:{self.flavor.version}",
+                "--build-arg", f"AIRFLOW_VERSION={self.flavor.version}", "-f", str(HERE / "stand" / "Dockerfile.client"), str(ctx)],
+               timeout=1800)  # fmt: skip
+            return
         shutil.copy2(self.rivet_bin, ctx / "rivet")
         for name in PACKAGE_FILES:
             src = REPO / name
@@ -403,6 +550,8 @@ class Stand:
             for sub in HOST_DIRS:
                 (self.host_disk(host) / sub).mkdir(parents=True)
         shutil.copy2(HERE / "stand" / "dags" / "rivet_gate.py", self.dir / "dags" / "rivet_gate.py")
+        if self.client_override is not None:
+            self.lay_out_client()
         if self.migrate_from:
             # The previous release the migration leg starts on, in the mount every container has (/opt/rivet/bin).
             (self.rivet_dir / "bin").mkdir(parents=True, exist_ok=True)
@@ -425,6 +574,29 @@ class Stand:
             services += "".join(self.worker_yaml(host) for host in self.hosts)
         write_private(self.dir / "docker-compose.gate.yaml", self.overlay(services))
         write_env_file(self.dir / "gate-connections.env", self.connection_variables())
+
+    def lay_out_client(self) -> None:
+        """The client's files, copied as delivered (their sha256 kept for the `as-delivered` cell), and the build
+        context of its image: `rivet-cli` (the binary under test, laid out as rivet's own wheel) and this provider's
+        wheel, which `Dockerfile.rivet` would take from PyPI."""
+        assert self.client_override is not None
+        self.client_files = {}
+        for name in CLIENT_FILES:
+            shutil.copy2(self.client_override / name, self.dir / name)
+            self.client_files[name] = hashlib.sha256((self.dir / name).read_bytes()).hexdigest()
+        (self.dir / "rivet-state").mkdir(parents=True, exist_ok=True)
+        out = self.dir / "image" / "wheels"
+        out.mkdir(parents=True, exist_ok=True)
+        shown = sh(["docker", "run", "--rm", "--entrypoint", "/rivet", "-v", f"{self.rivet_bin}:/rivet:ro",
+                    f"apache/airflow:{self.flavor.version}", "--version"]).stdout  # fmt: skip
+        cli = rivet_cli_wheel(self.rivet_bin, rivet_version(shown), out)
+        sh(["uv", "build", "--wheel", "--out-dir", str(out), str(REPO)], timeout=600)
+        provider = sorted(out.glob("airflow_provider_rivet-*.whl"))
+        if len(provider) != 1:
+            raise RuntimeError(f"uv build left {provider} in {out}, expected one provider wheel")
+        print(
+            f"CLIENT image {self.image}: {cli.name} {provider[0].name} ({shown.strip()}); files {self.client_files}", flush=True
+        )
 
     def worker_yaml(self, host: str) -> str:
         """One host of the multi-host leg: a Celery worker with its own hostname, its own disk at HOST_DISK, and the
@@ -456,6 +628,17 @@ class Stand:
             adc=adc,
             result_backend=self.flavor.result_backend,
             workers=self.workers,
+            source_state_root=self.source_state_root,
+            gcp_auth="env-file" if self.gcp_key_file else "",
+            # The client's compose sets it itself; the gate sets it only for its own stacks.
+            gcp_env=(
+                f"    GOOGLE_APPLICATION_CREDENTIALS: {GCP_KEY_IN_CONTAINER}\n"
+                if self.gcp_key_file and not self.client_override
+                else ""
+            ),
+            client="1" if self.client_override else "",
+            # The key file the client's compose names but does not mount (the client's prod file mounts it).
+            extra_volumes=f"    - {self.gcp_key_file}:{GCP_KEY_IN_CONTAINER}:ro\n" if self.gcp_key_file else "",
             **vars(self.secrets),
         )
 
@@ -498,14 +681,38 @@ class Stand:
         """A PostgreSQL state of the stack as `rivet init` reads it inside the stack's network (the Connection of `db`)."""
         return f"postgresql://rivet:{self.secrets.state}@gate-state:5432/{db}?sslmode=require"
 
+    @property
+    def source_state_root(self) -> str:
+        """Where the source legs' state_dirs are in the containers: the client's mount in `client-override`."""
+        return CLIENT_STATE_ROOT if self.client_override else "/opt/rivet/state"
+
+    @property
+    def source_state_host(self) -> Path:
+        """The same place on this host (bind-mounted)."""
+        return self.dir / "rivet-state" if self.client_override else self.rivet_dir / "state"
+
+    def leg_db(self, engine: str, kind: str) -> str:
+        """The state database of a source leg's config: the client's own `rivet_state` for the MySQL stream under
+        `client-override` (its `rivet_state` Connection), else one of the gate's per config."""
+        if self.client_override and (engine, kind) == ("mysql", "cdc"):
+            return CLIENT_STATE_DB
+        return state_db(engine, kind)
+
+    def leg_state_sub(self, engine: str, kind: str) -> str:
+        """The state_dir of a source leg's config under the source state root (the client's `mysql` for its stream)."""
+        if self.client_override and (engine, kind) == ("mysql", "cdc"):
+            return CLIENT_CDC_STATE_SUB
+        return f"{engine}_{kind}"
+
     def leg_state_conn(self, db: str) -> dict[str, Any]:
         """The Connection of a source leg config's state database, where `state_place` puts it."""
-        if self.state_place == "compose-postgres":
+        if self.state_place in ("compose-postgres", "client-override"):
+            client = self.state_place == "client-override"
             return {
                 "conn_type": "postgres",
-                "host": "postgres",
+                "host": RIVET_SERVICE if client else "postgres",
                 "port": 5432,
-                "login": COMPOSE_STATE_ROLE,
+                "login": CLIENT_STATE_USER if client else COMPOSE_STATE_ROLE,
                 "password": self.secrets.compose_state,
                 "schema": db,
                 # The compose `postgres` has no TLS: rivet refuses a remote state URL without an `sslmode`
@@ -524,6 +731,8 @@ class Stand:
 
     def leg_state_url(self, db: str) -> str:
         """A source leg config's state as `rivet init` reads it inside the stack's network (its Connection's URL)."""
+        if self.state_place == "client-override":
+            return f"postgresql://{CLIENT_STATE_USER}:{self.secrets.compose_state}@{RIVET_SERVICE}:5432/{db}?sslmode=disable"
         if self.state_place == "compose-postgres":
             return f"postgresql://{COMPOSE_STATE_ROLE}:{self.secrets.compose_state}@postgres:5432/{db}?sslmode=disable"
         return self.state_url(db)
@@ -531,16 +740,32 @@ class Stand:
     def make_leg_state_db(self, db: str) -> None:
         """Create a source leg config's state database: on `gate-state`, or on the compose `postgres` server owned by the
         role `rivet_state` (made once, LOGIN, its own password; the statement goes in on stdin, never on an argv)."""
-        if self.state_place != "compose-postgres":
+        if self.state_place == "gate":
             self.psql("gate-state", "rivet_state", f"CREATE DATABASE {db};")
             return
+        if self.state_place == "client-override":
+            # The client's server makes its own database (POSTGRES_DB); the gate's other configs get one each beside it,
+            # owned by the client's user (the server's superuser, as its compose file makes it).
+            if db != CLIENT_STATE_DB:
+                self.state_admin_sql(None, f"CREATE DATABASE {db};")
+            return
         role, password = COMPOSE_STATE_ROLE, self.secrets.compose_state
-        self.metastore_sql(
-            METASTORE_DB,
+        self.state_admin_sql(
+            None,
             f"DO $$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = '{role}') THEN "
             f"CREATE ROLE {role} LOGIN PASSWORD '{password}'; END IF; END $$;",
         )
-        self.metastore_sql(METASTORE_DB, f"CREATE DATABASE {db} OWNER {role};")
+        self.state_admin_sql(None, f"CREATE DATABASE {db} OWNER {role};")
+
+    def state_admin_sql(self, db: str | None, sql: str) -> str:
+        """SQL as the superuser of the source legs' state server: Airflow's `postgres` (`airflow`), or the client's own
+        `rivet-state` (its `RIVET_STATE_USER`); `db` None: the server's own database."""
+        if self.state_place == "client-override":
+            return self.compose(
+                "exec", "-T", RIVET_SERVICE, "psql", "-v", "ON_ERROR_STOP=1", "-At", "-U", CLIENT_STATE_USER,
+                "-d", db or CLIENT_STATE_DB, input=sql,
+            ).stdout  # fmt: skip
+        return self.metastore_sql(db or METASTORE_DB, sql)
 
     def metastore_sql(self, db: str, sql: str) -> str:
         """SQL on the compose file's `postgres` server as its superuser `airflow` (setup and the placement oracle)."""

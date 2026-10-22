@@ -200,9 +200,9 @@ def test_the_hot_dag_runs_the_streams_tasks_on_its_config_and_state(tmp_path: Pa
     assert leg.shared_dag == "gate_src_mysql_cdc_shared" and "gate_src_mysql_cdc_shared" not in leg.cycle_tasks()
     dag = (Path(sources.__file__).parent / "stand" / "dags" / "rivet_gate.py").read_text()
     block = dag[dag.index('hot = shape.get("hot")') : dag.index("# Destination legs")]
-    assert '"RIVET_TEST_PAUSE_AT": hot["pause"]' in block and 'state_dir=f"{ROOT}/state/{engine}_cdc"' in block
+    assert '"RIVET_TEST_PAUSE_AT": hot["pause"]' in block and 'state_dir=leg_state_dir(engine, "cdc")' in block
     shared = dag[dag.index('shared = shape.get("shared")') : dag.index("# Destination legs")]
-    assert 'state_dir=f"{ROOT}/state/{engine}_cdc"' in shared and 'config=shared["config"]' in shared
+    assert 'state_dir=leg_state_dir(engine, "cdc")' in shared and 'config=shared["config"]' in shared
 
 
 def test_the_rows_each_task_moved_come_from_what_the_gate_did(tmp_path: Path, monkeypatch) -> None:

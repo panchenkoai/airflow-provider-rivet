@@ -130,8 +130,10 @@ def connections(cloud: Cloud, clickhouse_password: str) -> dict[str, dict[str, A
     """The warehouse leg's Connections by conn_id: GCP (GCS + BigQuery), Snowflake, ClickHouse."""
     sf = snow_login(cloud.sf_connection)
     key = Path(sf["private_key_file"]).expanduser().read_text()
+    # `env-file` (the client's): no GCP Connection at all; rivet reads GOOGLE_APPLICATION_CREDENTIALS from the env.
+    gcp = {} if cloud.gcp_auth == "env-file" else {"gate_gcp": gcp_connection(cloud)}
     return {
-        "gate_gcp": gcp_connection(cloud),
+        **gcp,
         "gate_snowflake": {
             "conn_type": "snowflake",
             "login": sf["user"],

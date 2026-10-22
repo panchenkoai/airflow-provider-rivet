@@ -62,6 +62,13 @@ def main(argv: list[str] | None = None) -> int:
         "role of its own on the compose file's `postgres` server, beside Airflow's metadata database",
     )
     ap.add_argument(
+        "--client-override",
+        type=Path,
+        help="the client's delivered compose files (docker-compose.rivet.yml, Dockerfile.rivet, env.rivet.example, "
+        "README.md): run them as delivered on top of the official file (--airflow 2.10.2, --sources mysql); implies "
+        "--gcp-auth env-file",
+    )
+    ap.add_argument(
         "--migrate-from",
         type=Path,
         help="rivet 0.32.1 (Linux): the migration leg, a MySQL CDC stream on SQLite state under it, carried to PostgreSQL "
@@ -93,10 +100,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument(
         "--gcp-auth",
-        choices=["key", "adc"],
+        choices=["key", "adc", "env-file"],
         default="key",
         help="key: gate_gcp carries the credential; adc: gate_gcp holds only `project`, and rivet runs as the "
-        "containers' identity (--gcp-keyfile mounted read-only where Google's default chain looks)",
+        "containers' identity (--gcp-keyfile mounted read-only where Google's default chain looks); env-file (the "
+        "client's): no GCP Connection, --gcp-keyfile mounted read-only at /etc/gcloud_cred.json and named by "
+        "GOOGLE_APPLICATION_CREDENTIALS, the DAGs pass it with cloud_credentials=['gcp']",
     )
     ap.add_argument(
         "--gsm-reader",
@@ -125,6 +134,10 @@ def main(argv: list[str] | None = None) -> int:
     engines = tuple(e for e in args.sources.split(",") if e)
     if set(engines) - set(sources.ENGINES):
         ap.error(f"unknown source(s) {sorted(set(engines) - set(sources.ENGINES))}; known: {list(sources.ENGINES)}")
+    if args.client_override:
+        if versions != ["2.10.2"] or "mysql" not in engines:
+            ap.error("--client-override runs the client's stack: --airflow 2.10.2 and --sources with mysql")
+        args.gcp_auth = "env-file"  # the client's: GOOGLE_APPLICATION_CREDENTIALS, no GCP Connection
     if args.migrate_from and "mysql" not in engines:
         ap.error("--migrate-from runs beside the MySQL source leg: pass --sources with mysql")
     if args.state != "gate" and not engines:
@@ -179,6 +192,8 @@ def main(argv: list[str] | None = None) -> int:
             secrets_backend=cloud.secrets_backend(version) if gsm else None,
             # The secrets backend and a keyless gate_gcp both run as the containers' identity: this file, read-only.
             adc=cloud.keyfile.resolve() if cloud and (gsm or cloud.gcp_auth == "adc") else None,
+            gcp_key_file=cloud.keyfile.resolve() if cloud and cloud.gcp_auth == "env-file" else None,
+            client_override=args.client_override.resolve() if args.client_override else None,
             sources=sources.engines(engines),
             destinations=tuple(destinations.legs(dests)),
             workers=args.workers,

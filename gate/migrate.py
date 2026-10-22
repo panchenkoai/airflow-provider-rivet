@@ -41,12 +41,13 @@ STATE_CONN = state_conn_id(ENGINE, "mig")
 OLD_BIN = "/opt/rivet/bin/rivet-0.32.1"
 CONFIG_DIR = "/opt/rivet/configs/mysql_mig"
 INIT_DIR = "/opt/rivet/configs/mysql_mig_init"
-STATE_DIR = "/opt/rivet/state/mysql_mig"
+#: The state_dirs, under the source legs' state root (`Stand.source_state_root`).
+STATE_SUB = "mysql_mig"
 DAGS = {"sqlite": "gate_mig_mysql_sqlite", "pg": "gate_mig_mysql_pg", "back": "gate_mig_mysql_back"}
 #: The incremental batch pipeline of the same tables, migrated the same way (its own config, state_dir and state).
 B_STATE_DB = state_db(ENGINE, "migb")
 B_STATE_CONN = state_conn_id(ENGINE, "migb")
-B_STATE_DIR = "/opt/rivet/state/mysql_migb"
+B_STATE_SUB = "mysql_migb"
 B_DAGS = {"sqlite": "gate_migb_mysql_sqlite", "pg": "gate_migb_mysql_pg", "back": "gate_migb_mysql_back"}
 #: The batch steps: updates and inserts only (an incremental extract cannot see a delete), after the stream's steps.
 B_STEPS: dict[str, tuple[str, int]] = {
@@ -204,6 +205,9 @@ class Migration:
         self.b_dataset = f"{src.cloud.dataset(src.stack)}_mysqlmig_batch"
         self.stream: dict[str, Any] = {}
         self.b_exports: list[str] = []
+        #: The state_dirs in the containers (set by `prepare`, under the stand's source state root).
+        self.state_dir = f"/opt/rivet/state/{STATE_SUB}"
+        self.b_state_dir = f"/opt/rivet/state/{B_STATE_SUB}"
         self.commands: list[str] = []
 
     def command(self, text: str) -> None:
@@ -227,7 +231,10 @@ class Migration:
             f"--location={self.src.cloud.location}", "mk", "-f", "--dataset", f"{self.src.cloud.project}:{self.dataset}"
         )
         stand.make_leg_state_db(STATE_DB)
-        for sub in ("configs/mysql_mig", "configs/mysql_mig_init", "state/mysql_mig"):
+        self.state_dir = f"{stand.source_state_root}/{STATE_SUB}"
+        self.b_state_dir = f"{stand.source_state_root}/{B_STATE_SUB}"
+        (stand.source_state_host / STATE_SUB).mkdir(parents=True, exist_ok=True)
+        for sub in ("configs/mysql_mig", "configs/mysql_mig_init"):
             (stand.rivet_dir / sub).mkdir(parents=True, exist_ok=True)
         argv = [
             OLD_BIN, "init", "--source-env", URL_ENV, "--tls", "disable", "--mode", "cdc", "--gcs-bucket", self.bucket,
@@ -249,9 +256,9 @@ class Migration:
             raise ValueError(f"rivet 0.32.1's init wrote streams {streams}, expected one")
         self.stream = streams[0]
         self.b_exports = self.prepare_batch(stand)
-        shape = {"config": f"{CONFIG_DIR}/rivet.yaml", "state_dir": STATE_DIR, "stream": self.stream, "dags": DAGS,
+        shape = {"config": f"{CONFIG_DIR}/rivet.yaml", "state_dir": self.state_dir, "stream": self.stream, "dags": DAGS,
                  "old_bin": OLD_BIN, "url_env": URL_ENV, "conn": CONN, "state_conn": STATE_CONN,
-                 "batch": {"config": f"{B_STATE_DIR}/rivet.yaml", "state_dir": B_STATE_DIR, "exports": self.b_exports,
+                 "batch": {"config": f"{self.b_state_dir}/rivet.yaml", "state_dir": self.b_state_dir, "exports": self.b_exports,
                            "dags": B_DAGS, "state_conn": B_STATE_CONN}}  # fmt: skip
         (stand.rivet_dir / "configs" / "mysql_migrate.json").write_text(json.dumps(shape))
 
@@ -265,11 +272,11 @@ class Migration:
             f"--location={self.src.cloud.location}", "mk", "-f", "--dataset", f"{self.src.cloud.project}:{self.b_dataset}"
         )
         stand.make_leg_state_db(B_STATE_DB)
-        (stand.rivet_dir / "state" / "mysql_migb").mkdir(parents=True, exist_ok=True)
+        (stand.source_state_host / B_STATE_SUB).mkdir(parents=True, exist_ok=True)
         argv = [
             OLD_BIN, "init", "--source-env", URL_ENV, "--tls", "disable", "--mode", "incremental", "--gcs-bucket", self.b_bucket,
             "--bigquery-project", self.src.cloud.project, "--bigquery-dataset", self.b_dataset,
-            "--include", *TABLES, "-o", f"{B_STATE_DIR}/rivet.yaml",
+            "--include", *TABLES, "-o", f"{self.b_state_dir}/rivet.yaml",
         ]  # fmt: skip
         # Into the state_dir itself: 0.32.1 keeps SQLite beside -o, and init records the `query:` exports' primary keys
         # there, which their loads need (`pk: auto`); the provider then runs that file as it is (no copy). Live: written
@@ -277,7 +284,7 @@ class Migration:
         self.command(f"(batch) {URL_ENV}=<mysql url> " + " ".join(argv))
         stand.compose("exec", "-T", "-e", URL_ENV, "-e", "RIVET_STATE_URL", "airflow-worker", *argv,
                       extra_env={URL_ENV: self.url(stand), "RIVET_STATE_URL": ""})  # fmt: skip
-        text = (stand.rivet_dir / "state" / "mysql_migb" / "rivet.yaml").read_text()
+        text = (stand.source_state_host / B_STATE_SUB / "rivet.yaml").read_text()
         print(f"INIT mysql migrate batch (rivet 0.32.1) config:\n{text}", flush=True)
         exports = read_config(text, list(TABLES))["exports"]
         if sorted(exports) != sorted(TABLES):
@@ -287,6 +294,10 @@ class Migration:
     @property
     def b_tasks(self) -> list[str]:
         return [f"{g}.{e}" for e in self.b_exports for g in ("apply", "load", "compact")]
+
+    def shown_url(self, stand: Any, db: str) -> str:
+        """The state URL as a client writes it, the password left out."""
+        return stand.leg_state_url(db).replace(stand.secrets.compose_state, "<password>")
 
     def url(self, stand: Any) -> str:
         """The URL init and `rivet state copy` read the migration database with (inside the stack's network)."""
@@ -328,7 +339,9 @@ class Migration:
         }
 
     def sqlite_state(self, stand: Any) -> dict[str, Any]:
-        out = stand.compose("exec", "-T", "airflow-worker", "python", "-c", READ_SQLITE, f"{STATE_DIR}/.rivet_state.db").stdout
+        out = stand.compose(
+            "exec", "-T", "airflow-worker", "python", "-c", READ_SQLITE, f"{self.state_dir}/.rivet_state.db"
+        ).stdout
         return json.loads(out)
 
     def pg_state(self, stand: Any) -> dict[str, Any]:
@@ -345,7 +358,7 @@ class Migration:
         return {"counts": counts, "cursors": cursors}
 
     def checkpoints(self, stand: Any) -> dict[str, str]:
-        return fingerprints(stand.rivet_dir / "state" / "mysql_mig")
+        return fingerprints(stand.source_state_host / STATE_SUB)
 
     # --- the steps ---
 
@@ -391,7 +404,7 @@ class Migration:
         """SQLite under 0.32.1 for two runs, the copy, PostgreSQL under this binary for two runs (changes made before and
         after the switch), then the way back measured."""
         self.command(f"DAG {DAGS['sqlite']}: rivet_bin={OLD_BIN}, env RIVET_STATE_URL='' (SQLite beside the config copy in "
-                     f"{STATE_DIR}), single_host=True, state_dir={STATE_DIR}")  # fmt: skip
+                     f"{self.state_dir}), single_host=True, state_dir={self.state_dir}")  # fmt: skip
         self.run(stand, v, wait_runs, "sqlite-1", DAGS["sqlite"], None)
         sql, ops = STEPS["sqlite-2"]
         self.sql(stand, sql)
@@ -401,15 +414,13 @@ class Migration:
         print(f"MIGRATE SQLite state {json.dumps(sqlite)}; checkpoints {ckpt}", flush=True)
         before_sql, before_ops = STEPS["before-switch"]
         self.sql(stand, before_sql)
-        names = sorted(p.name for p in (stand.rivet_dir / "state" / "mysql_mig").glob("rivet.*.yaml"))
+        names = sorted(p.name for p in (stand.source_state_host / STATE_SUB).glob("rivet.*.yaml"))
         copies = full_copies(names)
         if len(copies) != 1:
             v.grade("migrate/mysql/cdc/state-copy", [f"whole config copies in the state_dir: {copies} of {names}, expected one"])
             return
-        argv = ["rivet", "state", "copy", "-c", f"{STATE_DIR}/{copies[0]}"]
-        self.command(
-            f"RIVET_STATE_URL=postgresql://rivet_state:<password>@postgres:5432/{STATE_DB}?sslmode=disable {' '.join(argv)}"
-        )
+        argv = ["rivet", "state", "copy", "-c", f"{self.state_dir}/{copies[0]}"]
+        self.command(f"RIVET_STATE_URL={self.shown_url(stand, STATE_DB)} {' '.join(argv)}")
         done = stand.compose("exec", "-T", "-e", "RIVET_STATE_URL", "-e", URL_ENV, "airflow-worker", *argv, check=False,
                              extra_env={"RIVET_STATE_URL": stand.leg_state_url(STATE_DB), URL_ENV: self.url(stand)})  # fmt: skip
         said = ((done.stdout or "") + (done.stderr or "")).strip()
@@ -425,7 +436,7 @@ class Migration:
         v.check("migrate/mysql/cdc/checkpoint-untouched-by-copy", checkpoint_problems, ckpt, self.checkpoints(stand), "the copy",
                 ok=f"{sorted(ckpt)}")  # fmt: skip
         self.command(f"DAG {DAGS['pg']}: rivet_bin=rivet (main), env_from_connections RIVET_STATE_URL={STATE_CONN} "
-                     f"(postgresql://rivet_state:...@postgres:5432/{STATE_DB}?sslmode=disable), state_dir={STATE_DIR}")  # fmt: skip
+                     f"({self.shown_url(stand, STATE_DB)}), state_dir={self.state_dir}")  # fmt: skip
         after_sql, after_ops = STEPS["after-switch"]
         self.sql(stand, after_sql)
         held = self.checkpoints(stand)
@@ -469,7 +480,7 @@ class Migration:
         print(f"MEASURE wayback/mysql/cdc/staged-before: {len([o for o in before if o.endswith('.parquet')])} Parquet, "
               f"{len([o for o in before if o.endswith('.json')])} JSON object(s) in gs://{self.bucket}: {before[:40]}", flush=True)  # fmt: skip
         self.command(f"(the way back) DAG {DAGS['back']}: rivet_bin=rivet (main), env RIVET_STATE_URL='' (the SQLite "
-                     f"file the copy left), single_host=True, state_dir={STATE_DIR}")  # fmt: skip
+                     f"file the copy left), single_host=True, state_dir={self.state_dir}")  # fmt: skip
         dag, run_id = DAGS["back"], "gate_mig_back"
         stand.trigger(dag, run_id)
         state = wait_runs(stand, [dag], run_id).get(dag)
@@ -529,10 +540,8 @@ class Migration:
             self.sql(stand, sql)
             self.run_batch(stand, v, wait_runs, step, dag, rows)
         # The batch config is init's file in the state_dir itself: the SQLite state beside it is the one to copy.
-        argv = ["rivet", "state", "copy", "-c", f"{B_STATE_DIR}/rivet.yaml"]
-        self.command(
-            f"(batch) RIVET_STATE_URL=postgresql://rivet_state:<password>@postgres:5432/{B_STATE_DB}?sslmode=disable {' '.join(argv)}"
-        )
+        argv = ["rivet", "state", "copy", "-c", f"{self.b_state_dir}/rivet.yaml"]
+        self.command(f"(batch) RIVET_STATE_URL={self.shown_url(stand, B_STATE_DB)} {' '.join(argv)}")
         done = stand.compose("exec", "-T", "-e", "RIVET_STATE_URL", "-e", URL_ENV, "airflow-worker", *argv, check=False,
                              extra_env={"RIVET_STATE_URL": stand.leg_state_url(B_STATE_DB), URL_ENV: self.url(stand)})  # fmt: skip
         said = ((done.stdout or "") + (done.stderr or "")).strip()

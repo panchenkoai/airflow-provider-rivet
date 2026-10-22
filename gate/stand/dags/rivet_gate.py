@@ -50,6 +50,12 @@ for state in ("sqlite", "pg"):
 
 
 # The warehouse leg: GCS, then BigQuery / Snowflake / ClickHouse, every credential from a Connection.
+# `--gcp-auth env-file` (the client's): no GCP Connection; the key file the compose env names reaches rivet through
+# `cloud_credentials=["gcp"]` (GOOGLE_APPLICATION_CREDENTIALS and the other GOOGLE_* variables).
+ENV_KEY = os.environ.get("GATE_GCP_AUTH") == "env-file"
+# Where the source legs' state_dirs are: the client's own mount under `--state rivet-service`.
+SOURCE_STATE = os.environ.get("GATE_SOURCE_STATE_ROOT") or f"{ROOT}/state"
+GCP = {"cloud_credentials": ["gcp"]} if ENV_KEY else {"connections": ["gate_gcp"]}
 WAREHOUSE_CONNECTIONS = {
     "bigquery": ["gate_gcp"],
     "snowflake": ["gate_gcp", "gate_snowflake"],
@@ -61,7 +67,8 @@ for wh in filter(None, os.environ.get("GATE_WAREHOUSES", "").split(",")):
         "env_from_connections": dict(SOURCE),
         "env": {"RIVET_STATE_URL": ""},
         "single_host": True,  # the stack's one state volume
-        "connections": WAREHOUSE_CONNECTIONS[wh],
+        "connections": [c for c in WAREHOUSE_CONNECTIONS[wh] if not (ENV_KEY and c == "gate_gcp")],
+        **({"cloud_credentials": ["gcp"]} if ENV_KEY else {}),
     }
     globals()[f"gate_wh_{wh}_batch"] = build_batch_dag(
         f"gate_wh_{wh}_batch",
@@ -83,15 +90,23 @@ for wh in filter(None, os.environ.get("GATE_WAREHOUSES", "").split(",")):
     )
 
 
+# `--client-override`: the client's own compose files; its MySQL stream reads the `rivet_state` Connection its compose
+# file defines (AIRFLOW_CONN_RIVET_STATE), from the state_dir its README names (step 6).
+CLIENT = os.environ.get("GATE_CLIENT_OVERRIDE") == "1"
+
+
 def leg_kwargs(engine: str, kind: str) -> dict:
     """The config's own PostgreSQL state: the one `rivet init` recorded the source's primary keys in."""
+    state = "rivet_state" if CLIENT and (engine, kind) == ("mysql", "cdc") else f"rivet_gate_state_{engine}_{kind}"
     return {
-        "env_from_connections": {
-            f"RIVET_GATE_{engine.upper()}_URL": f"rivet_gate_{engine}",
-            "RIVET_STATE_URL": f"rivet_gate_state_{engine}_{kind}",
-        },
-        "connections": ["gate_gcp"],
+        "env_from_connections": {f"RIVET_GATE_{engine.upper()}_URL": f"rivet_gate_{engine}", "RIVET_STATE_URL": state},
+        **GCP,
     }
+
+
+def leg_state_dir(engine: str, kind: str) -> str:
+    """The config's state_dir (the client's `<mount>/mysql` for its stream)."""
+    return f"{SOURCE_STATE}/mysql" if CLIENT and (engine, kind) == ("mysql", "cdc") else f"{SOURCE_STATE}/{engine}_{kind}"
 
 
 # Source legs (gate/sources.py): another engine to GCS and BigQuery, on the configs `rivet init` wrote; the export and
@@ -109,7 +124,7 @@ for engine in filter(None, os.environ.get("GATE_SOURCES", "").split(",")):
         globals()[f"gate_src_{engine}_batch"] = build_batch_dag(
             f"gate_src_{engine}_batch",
             config=f"{ROOT}/configs/{engine}_batch/rivet.yaml",
-            state_dir=f"{ROOT}/state/{engine}_batch",
+            state_dir=leg_state_dir(engine, "batch"),
             exports=batch,
             compact_exports=batch,
             operator_kwargs=leg_kwargs(engine, "batch"),
@@ -125,7 +140,7 @@ for engine in filter(None, os.environ.get("GATE_SOURCES", "").split(",")):
             config=cdc_config,
             export=stream["name"],
             tables=stream["tables"],
-            state_dir=f"{ROOT}/state/{engine}_cdc",
+            state_dir=leg_state_dir(engine, "cdc"),
             operator_kwargs=leg_kwargs(engine, "cdc"),
             tags=["rivet", "gate", "source", engine],
         )
@@ -140,7 +155,7 @@ for engine in filter(None, os.environ.get("GATE_SOURCES", "").split(",")):
             config=cdc_config,
             export=hot["stream"]["name"],
             tables=hot["stream"]["tables"],
-            state_dir=f"{ROOT}/state/{engine}_cdc",
+            state_dir=leg_state_dir(engine, "cdc"),
             operator_kwargs=hot_kwargs,
             tags=["rivet", "gate", "source", engine],
         )
@@ -155,7 +170,7 @@ for engine in filter(None, os.environ.get("GATE_SOURCES", "").split(",")):
             config=cdc_config,
             export=overlap["stream"]["name"],
             tables=overlap["stream"]["tables"],
-            state_dir=f"{ROOT}/state/{engine}_cdc",
+            state_dir=leg_state_dir(engine, "cdc"),
             operator_kwargs={**leg_kwargs(engine, "cdc"), "lock_wait": overlap["lock_wait"]},
             default_args={"retries": 1, "retry_delay": timedelta(seconds=60)},
             tags=["rivet", "gate", "source", engine],
@@ -169,7 +184,7 @@ for engine in filter(None, os.environ.get("GATE_SOURCES", "").split(",")):
             config=shared["config"],
             export=shared["stream"]["name"],
             tables=shared["stream"]["tables"],
-            state_dir=f"{ROOT}/state/{engine}_cdc",
+            state_dir=leg_state_dir(engine, "cdc"),
             operator_kwargs=leg_kwargs(engine, "cdc"),
             tags=["rivet", "gate", "source", engine],
         )
@@ -291,7 +306,7 @@ if os.path.exists(f"{ROOT}/configs/mysql_migrate.json"):
             export=mig["stream"]["name"],
             tables=mig["stream"]["tables"],
             state_dir=mig["state_dir"],
-            operator_kwargs={**kwargs, "connections": ["gate_gcp"]},
+            operator_kwargs={**kwargs, **GCP},
             tags=["rivet", "gate", "migrate"],
         )
     # The incremental batch pipeline of the same tables, migrated the same way.
@@ -305,7 +320,7 @@ if os.path.exists(f"{ROOT}/configs/mysql_migrate.json"):
             state_dir=b["state_dir"],
             exports=b["exports"],
             compact_exports=b["exports"],
-            operator_kwargs={**kwargs, "connections": ["gate_gcp"]},
+            operator_kwargs={**kwargs, **GCP},
             tags=["rivet", "gate", "migrate"],
         )
 
