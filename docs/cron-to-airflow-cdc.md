@@ -85,16 +85,42 @@ mkdir -p "rivet-state/$name" && sudo chown -R "${AIRFLOW_UID}:0" "rivet-state/$n
 - A Connection with the same id in a secrets backend wins over these: Airflow asks the backend first.
 - `--conn-schema` is the MySQL database; here it has the source's name.
 
-## 2. Stop cron
+## 2. Stop cron, and find its folder and config
 
 Comment out the rivet line in the crontab and wait until `pgrep -x rivet` prints nothing. If cron and Airflow both
 ran the stream, each would read the binlog from the same position and every change would arrive twice.
+
+The commented line names the two things the next steps need: the folder cron runs rivet in and the config it passes.
+Set them in the shell you run the rest of the steps in:
+
+```bash
+crontab -l | grep rivet
+# e.g.  # 0 */2 * * * cd /srv/elt/shop && rivet run -c cdc.yaml
+CRON_DIR=/srv/elt/shop    # the folder after `cd`
+CONFIG=cdc.yaml           # the file after `-c` / `--config`
+ls -la "$CRON_DIR"        # $CONFIG, .rivet_state.db and the checkpoint's folder (cdc/)
+grep -nE 'url_env|url:|^[[:space:]]+checkpoint:|server_id:' "$CRON_DIR/$CONFIG"
+```
+
+With no `cd` and a full path after `-c`, `CRON_DIR` is that file's folder and `CONFIG` its name. If the line runs a
+script, the script holds both. No `.rivet_state.db` beside the config means the state lives elsewhere
+(`RIVET_STATE_URL` in cron's environment): this recipe does not cover that case.
+
+**Check the host now.** If the config says `url_env: <VAR>`, the MySQL address is not in the config but in cron's
+environment: find `<VAR>` in the crontab line or the script it runs, and read its `host:port/database`. Compare it with
+the Connection from step 1 (this prints no password):
+
+```bash
+$DC exec -T airflow-worker python -c "from airflow.hooks.base import BaseHook; c = BaseHook.get_connection('rivet_$name'); print(f'{c.host}:{c.port or 3306}/{c.schema}')" | tail -n 1
+```
+
+If the spelling differs, edit the Connection, not the cron config (step 1 explains why it matters).
 
 ## 3. Copy the cron folder
 
 ```bash
 mkdir -p rivet-state/migration-src
-cp -a /path/to/cron-folder "rivet-state/migration-src/$name"
+cp -a "$CRON_DIR" "rivet-state/migration-src/$name"
 sudo chown -R "${AIRFLOW_UID}:0" rivet-state/migration-src
 ```
 
@@ -104,7 +130,7 @@ keeps the old file as `.rivet_state.db.v31…`. The untouched original is the wa
 ## 4. Move the state, the checkpoint and the config
 
 ```bash
-cfg=/opt/airflow/rivet-state/migration-src/$name/<config>.yaml
+cfg=/opt/airflow/rivet-state/migration-src/$name/$CONFIG
 $DC exec -T airflow-worker bash -c "RIVET_STATE_URL=\"postgresql://\$RIVET_STATE_USER:\$RIVET_STATE_PASSWORD@rivet-state:5432/rivet_state_$name?sslmode=disable\" \
   rivet state copy -c $cfg"
 ```
@@ -117,7 +143,7 @@ checking each table's row count. The SQLite file is only read. It prints `copied
 a copy of the config in `state_dir`, so a relative path resolves there:
 
 ```bash
-grep -nE '^[[:space:]]+checkpoint:' "rivet-state/migration-src/$name/<config>.yaml"   # e.g. checkpoint: ./cdc/cdc.ckpt
+grep -nE '^[[:space:]]+checkpoint:' "rivet-state/migration-src/$name/$CONFIG"   # e.g. checkpoint: ./cdc/cdc.ckpt
 mkdir -p "rivet-state/$name/cdc"
 cp -a "rivet-state/migration-src/$name/cdc/cdc.ckpt" "rivet-state/$name/cdc/"   # the file name the grep printed
 sudo chown -R "${AIRFLOW_UID}:0" "rivet-state/$name"
@@ -130,7 +156,7 @@ Connection:
 
 ```bash
 mkdir -p dags/rivet
-sed -E 's/^([[:space:]]*)url_env:.*/\1url_env: RIVET_MYSQL_URL/' "rivet-state/migration-src/$name/<config>.yaml" > "dags/rivet/$name.yaml"
+sed -E 's/^([[:space:]]*)url_env:.*/\1url_env: RIVET_MYSQL_URL/' "rivet-state/migration-src/$name/$CONFIG" > "dags/rivet/$name.yaml"
 ```
 
 Never put the config inside `rivet-state/`, and keep no `cdc/` beside it in `dags/rivet/`: the checkpoint lives only
@@ -143,6 +169,12 @@ in `state_dir`.
 `cloud_credentials=["gcp"]` by the layout above. Copy it into `dags/`, then list the sources (`RIVET_EXAMPLE_SOURCES`,
 or edit `SOURCES`) and set the schedule to cron's. The scheduler and the worker read `RIVET_EXAMPLE_SOURCES` when
 they parse the file: after changing it in `.env`, run `$DC up -d` so they see it.
+
+List only the sources that already have `dags/rivet/<src>.yaml`, each once. The source name is the key every other
+name hangs on (Connections, state database, `state_dir`), so a missing config is fixed by moving or generating it,
+never by renaming another source's file. The example refuses both mistakes at parse, and `list-import-errors` below
+shows why: `no config for <src> …` or `sources listed twice: <src>`. A source cron never ran joins the list after its
+config is generated (below).
 
 A new DAG file is picked up by the scheduler within `dag_dir_list_interval` (5 minutes by default). `airflow dags
 list` and `airflow tasks list` parse the files themselves and show the DAG earlier, so they are no evidence that the
@@ -207,7 +239,8 @@ $DC exec -T -e RIVET_MYSQL_URL airflow-worker bash -c "cd /opt/airflow/dags/rive
 `--tls disable` writes `tls: { mode: disable }` in `source:`, for a MySQL reached without TLS; drop it for one with TLS.
 `init` names everything after the `-o` file: the checkpoint `./cdc/<src>_cdc.ckpt`, the stream's prefix `<src>/cdc/`
 and the `server_id`, so two sources on one server do not collide. Review the `load:` block, then add the source to the
-DAG's sources (step 5). Its first run reads the baseline.
+DAG's sources (step 5). Its first run reads the baseline: every captured table in full from the source, so unpause
+it in a quiet hour on a busy server.
 
 ## The way back
 
