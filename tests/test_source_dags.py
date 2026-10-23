@@ -1058,7 +1058,30 @@ def test_what_a_data_source_cannot_give_rivet_is_refused(tmp_path: Path, section
 def test_a_batch_dag_may_choose_init_s_mode_but_not_cdc(tmp_path: Path) -> None:
     op = init_operator(tmp_path, mode="batch", init_args=["--mode", "incremental"])
     assert op.init_args == ["--mode", "incremental"]
-    with pytest.raises(ValueError, match="may not ask for `--mode cdc` in a batch DAG"):
+    with pytest.raises(ValueError) as exc:
         init_operator(tmp_path, mode="batch", init_args=["--mode", "cdc"])
+    assert str(exc.value) == "init_args may not ask for `--mode cdc` in a batch DAG: use mode='cdc'"
     with pytest.raises(ValueError, match=r"may not set \['--mode'\]"):
         init_operator(tmp_path, mode="cdc", init_args=["--mode", "incremental"])
+
+
+@pytest.mark.parametrize("trusted", ["true", "Yes", "1"])
+def test_every_spelling_of_windows_sign_in_is_refused(tmp_path: Path, trusted: str) -> None:
+    path = write(tmp_path, f"[src]\nDriver = ODBC Driver 18 for SQL Server\nServer = ms1\nTrusted_Connection = {trusted}\n")
+    assert "signs in with Windows or Entra ID" in str(refusal(lambda: odbc_connection(path, "src")))
+
+
+def test_a_sql_server_data_source_without_a_server_has_no_host(tmp_path: Path) -> None:
+    from airflow_provider_rivet.connections import connection_url
+
+    conn = odbc_connection(write(tmp_path, "[src]\nDriver = ODBC Driver 18 for SQL Server\nUID = u\n"), "src")
+    assert conn.host is None
+    assert "has no host" in str(refusal(lambda: connection_url(conn)))
+
+
+def test_an_oracle_data_source_without_a_server_name_is_refused(tmp_path: Path) -> None:
+    path = write(tmp_path, "[src]\nDriver = Oracle 21 ODBC driver\nUserID = u\n")
+    assert str(refusal(lambda: odbc_connection(path, "src"))) == (
+        f"[RIVET_AIRFLOW_CONNECTION_UNSUPPORTED] ODBC data source [src] in {path} has no ServerName: write ServerName = "
+        "host:port/service"
+    )
