@@ -455,7 +455,7 @@ def odbc_connection(path: str, name: str) -> OdbcConnection | None:
 def _odbc_sqlserver(section: Mapping[str, str], values: dict[str, Any], where: str) -> None:
     """SQL Server's `Server`: `[tcp:]host[,port]`; a named instance (`host\\name`) and Windows or Entra sign-in are
     refused, since a rivet URL carries a host, a port and a password."""
-    if _yes(section.get("trusted_connection", "").strip()) or section.get("authentication", "").strip():
+    if _yes(section.get("trusted_connection")) or section.get("authentication"):  # configparser strips each value
         raise PreflightRefusal(
             UNSUPPORTED, f"{where} signs in with Windows or Entra ID; rivet signs in with a SQL login: set UID and PWD"
         )
