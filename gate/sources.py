@@ -867,6 +867,8 @@ class SourceLeg:
                 )
             if self.engine.ops:
                 for kind, text in sorted(self.texts.items()):
+                    if kind not in self.delta_kinds():
+                        continue
                     v.check(
                         f"{name}/{self.engine.name}/{kind}/load-block-as-written",
                         load_block_problems,
@@ -903,6 +905,10 @@ class SourceLeg:
     def kept_by_batch(self, cycle: str, table: str) -> int:
         """Keys of `table` the batch target keeps after `cycle` although the source deleted them."""
         return deleted_by_batch(cycle, table)
+
+    def delta_kinds(self) -> set[str]:
+        """The configs that load deltas (a base and a buffer `compact` merges): every config the leg's init wrote."""
+        return set(self.texts)
 
     def grade_targets(
         self,

@@ -267,6 +267,9 @@ def test_a_full_batch_export_keeps_no_deleted_key_and_moves_every_row() -> None:
     leg = leg_with(MYSQL, {"batch": yaml.safe_dump(doc)})
     source = {"gate_customers": [{"updated_at": 1}] * 3, "gate_orders": [{"updated_at": 1}] * 7}
     assert leg.kept_by_batch("delta", "gate_orders") == 0
+    assert leg.delta_kinds() == {"batch"}, "one export still loads deltas: its load block is the client's"
+    doc["exports"][0]["mode"] = "full"
+    assert leg_with(MYSQL, {"batch": yaml.safe_dump(doc), "cdc": "exports: []"}).delta_kinds() == {"cdc"}
     assert leg.expected_rows("batch", "load.gate_orders", source, {}, False) == 7
     assert leg.kept_by_batch("delta", "gate_customers") == source_dags.SourceLeg.kept_by_batch(leg, "delta", "gate_customers")
 

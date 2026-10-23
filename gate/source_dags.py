@@ -490,6 +490,13 @@ class SourceDagsLeg(SourceLeg):
         its target keeps no deleted key."""
         return 0 if self.batch_mode(table) == "full" else super().kept_by_batch(cycle, table)
 
+    def delta_kinds(self) -> set[str]:
+        """A batch config of `full` exports only replaces its tables (init writes no `layout`): its load block is not
+        the delta client's."""
+        doc = yaml.safe_load(self.texts.get("batch") or "") or {}
+        full = bool(doc.get("exports")) and all(e.get("mode") == "full" for e in doc["exports"])
+        return set(self.texts) - ({"batch"} if full else set())
+
     def expected_rows(
         self, kind: str, task: str, source: dict[str, list[dict[str, Any]]], ops: dict[str, dict[str, int]], baseline: bool
     ) -> int | None:
