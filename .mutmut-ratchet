@@ -18,4 +18,6 @@
 # 2026-10-18: 19: test_dags pins get_provider_info's whole dict, which kills its 6 string mutants (no new full run)
 # 2026-10-18: 18: the release run 39130390503 (5762 mutants) left 20; 2 sat in `step`'s `name != "metrics"` branch, dead
 # since G1b went (#58), which this change removes.
-18
+# 2026-10-24: 14: the four equivalents of _run_units 44/45 and _load 140/141 moved into reading.Reading, where the
+# exit-0 fallback is the constant EXIT_ZERO and no such mutant exists (#88).
+14
