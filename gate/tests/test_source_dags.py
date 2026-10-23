@@ -153,7 +153,7 @@ def test_the_shape_is_one_group_per_stream_where_init_writes_a_stream_per_table(
     assert want == sorted(
         ["watcher"]
         + [f"{s}.{g}{t}" for s in ("gate_customers", "gate_orders") for g, t in (("run", ""),)]
-        + [f"{s}.{g}.dbo.{s}" for s in ("gate_customers", "gate_orders") for g in ("load", "compact")]
+        + [f"{s}.{g}.dbo_{s}" for s in ("gate_customers", "gate_orders") for g in ("load", "compact")]
     )
     assert shape_problems(want, mssql, "cdc", grouped=True) == []
     assert shape_problems(["init"], mssql, "cdc", grouped=True), "the DAG was never rebuilt"

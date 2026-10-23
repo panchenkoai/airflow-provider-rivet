@@ -116,7 +116,7 @@ class Layout:
 
 def expected_tasks(text: str, mode: str) -> list[str]:
     """The task ids docs/dag-builders.md promises for a config, sorted: for `cdc`, each `mode: cdc` export a stream
-    (`run`, `load.T` with a `load:` block, `compact.T` when its layout is `base_buffer`), at the top for one stream and in
+    (`run`, `load.T` with a `load:` block (T the warehouse name: `dbo.orders` is `dbo_orders`), `compact.T` when its layout is `base_buffer`), at the top for one stream and in
     a group named after the export for several; for `batch`, `apply.E` and (with `load:`) `load.E` per export; and the
     watcher."""
     doc = yaml.safe_load(text) or {}
@@ -124,7 +124,12 @@ def expected_tasks(text: str, mode: str) -> list[str]:
     load = doc.get("load") or {}
     ids = [WATCHER]
     if mode == "cdc":
-        streams = [(e["name"], e.get("tables") or [e.get("table")]) for e in exports if e.get("mode") == "cdc"]
+        # `rivet load --table` takes the warehouse name: a schema's dot folded to `_` (rivet's folded_table)
+        streams = [
+            (e["name"], [str(t).replace(".", "_") for t in e.get("tables") or [e.get("table")]])
+            for e in exports
+            if e.get("mode") == "cdc"
+        ]
         for export, tables in streams:
             group = "" if len(streams) == 1 else f"{export}."
             ids.append(f"{group}run")
