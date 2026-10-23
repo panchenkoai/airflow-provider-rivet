@@ -18,6 +18,8 @@ from .result import DIGEST_COUNTS, DIGEST_KEYS, STATUSES, ErrorObject, UnitResul
 # The `load:` keys that hold where a warehouse's tables are created, outermost first (rivet's src/config/load.rs).
 TARGET_CONTAINER = {"bigquery": ("project", "dataset"), "snowflake": ("database", "schema"), "clickhouse": ("database",)}
 DONE_WORD = {"load": "loaded", "compact": "compacted"}
+# A failed unit of a process that exited 0 and named no error for it (`exit_zero_failed_unit`): what D8 builds for exit 0.
+EXIT_ZERO = error_from_exit(0, None)
 
 
 @dataclass
@@ -120,8 +122,8 @@ class Reading:
         return [e for e in entries if isinstance(e, dict)] if isinstance(entries, list) else []
 
     def unit_error(self, step: _Step, error: ErrorObject | None, own: Any, export: str | None, table: str | None) -> ErrorObject:
-        """A failed unit's object: its own, its `failures[]` entry, or the process-level one (recorded), which is the
-        exit's own when rivet printed none."""
+        """A failed unit's object: its own, its `failures[]` entry, or the process-level one (recorded): rivet's printed
+        object, else the exit's, else (exit 0) `EXIT_ZERO`."""
         failures = (step.line or {}).get("failures")
         candidates = [own] if own is not None else []
         for entry in failures if isinstance(failures, list) else []:
@@ -135,7 +137,7 @@ class Reading:
                 return parsed
             self.degraded.add("result_malformed")
         self.degraded.add("per_unit_error")
-        return error or error_from_exit(step.exit_status, step.signal)
+        return error or EXIT_ZERO  # no process-level object only after a clean exit 0 (`classify`)
 
     def settled(self, units: list[UnitResult]) -> list[UnitResult]:
         """The units; one failed unit has the process's error as its own, so the fallback is no degradation then."""

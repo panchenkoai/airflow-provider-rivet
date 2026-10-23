@@ -205,3 +205,19 @@ def test_the_preflight_is_told_whether_the_task_is_a_cdc_run_and_its_warnings_ar
 def test_every_dispatched_command_names_its_lock() -> None:
     """LOCK_SCOPE: a command added to the dispatch without a lock row is caught here, not by a run blocked for lock_wait."""
     assert set(invocation.LOCK_SCOPE) == set(invocation._DISPATCH)
+
+
+def test_a_failed_unit_without_its_own_error_takes_the_one_rivet_printed() -> None:
+    """Reading.run_units 42: the process-level object rivet printed (its code), not one rebuilt from the exit."""
+    from conftest import fixture
+
+    from airflow_provider_rivet.reading import EXIT_ZERO, _Step
+    from airflow_provider_rivet.result import ErrorObject
+
+    printed = ErrorObject.from_contract(fixture("error_object.json"))
+    read = Reading(set(), {}, "run")
+    step = _Step(5, None, None)
+    units = read.run_units(step, {"per_export": [{"export_name": "a", "status": "failed"}]}, printed, None)
+    assert units[0].error == printed and printed.code
+    units = read.run_units(_Step(0, None, None), {"per_export": [{"export_name": "a", "status": "failed"}]}, None, None)
+    assert units[0].error == EXIT_ZERO and EXIT_ZERO.message == "rivet exited 0 and printed no error object"
