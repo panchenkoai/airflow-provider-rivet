@@ -165,8 +165,11 @@ config as a stream (`run`, then a load per table when the config has a `load:` b
 `layout` is `base_buffer`); for `batch`, every export through `build_batch_dag`, with a load when it has `load:`.
 `rivet init --mode cdc` writes one stream over all tables on MySQL and PostgreSQL's `public`, which keeps the
 `build_cdc_dag` shape (`run`, `load.T`, `compact.T`), and one stream per table on SQL Server, Oracle, MongoDB and other
-PostgreSQL schemas: each stream is then a group named after its export (`dbo_orders.run`, `dbo_orders.load.dbo.orders`),
-the streams running side by side. `init_args` are one list for every name of a call: sources that need other flags
+PostgreSQL schemas: each stream is then a group named after its export (`dbo_orders.run`, `dbo_orders.load.dbo_orders`: a load takes the warehouse name, the schema's dot folded to `_`),
+the streams running side by side. A batch DAG takes init's suggested mode per table (`full` for a small one), or the one `init_args` names
+(`--mode incremental`). One name is one config and one state database: a source in both a CDC and a batch DAG needs
+two names, or a `config_dir` and `state_root` per mode. Oracle CDC signs in as a common user (`c##…`) that LogMiner
+lets mine, with `--schema` naming the tables' owner. `init_args` are one list for every name of a call: sources that need other flags
 (`--tls require` for SQL Server, `--schema`) go in a call of their own. So
 unpausing runs `init` at once, and the stream starts at the next scheduled run (or trigger one).
 

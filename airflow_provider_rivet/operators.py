@@ -398,9 +398,12 @@ class RivetInitOperator(RivetBaseOperator):
             raise ValueError("`mode` is 'cdc' or 'batch'")
         if not (self.env_from_connections or {}).get(source_env):
             raise ValueError(f"env_from_connections names no `{source_env}`, the source `rivet init` reads")
-        owned = sorted({"--source", "--source-env", "--source-file", "-o", "--output", "--mode"} & set(init_args))
-        if owned:
-            raise ValueError(f"init_args may not set {owned}: the operator sets the source, the output and the mode")
+        owned = {"--source", "--source-env", "--source-file", "-o", "--output"} | ({"--mode"} if mode == "cdc" else set())
+        taken = sorted(owned & set(init_args))
+        if taken:
+            raise ValueError(f"init_args may not set {taken}: the operator sets the source, the output and the CDC mode")
+        if "cdc" in init_args:
+            raise ValueError("init_args may not ask for `--mode cdc` in a batch DAG: use mode='cdc'")
         self.mode = mode
         self.source_env = source_env
         self.init_args = list(init_args)

@@ -191,10 +191,9 @@ def init_operator(tmp_path: Path, **kwargs: Any) -> RivetInitOperator:
     kwargs.setdefault("state_dir", str(tmp_path / "state" / "shop"))
     return RivetInitOperator(
         task_id="init",
-        mode="cdc",
         source_env="RIVET_SOURCE_URL",
         config=str(tmp_path / "cfg" / "shop.yaml"),
-        **{"rivet_bin": str(tmp_path / "bin" / "rivet"), **kwargs},
+        **{"rivet_bin": str(tmp_path / "bin" / "rivet"), "mode": "cdc", **kwargs},
     )
 
 
@@ -637,7 +636,7 @@ def test_the_data_source_log_line_word_for_word(
 def test_every_flag_the_operator_owns_is_refused(tmp_path: Path, owned: str) -> None:
     with pytest.raises(ValueError) as exc:
         init_operator(tmp_path, init_args=["--tls", "disable", owned, "x"])
-    assert str(exc.value) == f"init_args may not set ['{owned}']: the operator sets the source, the output and the mode"
+    assert str(exc.value) == f"init_args may not set ['{owned}']: the operator sets the source, the output and the CDC mode"
 
 
 def test_init_takes_cdc_or_batch(tmp_path: Path) -> None:
@@ -974,17 +973,18 @@ def test_a_stream_per_table_gets_a_group_per_stream(tmp_path: Path) -> None:
     dag = build(tmp_path)["rivet_shop_cdc"]
     assert {t.task_id for t in dag.tasks} == {
         "dbo_orders.run",
-        "dbo_orders.load.dbo.orders",
-        "dbo_orders.compact.dbo.orders",
+        "dbo_orders.load.dbo_orders",
+        "dbo_orders.compact.dbo_orders",
         "dbo_users.run",
-        "dbo_users.load.dbo.users",
-        "dbo_users.compact.dbo.users",
+        "dbo_users.load.dbo_users",
+        "dbo_users.compact.dbo_users",
         "watcher",
     }
-    run, load = dag.get_task("dbo_users.run"), dag.get_task("dbo_users.load.dbo.users")
-    assert (run.export, load.export, load.table) == ("dbo_users", "dbo_users", "dbo.users")
+    run, load = dag.get_task("dbo_users.run"), dag.get_task("dbo_users.load.dbo_users")
+    # `rivet load --table` takes the warehouse name: init's `dbo.users` folded (rivet 0.32.2: RIVET_CLI_TABLE_UNKNOWN)
+    assert (run.export, load.export, load.table) == ("dbo_users", "dbo_users", "dbo_users")
     assert load.upstream_task_ids == {"dbo_users.run"}
-    assert dag.get_task("dbo_users.compact.dbo.users").upstream_task_ids == {"dbo_users.load.dbo.users"}
+    assert dag.get_task("dbo_users.compact.dbo_users").upstream_task_ids == {"dbo_users.load.dbo_users"}
     assert run.trigger_rule == "all_success" and run.env_from_connections["RIVET_SOURCE_URL"]["conn_id"] == "shop"
 
 
@@ -1053,3 +1053,12 @@ def test_what_a_data_source_cannot_give_rivet_is_refused(tmp_path: Path, section
     path = write(tmp_path, f"[src]\n{section}")
     r = refusal(lambda: odbc_connection(path, "src"))
     assert str(r) == f"[RIVET_AIRFLOW_CONNECTION_UNSUPPORTED] ODBC data source [src] in {path} {why}"
+
+
+def test_a_batch_dag_may_choose_init_s_mode_but_not_cdc(tmp_path: Path) -> None:
+    op = init_operator(tmp_path, mode="batch", init_args=["--mode", "incremental"])
+    assert op.init_args == ["--mode", "incremental"]
+    with pytest.raises(ValueError, match="may not ask for `--mode cdc` in a batch DAG"):
+        init_operator(tmp_path, mode="batch", init_args=["--mode", "cdc"])
+    with pytest.raises(ValueError, match=r"may not set \['--mode'\]"):
+        init_operator(tmp_path, mode="cdc", init_args=["--mode", "incremental"])

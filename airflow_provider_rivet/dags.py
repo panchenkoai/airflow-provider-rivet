@@ -293,7 +293,7 @@ def build_source_dags(
         if mode == "cdc":
             # init: one `tables:` stream on MySQL and `public` PostgreSQL, one stream per table elsewhere (`table:`)
             streams = [
-                (e["name"], e.get("tables") or ([e["table"]] if e.get("table") else []))
+                (e["name"], [warehouse_table(t) for t in e.get("tables") or ([e["table"]] if e.get("table") else [])])
                 for e in exports
                 if e.get("mode") == "cdc"
             ]
@@ -308,6 +308,12 @@ def build_source_dags(
             batch = [e["name"] for e in exports if e.get("mode") != "cdc"]
             dags[dag_id] = build_batch_dag(dag_id, exports=batch, load=bool(doc.get("load")), **common)
     return dags
+
+
+def warehouse_table(table: str) -> str:
+    """The name `rivet load --table` takes for a captured table: a schema-qualifying dot folded to `_` (`dbo.orders` is
+    loaded as `dbo_orders`; rivet's `folded_table`, src/load/plan.rs), a bare name as it is."""
+    return str(table).replace(".", "_")
 
 
 def _init_dag(dag_id: str, mode: str, init_args: list[str], common: Mapping[str, Any]) -> DAG:
