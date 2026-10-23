@@ -523,12 +523,19 @@ def test_the_client_layout_connection_rivet_name_falls_back_to_the_data_source_n
     assert run._database(database_ref(ref)).host == "db1.internal"  # [shop], not [rivet_shop]
 
 
+def stale(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A stat that says `shop.yaml` is there when it is not, as Docker Desktop's file cache answered for a deleted file;
+    every other path (mutmut's own files among them) is asked for real."""
+    for name in ("exists", "is_file"):
+        real = getattr(Path, name)
+        monkeypatch.setattr(Path, name, lambda self, real=real: self.name == "shop.yaml" or real(self))
+
+
 def test_a_config_that_vanishes_after_a_stat_still_builds_the_init_dag(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(Path, "exists", lambda self: True)  # Docker Desktop's file cache answered so for a deleted file
-    monkeypatch.setattr(Path, "is_file", lambda self: True)
+    stale(monkeypatch)
     assert [t.task_id for t in build(tmp_path)["rivet_shop_cdc"].tasks] == ["init"]
 
 
 def test_init_writes_a_config_a_stale_stat_claims_is_there(init: Init, monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(Path, "exists", lambda self: True)
+    stale(monkeypatch)
     assert init.run()["written"] is True
