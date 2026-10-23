@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import os
 import shutil
+import subprocess
 import tempfile
 from collections.abc import Mapping, Sequence
 from pathlib import Path
@@ -20,7 +21,14 @@ from ._compat import (
     executor_spreading_hosts,
 )
 from ._yaml import params_of
-from .connections import EnvSpec, build_environment, connection_url  # noqa: F401  (connection_url is re-exported)
+from .connections import (
+    EnvSpec,
+    build_environment,
+    connection_url,
+    database_ref,
+    odbc_connection,
+    with_database,
+)
 from .invocation import (
     CLOUD_ENV,
     Busy,
@@ -126,19 +134,34 @@ class RivetBaseOperator(BaseOperator):
     def _environment(self, secrets: Path) -> dict[str, str]:
         """The subprocess environment (`connections.build_environment`), with every Connection looked up here; key
         files go to `secrets`, which the task removes when rivet has exited."""
-        urls = {
-            name: ((ref, None) if isinstance(ref, str) else (ref[0], ref[1]))
-            for name, ref in (self.env_from_connections or {}).items()
-        }
+        refs = {name: database_ref(ref) for name, ref in (self.env_from_connections or {}).items()}
         spec = EnvSpec(
             passthrough=self.env_passthrough,
             clouds=self.cloud_credentials,
             env=self.env or {},
-            urls={name: (get_connection(conn_id), scheme) for name, (conn_id, scheme) in urls.items()},
+            urls={name: (self._database(ref), ref.get("scheme")) for name, ref in refs.items()},
             config=self._config_doc() if self.connections else {},
         )
         # The worker's environment: every reader of it takes None as os.environ, so its mutants are equivalent.
         return build_environment(os.environ, spec, [get_connection(c) for c in self.connections], secrets)  # pragma: no mutate
+
+    def _database(self, ref: Mapping[str, Any]) -> Any:
+        """The database an `env_from_connections` entry names: its Airflow Connection, else (with `odbc_ini`) the data
+        source of that name in the file; its `database` instead of the one stored. Where it came from is logged."""
+        conn_id, odbc_ini, dsn = ref["conn_id"], ref.get("odbc_ini"), ref.get("dsn") or ref["conn_id"]
+        try:
+            conn = BaseHook.get_connection(conn_id)
+        except AirflowNotFoundException:
+            conn = odbc_connection(odbc_ini, dsn) if odbc_ini else None
+            if conn is None:
+                raise PreflightRefusal(
+                    "RIVET_AIRFLOW_CONNECTION_MISSING",
+                    f"connection `{conn_id}` is not defined in the metadata database or any secrets backend this worker reads"
+                    + (f", and {odbc_ini} has no data source [{dsn}]" if odbc_ini else "")
+                    + "; create it, or correct the id the task names",
+                ) from None
+            self.log.info("database `%s`: no such Connection, ODBC data source [%s] in %s", conn_id, dsn, odbc_ini)
+        return with_database(conn, ref.get("database"))
 
     def _config_doc(self) -> dict[str, Any]:
         """The config as rivet builds it, for the names a Connection is filed under; read by the preflight's reader, so a
@@ -340,6 +363,165 @@ class RivetPlanOperator(RivetBaseOperator):
 
     def __init__(self, *, plan_file: str, **kwargs: Any) -> None:
         super().__init__(plan_file=plan_file, **kwargs)
+
+
+def config_present(path: Path) -> bool:
+    """Whether the config file is there, by opening it: a stat can answer from a stale cache (Docker Desktop's file
+    sharing kept a deleted file `exists()`), and the generator and `init` must agree with the reader that follows."""
+    try:
+        path.open("rb").close()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def places(doc: Mapping[str, Any]) -> set[str]:
+    """Where a config writes: each export's bucket prefix (`s3://b/p/`) and its warehouse dataset or database."""
+    out = set()
+    for export in doc.get("exports") or []:
+        dest = export.get("destination") or {}
+        if dest.get("bucket"):
+            out.add(f"{dest.get('type')}://{dest['bucket']}/{dest.get('prefix') or ''}")
+    load = doc.get("load") or {}
+    names = [load.get(k) for k in ("project", "dataset", "database", "schema") if load.get(k)]
+    if names:
+        out.add(f"{load.get('target')} {'.'.join(map(str, names))}")
+    return out
+
+
+class RivetInitOperator(RivetBaseOperator):
+    """Writes the config a source's DAG is built from: `rivet init` against the source, `rivet check` of what it wrote,
+    then the file at `config`, never over one that exists. The data source is the `source_env` entry of
+    `env_from_connections`; a `database` named for RIVET_STATE_URL is created on its PostgreSQL server if missing."""
+
+    command = "init"
+    template_fields: Sequence[str] = ("config", "state_dir", "init_args")
+    ui_color = "#f3e8fd"
+
+    def __init__(self, *, mode: str, source_env: str, init_args: Sequence[str] = (), **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        if mode not in ("cdc", "batch"):
+            raise ValueError("`mode` is 'cdc' or 'batch'")
+        if not (self.env_from_connections or {}).get(source_env):
+            raise ValueError(f"env_from_connections names no `{source_env}`, the source `rivet init` reads")
+        owned = sorted({"--source", "--source-env", "--source-file", "-o", "--output", "--mode"} & set(init_args))
+        if owned:
+            raise ValueError(f"init_args may not set {owned}: the operator sets the source, the output and the mode")
+        self.mode = mode
+        self.source_env = source_env
+        self.init_args = list(init_args)
+
+    def execute(self, context: Any) -> dict[str, Any]:
+        """Write the config, or report the one already there."""
+        target = Path(self.config)
+        if config_present(target):
+            self.log.info(
+                "%s exists: the next DAG parse builds this DAG's rivet tasks from it. If this task keeps running instead, "
+                "the scheduler does not see this file: put the config folder where both read it",
+                target,
+            )
+            return {"config": str(target), "written": False}
+        secrets = Path(tempfile.mkdtemp(prefix="rivet-airflow-secrets-"))
+        try:
+            try:
+                env = self._environment(secrets)
+                self._create_state_database()
+            except PreflightRefusal as refusal:
+                raise AirflowFailException(str(refusal)) from None
+            return self._write_config(target, env)
+        finally:
+            shutil.rmtree(secrets, ignore_errors=True)
+
+    def _config_doc(self) -> dict[str, Any]:
+        """No config yet: a storage or warehouse Connection is filed under its own name."""
+        return {}
+
+    def _create_state_database(self) -> None:
+        """CREATE DATABASE for a RIVET_STATE_URL entry that names a `database`, on the server its Connection points at."""
+        ref = (self.env_from_connections or {}).get("RIVET_STATE_URL")
+        ref = database_ref(ref) if ref else {}
+        if not ref.get("database"):
+            return
+        server = self._database({**ref, "database": None})
+        name = ref["database"]
+        try:
+            import psycopg2
+        except ImportError:
+            raise PreflightRefusal(
+                "RIVET_AIRFLOW_STATE_DATABASE", f"creating state database `{name}` needs psycopg2 on the worker"
+            ) from None
+        conn = psycopg2.connect(connection_url(with_database(server, server.schema or "postgres"), "postgresql"))
+        try:
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", (name,))
+                if cur.fetchone():
+                    return
+                quoted = '"' + name.replace('"', '""') + '"'
+                cur.execute(f"CREATE DATABASE {quoted}")
+                self.log.info("state database `%s` created on %s", name, server.host)
+        finally:
+            conn.close()
+
+    def _rivet(self, argv: list[str], env: Mapping[str, str], cwd: Path) -> None:
+        """Run one rivet command, its output in the task log; a nonzero exit fails the task without a retry."""
+        proc = subprocess.run([self.rivet_bin, *argv], env=dict(env), cwd=cwd, capture_output=True, text=True)
+        for line in (proc.stdout + proc.stderr).splitlines():
+            self.log.info("%s", line)
+        if proc.returncode != 0:
+            raise AirflowFailException(
+                f"`rivet {argv[0]}` exited {proc.returncode}; its output is above, and no config was written"
+            )
+
+    def _refuse_shared_places(self, doc: Mapping[str, Any], target: Path) -> None:
+        """Refuse a config that writes where another config of the folder writes: one bucket prefix (their files mix) or
+        one warehouse dataset or database (two sources' tables of one name become one table)."""
+        mine = places(doc)
+        for other in sorted(target.parent.glob("*.yaml")):
+            if other == target:
+                continue
+            try:
+                shared = sorted(mine & places(read_config(str(other))))
+            except PreflightRefusal:
+                continue  # a config this reader cannot read is no evidence either way
+            if shared:
+                raise AirflowFailException(
+                    f"the config `rivet init` wrote for {target.name} writes to {', '.join(shared)}, as {other} does; give each "
+                    "source its own place in init_args (`--gcs-bucket`/`--s3-bucket`, `--bigquery-dataset {name}`, "
+                    "`--clickhouse-database {name}`); no config was written"
+                )
+
+    def _write_config(self, target: Path, env: Mapping[str, str]) -> dict[str, Any]:
+        """`rivet init` into the state folder (where the tasks run the config), `rivet check` there, then `target`."""
+        state_dir = Path(self.state_dir or target.parent)
+        if not state_dir.parent.is_dir():  # a state root that is not there is a volume not mounted: never made here
+            raise AirflowFailException(f"{state_dir.parent} does not exist on this worker: mount the state folder first")
+        state_dir.mkdir(exist_ok=True)
+        work = state_dir / ".init"
+        work.mkdir(exist_ok=True)
+        draft = work / target.name  # init names the stream's server_id, slot, checkpoint and prefix after this stem
+        draft.unlink(missing_ok=True)
+        mode = ["--mode", "cdc"] if self.mode == "cdc" else []
+        self._rivet(["init", "--source-env", self.source_env, *mode, "-o", str(draft), *self.init_args], env, work)
+        self._rivet(["check", "--config", str(draft)], env, work)
+        doc = read_config(str(draft), dict(env), {})
+        target.parent.mkdir(parents=True, exist_ok=True)
+        self._refuse_shared_places(doc, target)
+        staged = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+        shutil.copyfile(draft, staged)
+        try:
+            os.link(staged, target)  # refuses when another try wrote it meanwhile: a config is never replaced
+        except FileExistsError:
+            self.log.info("%s was written meanwhile; it is kept", target)
+        finally:
+            staged.unlink(missing_ok=True)
+        exports = [{"name": e.get("name"), "mode": e.get("mode"), "tables": e.get("tables")} for e in doc.get("exports") or []]
+        for e in exports:
+            self.log.info(
+                "export %s (%s)%s", e["name"], e["mode"], f": {', '.join(map(str, e['tables']))}" if e["tables"] else ""
+            )
+        self.log.info("%s written; the next DAG parse replaces this task with the rivet tasks it describes", target)
+        return {"config": str(target), "written": True, "exports": exports}
 
 
 class RivetWaveBarrier(BaseOperator):

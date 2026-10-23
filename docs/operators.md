@@ -18,7 +18,7 @@ values are never stored as rendered fields. No operator builds argv: one module,
 | `plan_file` | `None` | yes | the layout file `RivetPlanOperator` rewrites and `build_batch_dag` reads waves from |
 | `rivet_bin` | `"rivet"` | no | the binary: a name looked up on the worker's `PATH`, else the one `rivet-cli` installed; or an absolute path |
 | `env` | `None` | no | extra variables for the rivet process; computed by your DAG file, so no secret literals |
-| `env_from_connections` | `None` | no | `{ENV_NAME: conn_id}`: a database URL built from an Airflow Connection inside the task (see [Connections and secrets](connections-and-secrets.md)) |
+| `env_from_connections` | `None` | no | `{ENV_NAME: conn_id}`: a database URL built from an Airflow Connection inside the task (see [Connections and secrets](connections-and-secrets.md)); the value may also be `{"conn_id": …, "database": …, "odbc_ini": …, "dsn": …}`: another database on the same server, and the odbc.ini data source `dsn` (default the id) when no Connection has the id |
 | `env_passthrough` | `()` | no | worker variables (names or `MY_*` patterns) passed on; nothing outside the allow-list is inherited otherwise |
 | `cloud_credentials` | `()` | no | `"gcp"`, `"aws"`, `"azure"`: pass the worker's credential variables of that kind |
 | `connections` | `()` | no | storage and warehouse Connection ids (see ["Storage and warehouse connections"](connections-and-secrets.md#storage-and-warehouse-connections)) |
@@ -40,6 +40,7 @@ values are never stored as rendered fields. No operator builds argv: one module,
 | `RivetCdcRunOperator` | `rivet run -e X --summary-output <file>` for a `mode: cdc` export | one bounded drain; succeeds on `max_events`, reports it, never loops |
 | `RivetLoadOperator` | `rivet load` | per export, per table where the binary can narrow |
 | `RivetCompactOperator` | `rivet compact` | with `load_result` degraded (rivet 0.31.0 and main) exit 0 is `compacted`, also when rivet merged nothing; a binary with compact's `--summary-output` reports `skipped`, which becomes an Airflow skip |
+| `RivetInitOperator` | `rivet init` then `rivet check` of what it wrote | writes `config` once and never replaces it; the task `build_source_dags` adds while a source has no config (see [DAG builders](dag-builders.md#one-dag-per-database-build_source_dags)) |
 | `RivetPlanOperator` | `rivet plan --format json` | rewrites the plan layout file atomically, only when the output is a layout `build_batch_dag` can read (waves with exports; one planned export, which rivet prints as a bare object with no campaign, is one wave from its `export_recommendation`); the file keeps its mode |
 
 ```python

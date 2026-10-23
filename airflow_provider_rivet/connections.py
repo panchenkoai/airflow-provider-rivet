@@ -379,6 +379,88 @@ def connection_url(conn: Any, scheme: str | None = None) -> str:
     return f"{scheme}://{auth}{url_host(conn)}{port}/{_quote(str(database))}{'?' + query if query else ''}"
 
 
+# --- A database by name: an Airflow Connection, else an ODBC data source ---
+
+# What an odbc.ini `Driver` names -> the Connection type it is; matched on the lower-cased name or library path.
+ODBC_DRIVERS = (("mysql", "mysql"), ("myodbc", "mysql"), ("mariadb", "mysql"), ("postgres", "postgres"), ("psqlodbc", "postgres"))
+# odbc.ini keys (case-insensitive, first one set wins) -> the Connection field they fill.
+ODBC_FIELDS = {
+    "host": ("server", "servername", "host"),
+    "port": ("port",),
+    "login": ("user", "uid", "username"),
+    "password": ("password", "pwd"),
+    "schema": ("database", "db"),
+}
+REF_KEYS = {"conn_id", "scheme", "database", "odbc_ini", "dsn"}
+
+
+@dataclass(frozen=True)
+class OdbcConnection:
+    """An odbc.ini data source in the shape `connection_url` reads from an Airflow Connection."""
+
+    conn_id: str
+    conn_type: str
+    host: str | None
+    port: int | None
+    login: str | None
+    password: str | None
+    schema: str | None
+    extra_dejson: Mapping[str, Any] = field(default_factory=dict)
+
+
+def odbc_connection(path: str, name: str) -> OdbcConnection | None:
+    """The data source `[name]` of the odbc.ini at `path`, or None when the file or the section is absent. A driver
+    rivet has no URL for, or a port that is no number, is refused: the data source exists, so a fallback would hide it."""
+    import configparser
+
+    ini = configparser.ConfigParser(interpolation=None, strict=False)
+    try:
+        ini.read(path)
+    except configparser.Error as exc:
+        raise PreflightRefusal(UNSUPPORTED, f"{path} is not a readable odbc.ini ({type(exc).__name__})") from None
+    if not ini.has_section(name):
+        return None
+    section = ini[name]
+    driver = section.get("driver", "").lower()
+    conn_type = next((kind for word, kind in ODBC_DRIVERS if word in driver), None)
+    if conn_type is None:
+        raise PreflightRefusal(
+            UNSUPPORTED,
+            f"ODBC data source [{name}] in {path} uses driver `{section.get('driver', '')}`; rivet reads MySQL and PostgreSQL "
+            f"data sources from odbc.ini: create an Airflow Connection `{name}` instead",
+        )
+    values = {f: next((section[k].strip() for k in keys if section.get(k, "").strip()), None) for f, keys in ODBC_FIELDS.items()}
+    port = values.pop("port")
+    if port is not None and not port.isdigit():
+        raise PreflightRefusal(UNSUPPORTED, f"ODBC data source [{name}] in {path} has port `{port}`, which is no number")
+    return OdbcConnection(conn_id=name, conn_type=conn_type, port=int(port) if port else None, **values)
+
+
+def database_ref(ref: Any) -> dict[str, Any]:
+    """An `env_from_connections` value as a dict: `conn_id`, `(conn_id, scheme)`, or a dict of `conn_id` and optional
+    `scheme`, `database` (instead of the Connection's own) and `odbc_ini` (the file whose data source `dsn`, default
+    `conn_id`, is used when no Airflow Connection has that id)."""
+    if isinstance(ref, str):
+        return {"conn_id": ref}
+    if isinstance(ref, Mapping):
+        unknown = sorted(set(ref) - REF_KEYS)
+        if unknown or not ref.get("conn_id"):
+            raise ValueError(
+                f"an env_from_connections dict has `conn_id` and optionally {sorted(REF_KEYS - {'conn_id'})}; got {sorted(ref)}"
+            )
+        return dict(ref)
+    conn_id, scheme = ref
+    return {"conn_id": conn_id, "scheme": scheme}
+
+
+def with_database(conn: Any, database: str | None) -> Any:
+    """`conn` with its database (`schema`) replaced, the Connection itself untouched; `conn` when `database` is None."""
+    if database is None:
+        return conn
+    fields = {name: getattr(conn, name, None) for name in ("conn_id", "conn_type", "host", "port", "login", "password")}
+    return OdbcConnection(**fields, schema=database, extra_dejson=dict(getattr(conn, "extra_dejson", None) or {}))
+
+
 # --- The whole subprocess environment ---
 
 

@@ -98,3 +98,78 @@ dag = build_cdc_dag(
   `compact=False` keeps `load.T` and drops `compact.T`. Use `compact=False` on Snowflake and
   ClickHouse, where there is nothing to compact (see ["Storage and warehouse connections"](connections-and-secrets.md#storage-and-warehouse-connections)).
 - `operator_kwargs` go to every task, as in the batch builder.
+
+### One DAG per database: `build_source_dags`
+
+Name the databases; each gets a DAG, created paused, that writes its own config the first time it runs. The operator's
+work is to unpause it.
+
+```python
+from datetime import datetime
+
+from airflow_provider_rivet.dags import build_source_dags
+
+globals().update(
+    build_source_dags(
+        ["shop", "billing"],  # Airflow Connection ids, else data sources of odbc.ini
+        mode="cdc",  # or "batch"
+        config_dir="/opt/airflow/dags/rivet",
+        state_root="/opt/airflow/rivet-state",
+        state_connection="rivet_state",  # a PostgreSQL server; each source gets the database rivet_state_<name>
+        init_args=[
+            "--tls",
+            "verify-full",
+            "--gcs-bucket",
+            "my-bucket",
+            "--bigquery-project",
+            "my-project",
+            "--bigquery-dataset",
+            "{name}",
+        ],
+        operator_kwargs={"cloud_credentials": ["gcp"]},
+        schedule="0 */2 * * *",
+        start_date=datetime(2026, 1, 1),
+        catchup=False,
+    )
+)
+```
+
+For each name `<name>`:
+
+| | |
+|---|---|
+| DAG | `rivet_<name>_cdc` / `rivet_<name>_batch`, paused at creation (`is_paused_upon_creation`) |
+| source | the Airflow Connection `source_connection` (default `{name}`; `rivet_{name}` for the layout of [the cron recipe](cron-to-airflow-cdc.md)); without one, the data source `[<name>]` of `odbc_ini` (default `/etc/odbc.ini`; `None` turns it off). The task log says when odbc.ini was used. MySQL and PostgreSQL drivers |
+| config | `<config_dir>/<name>.yaml` |
+| state | the database `rivet_state_<name>` on the server of `state_connection`, and the folder `<state_root>/<name>` |
+
+**Before the config exists**, the DAG has one task, `init`. When it runs:
+
+1. it creates `rivet_state_<name>` if missing (the state Connection's user needs `CREATEDB`) and `<state_root>/<name>`
+   (`state_root` must exist: a missing one is a volume that is not mounted, and is refused);
+2. runs `rivet init --source-env RIVET_SOURCE_URL [--mode cdc] -o <state_root>/<name>/.init/<name>.yaml <init_args>`,
+   `{name}` in `init_args` replaced. `init` names the stream's `server_id`, slot, checkpoint and bucket prefix after the
+   file name, so two sources never share them;
+3. runs `rivet check` on it;
+4. refuses a config that writes to a bucket prefix or a warehouse dataset another config in `config_dir` writes to
+   (give each source its own, e.g. `--bigquery-dataset {name}`);
+5. writes `<config_dir>/<name>.yaml`, never over an existing file, and logs each export and its tables.
+
+A failed step writes no config and is not retried: read the log, fix the cause, and clear the task in the latest run
+only (an `init` cleared in several runs at once fails in each run that starts after the first one wrote the config,
+since the DAG has no `init` task then). The bucket and the
+warehouse dataset are not created: they must exist.
+
+**Once the config exists**, the next parse builds the same DAG from it: for `cdc`, the config's one `mode: cdc` export
+through `build_cdc_dag`, with a load per table when the config has a `load:` block and a compaction when its
+`layout` is `base_buffer`; for `batch`, every export through `build_batch_dag`, with a load when it has `load:`. So
+unpausing runs `init` at once, and the stream starts at the next scheduled run (or trigger one).
+
+- The config folder must be one the scheduler (Airflow 3: the dag-processor) and every worker read, as the DAGs
+  folder. If `init` keeps running, the file it wrote is not where the scheduler reads.
+- Edit the config like any other: the DAG follows it at the next parse. Delete it to have `init` write it again.
+- A config moved from cron (`docs/cron-to-airflow-cdc.md`) works as it is: the source goes to the variable its
+  `url_env` names.
+- `operator_kwargs` go to every task, `init` included; `env_from_connections`, `config` and `state_dir` are the
+  builder's.
+- The DAG file reads only files: no database is reached while the scheduler parses it.
