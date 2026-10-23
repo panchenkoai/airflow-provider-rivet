@@ -1,0 +1,20 @@
+[book]
+title = "airflow-provider-rivet"
+description = "Apache Airflow operators and DAG builders for rivet: CDC and batch pipelines, from a Docker Compose quickstart to production."
+authors = ["Rivet"]
+language = "en"
+src = "docs"
+
+[build]
+build-dir = "book"
+
+[output.html]
+site-url = "/airflow-provider-rivet/"
+git-repository-url = "https://github.com/panchenkoai/airflow-provider-rivet"
+edit-url-template = "https://github.com/panchenkoai/airflow-provider-rivet/edit/main/docs/{path}"
+default-theme = "light"
+preferred-dark-theme = "navy"
+no-section-label = true
+
+[output.html.search]
+enable = true

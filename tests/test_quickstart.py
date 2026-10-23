@@ -119,3 +119,21 @@ def test_compose_pins_its_airflow_version(version: str) -> None:
     common = compose(version)["x-airflow-common"]
     full = common["build"]["args"]["AIRFLOW_VERSION"]
     assert full.startswith(version + ".") and common["image"] == f"rivet-quickstart:{full}"
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="the command builder runs under node")
+def test_every_placeholder_on_the_builder_page_is_filled_by_the_builder() -> None:
+    import json
+    import subprocess
+
+    docs = Path(__file__).resolve().parents[1] / "docs"
+    used = set(re.findall(r"\{\{([A-Z_]+)\}\}", (docs / "your-database.md").read_text()))
+    script = "console.log(JSON.stringify(Object.keys(require(process.argv[1]).tokens({}))))"
+    filled = set(
+        json.loads(
+            subprocess.run(
+                ["node", "-e", script, str(docs / "your-database.js")], capture_output=True, text=True, check=True
+            ).stdout
+        )
+    )
+    assert used and used <= filled, sorted(used - filled)

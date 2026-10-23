@@ -10,4 +10,4 @@ docker compose up -d --build --wait # then http://localhost:8080, airflow / airf
 ```
 
 The guide: [docs/quickstart.md](../docs/quickstart.md). Your own database:
-[the command builder](https://panchenkoai.github.io/rivet/airflow-quickstart.html).
+[the command builder](https://panchenkoai.github.io/airflow-provider-rivet/your-database.html).

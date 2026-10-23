@@ -11,9 +11,9 @@ warehouse. Four pipelines are ready to run:
 | `rivet_postgres_batch` | PostgreSQL `shop` | batch, incremental on `updated_at` | `postgres_batch.*` |
 
 Everything runs on your machine: no cloud account is needed. The same files then take your own database: the
-[command builder](https://panchenkoai.github.io/rivet/airflow-quickstart.html) writes the commands for it.
+[command builder](your-database.md) writes the commands for it.
 
-The files are in [`quickstart/`](../quickstart):
+The files are in [`quickstart/`](https://github.com/panchenkoai/airflow-provider-rivet/tree/main/quickstart):
 
 | File | What it is |
 |---|---|
@@ -112,7 +112,7 @@ A batch pipeline reads the rows whose `updated_at` moved; a deleted row has none
 
 ## 4. Your own database
 
-The [command builder](https://panchenkoai.github.io/rivet/airflow-quickstart.html) takes your database's name, host,
+The [command builder](your-database.md) takes your database's name, host,
 tables and mode, and writes every command below with those values. Without it, the steps are:
 
 1. **Grants** on your database: `SELECT` on the tables; for MySQL CDC also `REPLICATION SLAVE` and

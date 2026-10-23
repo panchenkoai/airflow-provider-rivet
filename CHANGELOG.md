@@ -9,7 +9,9 @@ rivet binary; its release tags will use the prefix `airflow-v`.
 
 - `quickstart/`: Docker Compose stacks for Airflow 2.10.5 and 3.3.2 with rivet and this provider, demo MySQL and
   PostgreSQL sources ready for CDC, MinIO and ClickHouse, and four pipelines (CDC and batch per source) built from
-  `rivet init` configs; guide in `docs/quickstart.md`, and a command builder for your own database on rivet's docs site.
+  `rivet init` configs; guide in `docs/quickstart.md`.
+- A docs site (mdBook on GitHub Pages, https://panchenkoai.github.io/airflow-provider-rivet/) with a command builder
+  that writes every command to add your own database as a pipeline of the quickstart stack (`docs/your-database.md`).
 
 ## 0.2.0 (2026-10-22)
 
