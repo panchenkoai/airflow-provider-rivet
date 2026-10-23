@@ -7,6 +7,14 @@ rivet binary; its release tags will use the prefix `airflow-v`.
 
 ### Added
 
+- `build_source_dags`: one DAG per named database, paused at creation. Until `<config_dir>/<name>.yaml` exists its one
+  task, `init` (`RivetInitOperator`), creates the source's state database, runs `rivet init` and `rivet check`, refuses
+  a config that writes where another source's does, and writes the file; the next parse builds the CDC or batch DAG
+  from it. A name is an Airflow Connection id, else a data source of odbc.ini.
+- `env_from_connections` takes `{"conn_id", "database", "odbc_ini", "dsn"}`: another database on the Connection's
+  server, and the odbc.ini data source `dsn` (default the id) when no Connection has the id (MySQL and PostgreSQL
+  drivers).
+
 - `quickstart/`: Docker Compose stacks for Airflow 2.10.5 and 3.3.2 with rivet and this provider, demo MySQL and
   PostgreSQL sources ready for CDC, MinIO and ClickHouse, and four pipelines (CDC and batch per source) built from
   `rivet init` configs; guide in `docs/quickstart.md`.

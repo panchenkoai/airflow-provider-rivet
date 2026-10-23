@@ -16,17 +16,22 @@ from .operators import (
     RivetApplyOperator,
     RivetCdcRunOperator,
     RivetCompactOperator,
+    RivetInitOperator,
     RivetLoadOperator,
     RivetPlanOperator,
     RivetRunOperator,
     RivetRunWatcher,
     RivetWaveBarrier,
+    config_present,
 )
+from .preflight import read_config
 
 ORDER_ONLY = "all_done"
 WATCHER_ID = "watcher"
 GATE = "all_success"
 DEFAULT_ARGS = {"retries": 2, "retry_delay": timedelta(minutes=5)}
+SOURCE_NAME = re.compile(r"[a-z0-9_]+")  # a file stem, a database name and a dag_id part as it is
+SOURCE_ENV = "RIVET_SOURCE_URL"
 NOT_IN_TASK_ID = re.compile(r"[^A-Za-z0-9_.-]")  # ASCII only: Airflow 3 cannot run a non-ASCII task id
 
 
@@ -48,13 +53,18 @@ def _names(field: str, value: Any) -> list[str]:
     return list(value)
 
 
-def _common(config: str, state_dir: str | None, operator_kwargs: Mapping[str, Any] | None) -> dict[str, Any]:
-    """The arguments every rivet task gets; its trigger rule is the builder's gate, whatever default_args says (D24)."""
+def _refuse_trigger_rule(operator_kwargs: Mapping[str, Any] | None) -> None:
+    """Every builder's tasks run only after their upstream succeeded: `operator_kwargs` may not say otherwise (D24)."""
     if operator_kwargs and "trigger_rule" in operator_kwargs:
         raise ValueError(
             "operator_kwargs may not set `trigger_rule`: every rivet task runs only after its upstream succeeded "
             "(load after its extract, compact after its load); the watcher fails the run on any failure"
         )
+
+
+def _common(config: str, state_dir: str | None, operator_kwargs: Mapping[str, Any] | None) -> dict[str, Any]:
+    """The arguments every rivet task gets; its trigger rule is the builder's gate, whatever default_args says (D24)."""
+    _refuse_trigger_rule(operator_kwargs)
     return {
         "config": config,
         "state_dir": state_dir,
@@ -197,4 +207,92 @@ def build_cdc_dag(
                     for table in tables:
                         loads[table] >> RivetCompactOperator(task_id=task_name(table), export=export, table=table, **common)
         _watch(dag)
+    return dag
+
+
+def build_source_dags(
+    sources: Sequence[str],
+    *,
+    mode: str,
+    config_dir: str,
+    state_root: str,
+    state_connection: str,
+    source_connection: str = "{name}",
+    init_args: Sequence[str] = (),
+    odbc_ini: str | None = "/etc/odbc.ini",
+    operator_kwargs: Mapping[str, Any] | None = None,
+    **dag_kwargs: Any,
+) -> dict[str, DAG]:
+    """One DAG `rivet_<name>_<mode>` per named database, created paused; put them in the DAG file's globals.
+
+    A name's source is the Airflow Connection `source_connection` (`{name}` replaced), else (with `odbc_ini`) the data
+    source `[name]` of that file. Until
+    `<config_dir>/<name>.yaml` exists the DAG has one task, `init`, which writes it with `rivet init` (`init_args` as
+    written, `{name}` replaced) and checks it; the next parse builds the DAG from the config: one CDC stream with a load
+    and compaction per table, or every batch export with its load. The state of a source is the database
+    `rivet_state_<name>` on the PostgreSQL server of `state_connection` (created by `init` if missing) and the folder
+    `<state_root>/<name>`. Reads only files at parse time: no database is reached until a task runs.
+    """
+    names = _names("sources", sources)
+    bad = [n for n in names if not SOURCE_NAME.fullmatch(n)]
+    twice = sorted({n for n in names if names.count(n) > 1})
+    if bad or twice:
+        raise ValueError(f"source names are distinct and of [a-z0-9_]: {bad or twice}")
+    if mode not in ("cdc", "batch"):
+        raise ValueError("`mode` is 'cdc' or 'batch'")
+    taken = sorted({"env_from_connections", "config", "state_dir"} & set(operator_kwargs or {}))
+    if taken:
+        raise ValueError(f"operator_kwargs may not set {taken}: each source's DAG sets them")
+    _refuse_trigger_rule(operator_kwargs)  # before any source has a config, as the builders it calls later
+    dags: dict[str, DAG] = {}
+    for name in names:
+        config = Path(config_dir) / f"{name}.yaml"
+        source = {
+            "conn_id": source_connection.replace("{name}", name),
+            **({"odbc_ini": odbc_ini, "dsn": name} if odbc_ini else {}),
+        }
+        state = {"conn_id": state_connection, "database": f"rivet_state_{name}"}
+        kwargs = {
+            **(operator_kwargs or {}),
+            "env_from_connections": {SOURCE_ENV: source, "RIVET_STATE_URL": state},
+        }
+        settings = {"is_paused_upon_creation": True, **dag_kwargs}
+        dag_id = f"rivet_{name}_{mode}"
+        common = {"config": str(config), "state_dir": str(Path(state_root) / name), "operator_kwargs": kwargs, **settings}
+        if not config_present(config):
+            dags[dag_id] = _init_dag(dag_id, mode, [a.replace("{name}", name) for a in init_args], common)
+            continue
+        doc = read_config(str(config))
+        url_env = (doc.get("source") or {}).get("url_env")
+        if url_env and url_env != SOURCE_ENV:  # a config moved from cron names its own variable
+            kwargs["env_from_connections"] = {url_env: source, "RIVET_STATE_URL": state}
+        exports = doc.get("exports") or []
+        if mode == "cdc":
+            streams = [e for e in exports if e.get("mode") == "cdc"]
+            if len(streams) != 1:
+                raise ValueError(f"{config}: expected one export with `mode: cdc`, found {len(streams)}")
+            stream, load = streams[0], doc.get("load") or {}  # a config init wrote without a warehouse lands files only
+            tables = stream.get("tables") or ([stream["table"]] if stream.get("table") else [])  # init: `table:` for one
+            compact = load.get("layout") == "base_buffer"  # a buffer to merge: ClickHouse and Snowflake read a change log
+            dags[dag_id] = build_cdc_dag(dag_id, export=stream["name"], tables=tables, load=bool(load), compact=compact, **common)
+        else:
+            batch = [e["name"] for e in exports if e.get("mode") != "cdc"]
+            dags[dag_id] = build_batch_dag(dag_id, exports=batch, load=bool(doc.get("load")), **common)
+    return dags
+
+
+def _init_dag(dag_id: str, mode: str, init_args: list[str], common: Mapping[str, Any]) -> DAG:
+    """The DAG of a source with no config yet: its one task writes the config."""
+    settings = {k: v for k, v in common.items() if k not in ("config", "state_dir", "operator_kwargs")}
+    task_kwargs = common["operator_kwargs"]
+    with _dag(dag_id, ("rivet", mode, "init"), settings) as dag:
+        RivetInitOperator(
+            task_id="init",
+            mode=mode,
+            source_env=SOURCE_ENV,
+            init_args=init_args,
+            config=common["config"],
+            state_dir=common["state_dir"],
+            **{**task_kwargs, "retries": 0},  # a failed init is re-run by the operator, after reading why it failed
+        )
     return dag
