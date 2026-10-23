@@ -23,6 +23,8 @@ STATUSES = frozenset({"success", "failed", "skipped", "loaded", "compacted", "al
 # first two as exit 5 refusals; rivet >= 0.32.2 gives them kind `busy`, exit 2, and stops with RIVET_STATE_LOCK_TIMEOUT
 # when its own `--lock-wait` for the lease runs out (the provider's RIVET_AIRFLOW_EXPORT_BUSY, inside rivet).
 BUSY_CODES = frozenset({"RIVET_STATE_RUN_IN_PROGRESS", "RIVET_LOAD_TABLE_BUSY", "RIVET_STATE_LOCK_TIMEOUT"})
+# The key of a task's XCom payload that says why rivet was never started; the task log and the Slack alert read it.
+REFUSED, STOPPED, BUSY = "preflight_refusal", "stopped_before", "busy"
 # What a `rivet load` / `rivet compact` entry reports beyond its rows (ADR-0039 D3, rivet >= 0.32.2): the counts the
 # warehouse or the ledger returned, and the jobs it ran. A value nobody returned is null, never 0.
 DIGEST_COUNTS = (
@@ -154,3 +156,9 @@ class UnitResult:
             "stop_reason": self.stop_reason,
             "error": self.error.to_xcom() if self.error else None,
         }
+
+
+def unstarted(command: str, why: str, value: str) -> dict[str, Any]:
+    """The XCom payload of a task that ended before rivet started: refused (`REFUSED`, final), or stopped by Airflow
+    (`STOPPED`) or kept off a held lock (`BUSY`), both retried; `value` is the code or the step."""
+    return {"command": command, "decision": "fail" if why == REFUSED else "retry", why: value, "units": []}

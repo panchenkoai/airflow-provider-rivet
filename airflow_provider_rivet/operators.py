@@ -42,6 +42,7 @@ from .invocation import (
     worker_environment,
 )
 from .preflight import PreflightRefusal, read_config, resolve_binary
+from .result import BUSY, REFUSED, STOPPED, unstarted
 from .tasklog import TaskLog
 
 XCOM_KEY = "return_value"
@@ -218,8 +219,13 @@ class RivetBaseOperator(BaseOperator):
     def _refuse(self, ti: Any, refusal: PreflightRefusal) -> None:
         """Log and publish a refusal made before rivet started, then fail without retry."""
         self._emit({"event": "rivet.refused", "code": refusal.code, "text": str(refusal)})
-        payload = {"command": self.command, "decision": "fail", "preflight_refusal": refusal.code, "units": []}
+        payload = unstarted(self.command, REFUSED, refusal.code)
         self._fail(ti, payload, str(refusal), retry=False)  # pragma: no mutate - `retry` is read as a truth value
+
+    def _stopped(self, ti: Any, stop: Stopped) -> None:
+        """Log and publish a stop Airflow asked for before a rivet step started, then fail for a retry (D40)."""
+        self._emit({"event": "rivet.stopped", "step": stop.step, "text": str(stop)})
+        self._fail(ti, unstarted(self.command, STOPPED, stop.step), str(stop), retry=True)
 
     def execute(self, context: Any) -> dict[str, Any]:
         """Run the command; return the XCom payload or raise by the contract's retry table."""
@@ -267,13 +273,10 @@ class RivetBaseOperator(BaseOperator):
         except PreflightRefusal as refusal:
             self._refuse(ti, refusal)
         except Stopped as stop:
-            self._emit({"event": "rivet.stopped", "step": stop.step, "text": str(stop)})
-            payload = {"command": self.command, "decision": "retry", "stopped_before": stop.step, "units": []}
-            self._fail(ti, payload, str(stop), retry=True)
+            self._stopped(ti, stop)
         except Busy as busy:
             self._emit({"event": "rivet.busy", "code": busy.code, "text": str(busy)})
-            payload = {"command": self.command, "decision": "retry", "busy": busy.code, "units": []}
-            self._fail(ti, payload, str(busy), retry=True)
+            self._fail(ti, unstarted(self.command, BUSY, busy.code), str(busy), retry=True)
         finally:
             self._proc = None
         return self._settle(ti, run_id, task_part, outcome)
@@ -430,8 +433,7 @@ class RivetInitOperator(RivetBaseOperator):
         try:
             return self._write_config(target, env, binary)
         except Stopped as stop:
-            payload = {"command": self.command, "decision": "retry", "stopped_before": stop.step, "units": []}
-            self._fail(ti, payload, str(stop), retry=True)
+            self._stopped(ti, stop)
         finally:
             self._proc = None
 
