@@ -127,6 +127,7 @@ The same pages, with the command builder: https://panchenkoai.github.io/airflow-
 | Topic | |
 |---|---|
 | [Quickstart](https://github.com/panchenkoai/airflow-provider-rivet/blob/main/docs/quickstart.md) | Docker Compose with Airflow 2.10 or 3.3, demo MySQL and PostgreSQL, MinIO and ClickHouse: CDC and batch pipelines in minutes, then your own database ([command builder](https://panchenkoai.github.io/airflow-provider-rivet/your-database.html)) |
+| [Add your own database](https://github.com/panchenkoai/airflow-provider-rivet/blob/main/docs/your-database.md) | the commands that add your MySQL or PostgreSQL database as a pipeline of the quickstart stack; with the form that writes them on the [docs site](https://panchenkoai.github.io/airflow-provider-rivet/your-database.html) |
 | [Operators](https://github.com/panchenkoai/airflow-provider-rivet/blob/main/docs/operators.md) | each operator, its parameters, the XCom value, reading the task log |
 | [DAG builders](https://github.com/panchenkoai/airflow-provider-rivet/blob/main/docs/dag-builders.md) | `build_batch_dag`, `build_cdc_dag`: tasks, waves, trigger rules, the `watcher` |
 | [Retries](https://github.com/panchenkoai/airflow-provider-rivet/blob/main/docs/retries.md) | exit status → success, retry or stop; the crashed budget; a retry of an apply that succeeded |

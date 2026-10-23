@@ -20,7 +20,8 @@ import pytest
 
 PACKAGE_ROOT = Path(__file__).resolve().parents[1]
 # The documentation: the README (the front page) and the pages under docs/ it links to.
-DOC_FILES = (PACKAGE_ROOT / "README.md", *sorted((PACKAGE_ROOT / "docs").glob("*.md")))
+#: The front page and every docs page; SUMMARY.md is the docs site's navigation, not a page.
+DOC_FILES = (PACKAGE_ROOT / "README.md", *sorted(p for p in (PACKAGE_ROOT / "docs").glob("*.md") if p.name != "SUMMARY.md"))
 DOCS = "\n".join(p.read_text() for p in DOC_FILES)
 
 
