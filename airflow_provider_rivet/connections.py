@@ -413,20 +413,21 @@ def odbc_connection(path: str, name: str) -> OdbcConnection | None:
     rivet has no URL for, or a port that is no number, is refused: the data source exists, so a fallback would hide it."""
     import configparser
 
-    ini = configparser.ConfigParser(interpolation=None, strict=False)
+    # Passwords hold `%` (no interpolation); a file that repeats a section or key is read, the last one winning.
+    ini = configparser.ConfigParser(interpolation=None, strict=False)  # pragma: no mutate - strict=None reads as False
     try:
         ini.read(path)
     except configparser.Error as exc:
         raise PreflightRefusal(UNSUPPORTED, f"{path} is not a readable odbc.ini ({type(exc).__name__})") from None
     if not ini.has_section(name):
         return None
-    section = ini[name]
-    driver = section.get("driver", "").lower()
-    conn_type = next((kind for word, kind in ODBC_DRIVERS if word in driver), None)
+    section = dict(ini[name])  # keys lower-cased by the parser
+    driver = section.get("driver", "")
+    conn_type = next((kind for word, kind in ODBC_DRIVERS if word in driver.lower()), None)
     if conn_type is None:
         raise PreflightRefusal(
             UNSUPPORTED,
-            f"ODBC data source [{name}] in {path} uses driver `{section.get('driver', '')}`; rivet reads MySQL and PostgreSQL "
+            f"ODBC data source [{name}] in {path} uses driver `{driver}`; rivet reads MySQL and PostgreSQL "
             f"data sources from odbc.ini: create an Airflow Connection `{name}` instead",
         )
     values = {f: next((section[k].strip() for k in keys if section.get(k, "").strip()), None) for f, keys in ODBC_FIELDS.items()}

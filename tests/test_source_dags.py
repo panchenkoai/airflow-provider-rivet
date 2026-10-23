@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 import pytest
+from conftest import FakeTI
 
 from airflow_provider_rivet._compat import AirflowFailException, AirflowNotFoundException
 from airflow_provider_rivet.connections import database_ref, odbc_connection, with_database
@@ -85,7 +86,7 @@ if argv[0] == "init":
         print("error: cannot connect", file=sys.stderr)
         sys.exit(spec["init_exit"])
     Path(argv[argv.index("-o") + 1]).write_text(spec["yaml"])
-    print("wrote config")
+    print("wrote config, 100% %s of it")
 elif argv[0] == "check":
     print("check ok" if not spec.get("check_exit") else "error: binlog_format is STATEMENT", file=sys.stderr)
     sys.exit(spec.get("check_exit", 0))
@@ -252,7 +253,7 @@ class Init:
 
     def run(self, **kwargs: Any) -> Any:
         try:
-            return init_operator(self.tmp, **kwargs).execute({})
+            return init_operator(self.tmp, **kwargs).execute({"ti": FakeTI(task_id="init"), "run_id": "r"})
         except Exception as exc:
             return exc
 
@@ -539,3 +540,289 @@ def test_a_config_that_vanishes_after_a_stat_still_builds_the_init_dag(tmp_path:
 def test_init_writes_a_config_a_stale_stat_claims_is_there(init: Init, monkeypatch: pytest.MonkeyPatch) -> None:
     stale(monkeypatch)
     assert init.run()["written"] is True
+
+
+# --- each message and decision, word for word ---
+
+
+@pytest.fixture
+def logged(caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture) -> Any:
+    """The task log so far: Airflow 2 logs through logging, Airflow 3 to stdout."""
+    caplog.set_level("INFO")
+    return lambda: caplog.text + capsys.readouterr().out
+
+
+def refusal(call: Any) -> PreflightRefusal:
+    with pytest.raises(PreflightRefusal) as exc:
+        call()
+    return exc.value
+
+
+def write(tmp_path: Path, text: str) -> str:
+    path = tmp_path / "odbc.ini"
+    path.write_text(text)
+    return str(path)
+
+
+def test_odbc_refusals_carry_their_code_and_text(tmp_path: Path) -> None:
+    path = write(tmp_path, "Driver = MySQL\n")
+    r = refusal(lambda: odbc_connection(path, "shop"))
+    assert (r.code, str(r)) == (
+        "RIVET_AIRFLOW_CONNECTION_UNSUPPORTED",
+        f"[{r.code}] {path} is not a readable odbc.ini (MissingSectionHeaderError)",
+    )
+    path = write(tmp_path, "[shop]\nServer = h\n")
+    r = refusal(lambda: odbc_connection(path, "shop"))
+    assert str(r) == (
+        f"[RIVET_AIRFLOW_CONNECTION_UNSUPPORTED] ODBC data source [shop] in {path} uses driver ``; rivet reads MySQL and "
+        "PostgreSQL data sources from odbc.ini: create an Airflow Connection `shop` instead"
+    )
+    path = write(tmp_path, "[shop]\nDriver = MySQL\nPort = x\n")
+    r = refusal(lambda: odbc_connection(path, "shop"))
+    assert (r.code, str(r).split("] ", 1)[1]) == (
+        "RIVET_AIRFLOW_CONNECTION_UNSUPPORTED",
+        f"ODBC data source [shop] in {path} has port `x`, which is no number",
+    )
+
+
+def test_odbc_reads_percent_signs_and_repeated_keys_as_written(tmp_path: Path) -> None:
+    path = write(tmp_path, "[shop]\nDriver = MySQL\nServer = h\nPassword = 50%off\nServer = h2\n[shop]\nDatabase = d\n")
+    conn = odbc_connection(path, "shop")
+    assert (conn.conn_id, conn.host, conn.password, conn.schema) == ("shop", "h2", "50%off", "d")
+
+
+def test_a_bad_reference_names_the_keys_it_takes() -> None:
+    with pytest.raises(ValueError) as exc:
+        database_ref({"conn_id": "pg", "db": "d"})
+    assert str(exc.value) == (
+        "an env_from_connections dict has `conn_id` and optionally ['database', 'dsn', 'odbc_ini', 'scheme']; got ['conn_id', 'db']"
+    )
+
+
+def test_with_database_reads_a_connection_without_every_field() -> None:
+    bare = types.SimpleNamespace(conn_id="s", conn_type="postgres", host="h")
+    moved = with_database(bare, "d")
+    assert (moved.port, moved.login, moved.password, moved.schema, moved.extra_dejson) == (None, None, None, "d", {})
+
+
+def test_the_missing_source_refusal_word_for_word(odbc_ini: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    lookup(monkeypatch, {})
+    head = "[RIVET_AIRFLOW_CONNECTION_MISSING] connection `nope` is not defined in the metadata database or any secrets backend this worker reads"
+    op = init_operator(tmp_path)
+    r = refusal(lambda: op._database({"conn_id": "nope", "odbc_ini": odbc_ini, "dsn": "nada"}))
+    assert str(r) == f"{head}, and {odbc_ini} has no data source [nada]; create it, or correct the id the task names"
+    r = refusal(lambda: op._database({"conn_id": "nope"}))
+    assert str(r) == f"{head}; create it, or correct the id the task names"
+
+
+def test_the_data_source_log_line_word_for_word(
+    odbc_ini: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, logged: Any
+) -> None:
+    lookup(monkeypatch, {})
+    init_operator(tmp_path)._database({"conn_id": "rivet_shop", "odbc_ini": odbc_ini, "dsn": "shop"})
+    assert f"database `rivet_shop`: no such Connection, ODBC data source [shop] in {odbc_ini}" in logged()
+
+
+@pytest.mark.parametrize("owned", ["--source", "--source-env", "--source-file", "-o", "--output", "--mode"])
+def test_every_flag_the_operator_owns_is_refused(tmp_path: Path, owned: str) -> None:
+    with pytest.raises(ValueError) as exc:
+        init_operator(tmp_path, init_args=["--tls", "disable", owned, "x"])
+    assert str(exc.value) == f"init_args may not set ['{owned}']: the operator sets the source, the output and the mode"
+
+
+def test_init_takes_cdc_or_batch(tmp_path: Path) -> None:
+    with pytest.raises(ValueError) as exc:
+        RivetInitOperator(task_id="i", mode="CDC", source_env="S", config="c", env_from_connections={"S": "s"})
+    assert str(exc.value) == "`mode` is 'cdc' or 'batch'"
+    assert (
+        RivetInitOperator(task_id="i", mode="batch", source_env="S", config="c", env_from_connections={"S": "s"}).mode == "batch"
+    )
+
+
+def test_batch_init_asks_rivet_for_no_mode_and_runs_where_it_writes(init: Init) -> None:
+    op = init_operator(init.tmp)
+    op.mode = "batch"
+    out = op.execute({"ti": FakeTI(task_id="init"), "run_id": "r"})
+    work = str(init.tmp / "state" / "shop" / ".init")
+    first, second = init.calls()
+    assert "--mode" not in first["argv"] and first["cwd"] == work == second["cwd"]
+    assert out == {
+        "config": str(init.config),
+        "written": True,
+        "exports": [
+            {"name": "shop_orders", "mode": "full", "tables": None},
+            {"name": "shop_cdc", "mode": "cdc", "tables": ["orders", "customers"]},
+        ],
+    }
+
+
+def test_init_logs_rivet_s_lines_and_what_it_wrote_word_for_word(init: Init, logged: Any) -> None:
+    init.run()
+    text = logged()
+    assert "wrote config, 100% %s of it" in text  # a line is logged as text, never as a format
+    lines = [line.split(" [airflow.task")[0].rstrip() for line in text.splitlines()]  # Airflow 3 appends the logger
+    assert any(line.endswith("export shop_orders (full)") for line in lines)
+    assert any(line.endswith("export shop_cdc (cdc): orders, customers") for line in lines)
+    assert f"{init.config} written; the next DAG parse replaces this task with the rivet tasks it describes" in text
+
+
+def test_init_names_the_failing_command(init: Init) -> None:
+    init.spec(check_exit=5)
+    assert str(init.run()) == "`rivet check` exited 5; its output is above, and no config was written"
+
+
+def test_init_makes_a_config_folder_two_levels_deep(init: Init) -> None:
+    op = init_operator(init.tmp)
+    op.config = str(init.tmp / "a" / "b" / "shop.yaml")
+    assert op.execute({"ti": FakeTI(task_id="init"), "run_id": "r"})["written"] is True
+
+
+def test_the_existing_config_log_line_word_for_word(init: Init, logged: Any) -> None:
+    init.config.parent.mkdir()
+    init.config.write_text("x: 1\n")
+    init.run()
+    assert (
+        f"{init.config} exists: the next DAG parse builds this DAG's rivet tasks from it. If this task keeps running "
+        "instead, the scheduler does not see this file: put the config folder where both read it"
+    ) in logged()
+
+
+def test_a_config_written_meanwhile_is_logged_and_its_places_are_not_another_source_s(
+    init: Init, monkeypatch: pytest.MonkeyPatch, logged: Any
+) -> None:
+    real = RivetInitOperator._rivet
+
+    def racing(self: RivetInitOperator, argv: list[str], env: Any, cwd: Path) -> None:
+        real(self, argv, env, cwd)
+        if argv[0] == "check":
+            init.config.parent.mkdir(exist_ok=True)
+            init.config.write_text(CDC_CONFIG.format(env="RIVET_SOURCE_URL"))  # the same places: the same source
+
+    monkeypatch.setattr(RivetInitOperator, "_rivet", racing)
+    assert init.run()["written"] is True
+    assert f"{init.config} was written meanwhile; it is kept" in logged()
+
+
+def test_an_unreadable_neighbour_is_skipped_and_the_next_one_still_checked(init: Init) -> None:
+    init.config.parent.mkdir()
+    (init.config.parent / "a_broken.yaml").write_bytes(b"\xff\xfe")
+    (init.config.parent / "billing.yaml").write_text(CDC_CONFIG.format(env="X"))
+    out = init.run()
+    assert str(out) == (
+        f"the config `rivet init` wrote for shop.yaml writes to bigquery p.shop, as {init.config.parent / 'billing.yaml'} "
+        "does; give each source its own place in init_args (`--gcs-bucket`/`--s3-bucket`, `--bigquery-dataset {name}`, "
+        "`--clickhouse-database {name}`); no config was written"
+    )
+
+
+def test_places_read_every_warehouse_name_and_a_bucket_root() -> None:
+    from airflow_provider_rivet.operators import places
+
+    doc = {
+        "load": {"target": "snowflake", "database": "DB", "schema": "S"},
+        "exports": [{"destination": {"type": "s3", "bucket": "b"}}, {"destination": {"type": "local", "path": "/x"}}],
+    }
+    assert places(doc) == {"s3://b/", "snowflake DB.S"}
+
+
+class Server(FakeServer):
+    """A server that, as PostgreSQL, refuses CREATE DATABASE inside a transaction."""
+
+    def connect(self, dsn: str) -> Any:
+        self.dsn.append(dsn)
+        conn = types.SimpleNamespace(close=lambda: None, autocommit=False)
+        conn.cursor = lambda: Cursor(self, conn)
+        return conn
+
+
+class Cursor(FakeCursor):
+    def __init__(self, server: FakeServer, conn: Any) -> None:
+        super().__init__(server)
+        self.conn = conn
+
+    def execute(self, sql: str, args: tuple = ()) -> None:
+        if sql.startswith("CREATE") and self.conn.autocommit is not True:
+            raise RuntimeError("CREATE DATABASE cannot run inside a transaction block")
+        super().execute(sql, args)
+
+
+def state_refs(init: Init, database: str) -> dict:
+    return {
+        "RIVET_SOURCE_URL": {"conn_id": "shop", "odbc_ini": str(init.tmp / "odbc.ini")},
+        "RIVET_STATE_URL": {"conn_id": "rivet_state", "database": database},
+    }
+
+
+def test_the_state_database_sql_word_for_word(init: Init, monkeypatch: pytest.MonkeyPatch, logged: Any) -> None:
+    server = Server()
+    monkeypatch.setitem(sys.modules, "psycopg2", types.SimpleNamespace(connect=server.connect))
+    lookup(monkeypatch, {"rivet_state": connection("rivet_state", "postgres", schema="admin")})
+    init.run(env_from_connections=state_refs(init, 'we"ird'))
+    assert server.dsn == ["postgresql://u:pw@rivet_state.host/admin"]
+    assert server.sql == [("SELECT 1 FROM pg_database WHERE datname = %s", ('we"ird',)), ('CREATE DATABASE "we""ird"', ())]
+    assert 'state database `we"ird` created on rivet_state.host' in logged()
+
+
+def test_without_psycopg2_the_state_database_is_refused(init: Init, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setitem(sys.modules, "psycopg2", None)
+    lookup(monkeypatch, {"rivet_state": connection("rivet_state", "postgres")})
+    out = init.run(env_from_connections=state_refs(init, "rivet_state_shop"))
+    assert str(out) == "[RIVET_AIRFLOW_STATE_DATABASE] creating state database `rivet_state_shop` needs psycopg2 on the worker"
+
+
+# --- the builder's decisions ---
+
+
+def test_builder_refusals_word_for_word(tmp_path: Path) -> None:
+    def message(**kwargs: Any) -> str:
+        args = {"sources": ["shop"], "mode": "cdc", "config_dir": str(tmp_path), "state_root": "/s", "state_connection": "st"}
+        with pytest.raises(ValueError) as exc:
+            build_source_dags(**{**args, **kwargs})
+        return str(exc.value)
+
+    assert message(sources=["Shop", "ok"]) == "source names are distinct and of [a-z0-9_]: ['Shop']"
+    assert message(sources=["a", "a"]) == "source names are distinct and of [a-z0-9_]: ['a']"
+    assert message(sources="shop") == "`sources` is a list of names, not a string: write sources=['shop']"
+    assert message(mode="CDC") == "`mode` is 'cdc' or 'batch'"
+    for key in ("config", "state_dir"):
+        assert message(operator_kwargs={key: "x"}) == f"operator_kwargs may not set ['{key}']: each source's DAG sets them"
+    assert message(operator_kwargs={"trigger_rule": "all_done"}).startswith("operator_kwargs may not set `trigger_rule`")
+    (tmp_path / "shop.yaml").write_text("exports: []\n")
+    assert message() == f"{tmp_path / 'shop.yaml'}: expected one export with `mode: cdc`, found 0"
+
+
+def test_every_source_is_built_whichever_has_a_config(tmp_path: Path) -> None:
+    (tmp_path / "zeta.yaml").write_text(CDC_CONFIG.format(env="RIVET_SOURCE_URL"))
+    dags = build_source_dags(["alpha", "zeta"], mode="cdc", config_dir=str(tmp_path), state_root="/s", state_connection="st")
+    assert {d: [t.task_id for t in dag.tasks][:1] for d, dag in dags.items()} == {
+        "rivet_alpha_cdc": ["init"],
+        "rivet_zeta_cdc": ["run"],
+    }
+    assert sorted(dags["rivet_alpha_cdc"].tags) == ["cdc", "init", "rivet"]
+
+
+def test_a_config_naming_no_url_env_gets_the_source_under_rivet_source_url(tmp_path: Path) -> None:
+    (tmp_path / "shop.yaml").write_text(CDC_CONFIG.format(env="RIVET_SOURCE_URL").replace("  url_env: RIVET_SOURCE_URL\n", ""))
+    assert set(build(tmp_path)["rivet_shop_cdc"].get_task("run").env_from_connections) == {"RIVET_SOURCE_URL", "RIVET_STATE_URL"}
+
+
+def test_a_stream_naming_no_table_without_a_warehouse_only_runs(tmp_path: Path) -> None:
+    assert tasks(tmp_path, cdc_config(load="", stream="")) == {"run", "watcher"}
+
+
+def test_batch_leaves_out_the_stream_and_loads_only_with_a_warehouse(tmp_path: Path) -> None:
+    stream = "  - name: cdc\n    mode: cdc\n    tables: [orders]\n"
+    (tmp_path / "shop.yaml").write_text(BATCH_CONFIG + stream)
+    assert {t.task_id for t in build(tmp_path, mode="batch")["rivet_shop_batch"].tasks} == {
+        "apply.orders",
+        "apply.customers",
+        "load.orders",
+        "load.customers",
+        "watcher",
+    }
+    (tmp_path / "shop.yaml").write_text(BATCH_CONFIG.replace("load:\n  target: bigquery\n  project: p\n  dataset: shop\n", ""))
+    assert {t.task_id for t in build(tmp_path, mode="batch")["rivet_shop_batch"].tasks} == {
+        "apply.orders",
+        "apply.customers",
+        "watcher",
+    }

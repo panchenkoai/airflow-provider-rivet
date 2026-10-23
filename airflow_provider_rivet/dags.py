@@ -238,6 +238,7 @@ def build_source_dags(
     taken = sorted({"env_from_connections", "config", "state_dir"} & set(operator_kwargs or {}))
     if taken:
         raise ValueError(f"operator_kwargs may not set {taken}: each source's DAG sets them")
+    _common("", None, operator_kwargs)  # the builders' own refusals, before any source has a config
     dags: dict[str, DAG] = {}
     for name in names:
         config = Path(config_dir) / f"{name}.yaml"
@@ -254,9 +255,9 @@ def build_source_dags(
         dag_id = f"rivet_{name}_{mode}"
         common = {"config": str(config), "state_dir": str(Path(state_root) / name), "operator_kwargs": kwargs, **settings}
         if not config_present(config):
-            dags[dag_id] = _init_dag(dag_id, name, mode, [a.replace("{name}", name) for a in init_args], common)
+            dags[dag_id] = _init_dag(dag_id, mode, [a.replace("{name}", name) for a in init_args], common)
             continue
-        doc = read_config(str(config), {SOURCE_ENV: ""})
+        doc = read_config(str(config))
         url_env = (doc.get("source") or {}).get("url_env")
         if url_env and url_env != SOURCE_ENV:  # a config moved from cron names its own variable
             kwargs["env_from_connections"] = {url_env: source, "RIVET_STATE_URL": state}
@@ -275,10 +276,10 @@ def build_source_dags(
     return dags
 
 
-def _init_dag(dag_id: str, name: str, mode: str, init_args: list[str], common: Mapping[str, Any]) -> DAG:
+def _init_dag(dag_id: str, mode: str, init_args: list[str], common: Mapping[str, Any]) -> DAG:
     """The DAG of a source with no config yet: its one task writes the config."""
     settings = {k: v for k, v in common.items() if k not in ("config", "state_dir", "operator_kwargs")}
-    task_kwargs = {k: v for k, v in common["operator_kwargs"].items() if k != "trigger_rule"}
+    task_kwargs = common["operator_kwargs"]
     with _dag(dag_id, ("rivet", mode, "init"), settings) as dag:
         RivetInitOperator(
             task_id="init",

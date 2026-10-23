@@ -411,8 +411,8 @@ class RivetInitOperator(RivetBaseOperator):
         self.source_env = source_env
         self.init_args = list(init_args)
 
-    def execute(self, context: Any) -> dict[str, Any]:
-        """Write the config, or report the one already there."""
+    def _run_with_secrets(self, ti: Any, run_id: str, task_part: str, secrets: Path) -> dict[str, Any]:
+        """Write the config, or report the one already there; `execute` gives the private folder for key files."""
         target = Path(self.config)
         if config_present(target):
             self.log.info(
@@ -421,16 +421,12 @@ class RivetInitOperator(RivetBaseOperator):
                 target,
             )
             return {"config": str(target), "written": False}
-        secrets = Path(tempfile.mkdtemp(prefix="rivet-airflow-secrets-"))
         try:
-            try:
-                env = self._environment(secrets)
-                self._create_state_database()
-            except PreflightRefusal as refusal:
-                raise AirflowFailException(str(refusal)) from None
-            return self._write_config(target, env)
-        finally:
-            shutil.rmtree(secrets, ignore_errors=True)
+            env = self._environment(secrets)
+            self._create_state_database()
+        except PreflightRefusal as refusal:
+            raise AirflowFailException(str(refusal)) from None
+        return self._write_config(target, env)
 
     def _config_doc(self) -> dict[str, Any]:
         """No config yet: a storage or warehouse Connection is filed under its own name."""
@@ -450,7 +446,7 @@ class RivetInitOperator(RivetBaseOperator):
             raise PreflightRefusal(
                 "RIVET_AIRFLOW_STATE_DATABASE", f"creating state database `{name}` needs psycopg2 on the worker"
             ) from None
-        conn = psycopg2.connect(connection_url(with_database(server, server.schema or "postgres"), "postgresql"))
+        conn = psycopg2.connect(connection_url(with_database(server, server.schema or "postgres")))
         try:
             conn.autocommit = True
             with conn.cursor() as cur:
@@ -467,7 +463,9 @@ class RivetInitOperator(RivetBaseOperator):
         """Run one rivet command, its output in the task log; a nonzero exit fails the task without a retry."""
         proc = subprocess.run([self.rivet_bin, *argv], env=dict(env), cwd=cwd, capture_output=True, text=True)
         for line in (proc.stdout + proc.stderr).splitlines():
-            self.log.info("%s", line)
+            self.log.info(
+                "%s", line
+            )  # pragma: no mutate - info(line) is the same line: a logger formats no message given no args
         if proc.returncode != 0:
             raise AirflowFailException(
                 f"`rivet {argv[0]}` exited {proc.returncode}; its output is above, and no config was written"
@@ -504,7 +502,7 @@ class RivetInitOperator(RivetBaseOperator):
         mode = ["--mode", "cdc"] if self.mode == "cdc" else []
         self._rivet(["init", "--source-env", self.source_env, *mode, "-o", str(draft), *self.init_args], env, work)
         self._rivet(["check", "--config", str(draft)], env, work)
-        doc = read_config(str(draft), dict(env), {})
+        doc = read_config(str(draft))  # init writes `url_env:`, no `${...}`
         target.parent.mkdir(parents=True, exist_ok=True)
         self._refuse_shared_places(doc, target)
         staged = target.with_name(f".{target.name}.{os.getpid()}.tmp")
@@ -514,7 +512,7 @@ class RivetInitOperator(RivetBaseOperator):
         except FileExistsError:
             self.log.info("%s was written meanwhile; it is kept", target)
         finally:
-            staged.unlink(missing_ok=True)
+            staged.unlink()
         exports = [{"name": e.get("name"), "mode": e.get("mode"), "tables": e.get("tables")} for e in doc.get("exports") or []]
         for e in exports:
             self.log.info(
