@@ -17,6 +17,7 @@ import pytest
 
 from airflow_provider_rivet import invocation
 from airflow_provider_rivet.preflight import PreflightRefusal
+from airflow_provider_rivet.reading import Reading
 
 
 def mode(path: Path) -> int:
@@ -294,10 +295,10 @@ def test_a_kind_that_cannot_be_listed_does_not_stop_the_other_kind_from_being_pr
 
 
 def test_entries_that_are_not_a_list_are_dropped_and_recorded() -> None:
-    """_entries 14: a number where the list goes."""
-    s = SimpleNamespace(degraded=set())
-    assert invocation._entries(s, {"per_export": 5}, "per_export") == []
-    assert s.degraded == {"result_malformed"}
+    """Reading.entries 14: a number where the list goes."""
+    read = Reading(set(), {}, "run")
+    assert read.entries({"per_export": 5}, "per_export") == []
+    assert read.degraded == {"result_malformed"}
 
 
 def test_tightening_a_file_rivet_did_not_write_is_left_to_the_step_that_reads_it(tmp_path: Path) -> None:

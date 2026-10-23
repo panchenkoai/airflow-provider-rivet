@@ -12,7 +12,7 @@ import pytest
 from airflow.exceptions import AirflowException
 from conftest import NEW_FLAGS, FakeTI, Rig
 
-from airflow_provider_rivet import invocation
+from airflow_provider_rivet import invocation, result
 from airflow_provider_rivet.invocation import crashed_retry_allowed
 from airflow_provider_rivet.operators import RivetApplyOperator, RivetLoadOperator, RivetRunOperator
 
@@ -248,12 +248,11 @@ def test_a_crash_ledger_that_cannot_be_written_names_the_error(tmp_path: Path, m
 
 
 def digest_of(row: dict) -> tuple[dict | None, set[str]]:
-    """`_digest` of one entry, and the degradations it recorded."""
-    from types import SimpleNamespace
+    """`Reading.digest` of one entry, and the degradations it recorded."""
+    from airflow_provider_rivet.reading import Reading
 
-    s = SimpleNamespace(degraded=set())
-    s.malformed = lambda value, kind: invocation._Session.malformed(s, value, kind)
-    return invocation._digest(s, row), s.degraded  # type: ignore[arg-type]
+    read = Reading(set(), {}, "load")
+    return read.digest(row), read.degraded
 
 
 def test_a_digest_is_read_with_the_contracts_types_and_nothing_else() -> None:
@@ -262,9 +261,9 @@ def test_a_digest_is_read_with_the_contracts_types_and_nothing_else() -> None:
     for name in ("load_result.json", "compact_result.json"):
         for row in fixture(name)["per_table"]:
             digest, degraded = digest_of(row)
-            assert digest == {k: row[k] for k in invocation.DIGEST_KEYS} and degraded == set(), (name, row["table"])
+            assert digest == {k: row[k] for k in result.DIGEST_KEYS} and degraded == set(), (name, row["table"])
     digest, degraded = digest_of({"rows_merged": "12", "bytes_billed": True, "files": 1.0, "warehouse_job_ids": ["j", 1]})
-    assert digest == {k: None for k in invocation.DIGEST_KEYS} and degraded == {"result_malformed"}
+    assert digest == {k: None for k in result.DIGEST_KEYS} and degraded == {"result_malformed"}
     digest, degraded = digest_of({"warehouse_job_ids": ["j", 1]})  # one id that is not a name: no ids at all
     assert digest["warehouse_job_ids"] is None and degraded == {"result_malformed"}
     digest, degraded = digest_of({"warehouse_job_ids": "j1", "runs": 2})
@@ -273,9 +272,9 @@ def test_a_digest_is_read_with_the_contracts_types_and_nothing_else() -> None:
 
 def test_an_entry_without_a_digest_key_is_an_older_binary_and_says_so() -> None:
     assert digest_of({"export": "e", "table": "t", "rows": 1, "target": "p.d.t"}) == (None, {"load_digest"})
-    for key in invocation.DIGEST_KEYS:  # any one key is the digest's shape: the rest read as null
+    for key in result.DIGEST_KEYS:  # any one key is the digest's shape: the rest read as null
         digest, degraded = digest_of({key: None})
-        assert digest == {k: None for k in invocation.DIGEST_KEYS} and degraded == set(), key
+        assert digest == {k: None for k in result.DIGEST_KEYS} and degraded == set(), key
 
 
 def test_the_unit_record_carries_the_digest_and_the_configs_names_where_xcom_has_none(rig: Rig) -> None:

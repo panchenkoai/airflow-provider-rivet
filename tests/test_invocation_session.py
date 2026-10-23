@@ -14,6 +14,7 @@ import pytest
 from airflow_provider_rivet import invocation
 from airflow_provider_rivet.invocation import Request, hashed_name, path_name
 from airflow_provider_rivet.preflight import STATE_URL_ENV, PreflightRefusal
+from airflow_provider_rivet.reading import Reading
 
 LABEL = ("dag", "run", "task", 2)
 
@@ -98,8 +99,8 @@ def test_a_narrowed_copy_that_cannot_be_cut_names_the_source_config(tmp_path: Pa
     ids=["missing", "not-json", "not-utf8", "object"],
 )
 def test_a_result_file_on_exit_zero_records_what_is_wrong_with_it(tmp_path: Path, body: object, degraded: set) -> None:
-    """_Session.result_file 7: missing and malformed are different words; a good file is neither."""
-    s = session(tmp_path)
+    """Reading.result_file 7: missing and malformed are different words; a good file is neither."""
+    s = Reading(set(), {}, "run")
     path = tmp_path / "summary.json"
     if isinstance(body, bytes):
         path.write_bytes(body)
