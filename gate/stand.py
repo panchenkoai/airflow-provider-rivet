@@ -25,6 +25,8 @@ REPO = HERE.parent
 PACKAGE_FILES = ("airflow_provider_rivet", "pyproject.toml", "README.md", "LICENSE", "CHANGELOG.md")
 #: The client's GCP key file, named by GOOGLE_APPLICATION_CREDENTIALS in the compose env (`--gcp-auth env-file`).
 GCP_KEY_IN_CONTAINER = "/etc/gcloud_cred.json"
+#: `--source-dags`: the odbc.ini of the workers, where build_source_dags reads it by default.
+ODBC_INI = "/etc/odbc.ini"
 #: ELF `e_machine` -> the manylinux platform tag of a `rivet-cli` wheel (rivet's dev/pytools/pypi_wheels.py tags).
 ELF_PLATFORMS = {0xB7: "manylinux_2_28_aarch64", 0x3E: "manylinux_2_28_x86_64"}
 RIVET_CLI_MODULE = '''"""The rivet binaries this wheel installed."""
@@ -358,8 +360,12 @@ class Stand:
         migrate_from: Path | None = None,
         gcp_key_file: Path | None = None,
         client_override: Path | None = None,
+        source_dags: Any = None,
     ) -> None:
         self.flavor = FLAVORS[version]
+        #: `--source-dags` (gate/source_dags.py `Layout`): the odbc.ini every Airflow container reads at ODBC_INI, and the
+        #: Connections of the sources that are not in it.
+        self.source_dags = source_dags
         #: The client's delivered compose files (`--client-override`): the stack runs them as delivered, on top of the
         #: official file; the gate's overlay goes on top of both.
         self.client_override = client_override
@@ -461,6 +467,7 @@ class Stand:
                 for kind in d.configs
             },
             **self.migration_connections(),
+            **(self.source_dags.connections(self.secrets) if self.source_dags is not None else {}),
             **self.extra_connections,
         }
 
@@ -585,6 +592,11 @@ class Stand:
             for sub in HOST_DIRS:
                 (self.host_disk(host) / sub).mkdir(parents=True)
         shutil.copy2(HERE / "stand" / "dags" / "rivet_gate.py", self.dir / "dags" / "rivet_gate.py")
+        if self.source_dags is not None:
+            # The DAG file of `--source-dags` (DAGs once the legs write their calls), and the odbc.ini the Airflow
+            # containers read (its passwords are the stack's own: a private file, mounted read-only).
+            shutil.copy2(HERE / "stand" / "dags" / "rivet_source_dags.py", self.dir / "dags" / "rivet_source_dags.py")
+            write_private(self.dir / "odbc.ini", self.source_dags.odbc_ini(self.secrets))
         if self.client_override is not None:
             self.lay_out_client()
         if self.migrate_from:
@@ -668,7 +680,8 @@ class Stand:
             ),
             client="1" if self.client_override else "",
             # The key file the client's compose names but does not mount (the client's prod file mounts it).
-            extra_volumes=f"    - {self.gcp_key_file}:{GCP_KEY_IN_CONTAINER}:ro\n" if self.gcp_key_file else "",
+            extra_volumes=(f"    - {self.gcp_key_file}:{GCP_KEY_IN_CONTAINER}:ro\n" if self.gcp_key_file else "")
+            + (f"    - {self.dir / 'odbc.ini'}:{ODBC_INI}:ro\n" if self.source_dags is not None else ""),
             **vars(self.secrets),
         )
 
@@ -892,6 +905,14 @@ class Stand:
                 now = str(exc)[-300:]
             time.sleep(2)
         raise TimeoutError(f"queue {queue} is consumed as {now}, not by {host} alone, after {timeout:.0f} s")
+
+    def runs(self, dag: str) -> list[dict[str, Any]]:
+        """The DAG's runs (id, state, run type)."""
+        return self._call("GET", f"/dags/{dag}/dagRuns")["dag_runs"]
+
+    def dag_tasks(self, dag: str) -> list[str]:
+        """The task ids of the DAG as the scheduler last parsed it."""
+        return sorted(t["task_id"] for t in self._call("GET", f"/dags/{dag}/tasks")["tasks"])
 
     def tasks(self, dag: str, run_id: str) -> dict[str, dict[str, Any]]:
         """Task instances of a run by task id: state, start, end."""

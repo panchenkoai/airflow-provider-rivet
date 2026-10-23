@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -188,10 +188,12 @@ def grade_runs(
     states: dict[str, str],
     tasks_of: dict[str, list[str]],
     may_skip: Mapping[str, tuple[str, ...]] | None = None,
+    refused: Mapping[str, Sequence[str]] | None = None,
 ) -> dict[str, dict[str, Any]]:
     """Every DAG run succeeded and every rivet task in it too (a task whose id starts with a prefix `may_skip` gives
-    for its DAG may be skipped)."""
-    may_skip = may_skip or {}
+    for its DAG may be skipped). A DAG `refused` names tasks for (a stream rivet refuses by a documented limit, graded
+    by the leg's own cell) must end `failed`, those tasks failed and every other wanted task succeeded."""
+    may_skip, refused = may_skip or {}, refused or {}
     tasks = {}
     for dag, wanted in tasks_of.items():
         tasks[dag] = stand.tasks(dag, run_id)
@@ -201,7 +203,14 @@ def grade_runs(
             if t in wanted and i["state"] != "success" and not (i["state"] == "skipped" and t.startswith(may_skip.get(dag, ())))
         }
         missing = sorted(set(wanted) - set(tasks[dag]))
-        problems = ([f"run {states.get(dag)}"] if states.get(dag) != "success" else []) + ([f"tasks {bad}"] if bad else [])
+        stops = list(refused.get(dag, ()))
+        want = "failed" if stops else "success"
+        not_failed = {t: tasks[dag].get(t, {}).get("state") for t in stops if tasks[dag].get(t, {}).get("state") != "failed"}
+        problems = (
+            ([f"run {states.get(dag)}" + (f", expected {want}" if stops else "")] if states.get(dag) != want else [])
+            + ([f"tasks {bad}"] if bad else [])
+            + ([f"refused tasks {not_failed}, expected failed"] if not_failed else [])
+        )
         v.grade(f"{name}/{dag}/run", problems + ([f"no tasks {missing}"] if missing else []), ok=f"run {states.get(dag)}")
     return tasks
 
@@ -332,7 +341,7 @@ def run_cycle(
             print(f"SABOTAGE {leg.sabotage()}", flush=True)
         leg.grade(stand, v, name, {t: DELETED_BY_BATCH[name] if t == "gate_orders" else 0 for t in TABLES})
     for src in src_legs:
-        grade_runs(stand, v, name, run_id, states, src.cycle_tasks(), may_skip=src.may_skip)
+        grade_runs(stand, v, name, run_id, states, src.cycle_tasks(), may_skip=src.may_skip, refused=src.refused)
         src.grade(stand, v, name, run_id)
     for dest in dest_legs:
         grade_runs(stand, v, name, run_id, states, dest.tasks, may_skip=dest.may_skip)
@@ -371,6 +380,10 @@ def play(
         + [d for src in src_legs for d in [*src.dags, *filter(None, [src.hot_dag, src.shared_dag, src.overlap_dag])]]
         + [d for x in dest_legs for d in [*x.dags, *x.probe_dags]]
     )
+    for src in src_legs:
+        # `--source-dags`: the DAGs just unpaused write their configs (their `init` runs); the leg waits for each and for
+        # the DAG built from what it wrote.
+        src.adopt(stand, v)
     files: set[str] = set()
     high_water: dict[str, Any] = {}
     history: dict[str, list[list[str]]] = {state: [] for state in STATES}
@@ -379,6 +392,8 @@ def play(
             stand, v, n, name, changes, ops, files, high_water, history, sabotage, leg, src_legs, dest_legs
         )
     for src in src_legs:
+        if not src.extras:
+            continue
         if src.hot_dag:
             src.hot_phase(stand, v, wait_runs, grade_runs)
         if src.engine.shared is not None and src.shared:
@@ -395,7 +410,7 @@ def play(
     for readme in readme_legs:
         readme.play(stand, v, wait_runs)
     for src in src_legs:
-        if src.engine.duplicate_db:
+        if src.extras and src.engine.duplicate_db:
             src.unqualified_phase(stand, v, wait_runs)
     for dest in dest_legs:
         dest.missing_bucket_probe(stand, v, wait_runs)

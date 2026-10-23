@@ -291,6 +291,30 @@ its subtype) and compared with BigQuery's `document` read back as extended JSON 
 `_id` text; Oracle is read by python-oracledb (exact decimals, LOBs as bytes, the zoned instant as `TO_CHAR` text with
 its offset).
 
+**The source legs through `build_source_dags`.** `--source-dags` (beside `--sources`, on the gate's own state) runs the
+same engines the way docs/dag-builders.md ("One DAG per database") tells an operator to: the gate runs no `rivet init`
+and writes no config. Each engine's sources are names, `<engine>_<batch|cdc>` (MongoDB: `mongodb_cdc` only): MySQL,
+SQL Server and Oracle are data sources of an odbc.ini the stack mounts read-only at `/etc/odbc.ini` in every Airflow
+container (`MySQL ODBC 8.0 Unicode Driver`, `ODBC Driver 18 for SQL Server` with `Server = tcp:host,port`, `Oracle 21
+ODBC driver` with `ServerName = host:port/FREEPDB1`; Oracle CDC signs in as the common user `c##rivetcdc` LogMiner needs,
+with `--schema RIVET`), and no Airflow Connection has those names; MongoDB is an Airflow Connection. The DAG file
+(`gate/stand/dags/rivet_source_dags.py`) makes one `build_source_dags` call per engine and mode (their `init_args`
+differ: `--tls require` for SQL Server), names only, `state_connection` the stack's `gate-state`, `init_args` naming
+each source's bucket and dataset with `{name}`, `schedule="@once"`. The gate unpauses each DAG, waits for its `init`
+run and for the DAG the next parse builds from the config init wrote, then runs the cycles on those DAGs, graded by the
+source legs' oracles (Oracle CDC, which has no `load:` block: its Parquet parts in the bucket replayed in commit-SCN
+order by `oracle.cdc_replay` against the source, and each cycle's change parts counted by `oracle.cdc_ops`). Cells:
+`<engine>/source-dags/<kind>/init` (the config written, `rivet_state_<name>` absent before and created by init, the
+source read from odbc.ini or the Connection, every CDC checkpoint in `<state_root>/<name>` after the first cycle),
+`<engine>/source-dags/<kind>/shape` (the task ids after the rebuild equal what the config promises: one stream at the
+top on MySQL, a group per stream on SQL Server, Oracle and MongoDB), `mongodb/source-dags/odbc-refused` (a MongoDB data
+source of the odbc.ini with no Connection: its `init` fails once with `RIVET_AIRFLOW_CONNECTION_UNSUPPORTED` and the
+BI Connector reason), `<cycle>/oracle/source-dags/cdc/GATE_ORDERS/known-limit` (Oracle CDC refuses a table with a
+LOB column by name), and the source legs' data cells. build_source_dags passes init no `--mode` for `batch`, so a
+batch config is init's suggestion (`full` for the scenario's small tables): a `full` export's target keeps no
+deleted key and each extract moves every row. The phases after the cycles (hot ALTER, overlap, git-sync, ...) belong
+to the gate's own DAGs and are not run.
+
 **Destination legs.** `--destinations s3` (needs no cloud) adds a MinIO container to the stack and runs the postgres
 scenario to S3 on the configs `rivet init --s3-bucket <bucket> --s3-region us-east-1` writes, used as written: an
 extract-only half (incremental batch and the CDC stream, `gate_s3_batch` / `gate_s3_cdc`) and a load half that adds
