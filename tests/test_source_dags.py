@@ -86,6 +86,8 @@ if argv[0] == "init":
     if spec.get("sleep"):
         import time
         time.sleep(spec["sleep"])
+    if spec.get("raw"):
+        sys.stdout.buffer.write(b"caf\\xe9 table\\n")
     if spec.get("init_exit"):
         print("error: cannot connect", file=sys.stderr)
         sys.exit(spec["init_exit"])
@@ -891,3 +893,43 @@ def test_a_stop_reaches_the_running_rivet(init: Init) -> None:
     with pytest.raises(AirflowFailException, match="`rivet init` exited -15"):
         op.execute({"ti": FakeTI(task_id="init"), "run_id": "r"})
     assert time.monotonic() - started < 20 and not init.config.exists()
+
+
+def test_rivet_s_stderr_and_bytes_that_are_not_utf8_reach_the_log(init: Init, logged: Any) -> None:
+    init.spec(raw=True, init_exit=5)
+    init.run()
+    text = logged()
+    assert said(text, "caf\ufffd table") and said(text, "error: cannot connect")
+    assert sorted(p.name for p in (init.tmp / "state" / "shop" / ".init").glob("*.log")) == ["init.log"]
+
+
+def test_a_key_file_connection_gets_the_task_s_private_folder(init: Init, monkeypatch: pytest.MonkeyPatch) -> None:
+    gcp = connection("gcp", "google_cloud_platform", extra={"keyfile_dict": {"type": "service_account"}})
+    lookup(monkeypatch, {"gcp": gcp})
+    assert init.run(connections=["gcp"])["written"] is True
+
+
+def test_a_stop_is_told_in_its_own_words_and_a_later_on_kill_finds_no_process(init: Init) -> None:
+    op = init_operator(init.tmp)
+    assert op.execute({"ti": FakeTI(task_id="init"), "run_id": "r"})["written"] is True
+    op.on_kill()  # after the task: no process is held, nothing to signal
+    init.config.unlink()
+    with pytest.raises(Exception) as exc:
+        op.execute({"ti": FakeTI(task_id="init"), "run_id": "r"})
+    assert str(exc.value) == "the task was stopped before rivet init started; rivet init was not run"
+
+
+def test_another_source_sharing_a_place_is_found_beside_a_config_written_meanwhile(
+    init: Init, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = RivetInitOperator._rivet
+
+    def racing(self: RivetInitOperator, binary: str, argv: list[str], env: Any, cwd: Path) -> None:
+        real(self, binary, argv, env, cwd)
+        if argv[0] == "check":
+            init.config.write_text("x: 1\n")  # this source's own, written by another try
+
+    init.config.parent.mkdir()
+    (init.config.parent / "zeta.yaml").write_text(CDC_CONFIG.format(env="X"))  # sorted after shop.yaml
+    monkeypatch.setattr(RivetInitOperator, "_rivet", racing)
+    assert "writes to bigquery p.shop, as" in str(init.run())
