@@ -35,9 +35,9 @@ from .invocation import (
     Outcome,
     Request,
     Stopped,
+    crashed_ledger,
     crashed_retry_allowed,
     invoke,
-    path_name,
     spawn,
     worker_environment,
 )
@@ -301,8 +301,7 @@ class RivetBaseOperator(BaseOperator):
             # SQLite state guarantees and PostgreSQL state does not (a retry on another host saw an empty ledger and
             # granted the budget again). Elsewhere the budget is the first `crashed_retries` tries, as on a pod.
             if outcome.marker is not None and self.state_dir and outcome.state_kind == "sqlite":
-                name = f"{path_name(run_id, task_part)}.json"
-                ledger = Path(self.state_dir) / "airflow" / path_name(ti.dag_id) / "crashed" / name
+                ledger = crashed_ledger(self.state_dir, ti.dag_id, run_id, task_part)
             allowed, problem = crashed_retry_allowed(ledger, ti.try_number, ti.max_tries, self.crashed_retries)
             payload["crashed_retry"] = allowed
             if ledger is None or problem:

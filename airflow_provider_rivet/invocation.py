@@ -54,6 +54,10 @@ _LOG_FILE = re.compile(r"^(?P<attempt>.+)\.[a-z]+\.(?:stderr|stdout)\.log$")
 LOCK_POLL = 0.2  # seconds between two tries of a held export lock
 BUSY_CODE = "RIVET_AIRFLOW_EXPORT_BUSY"
 PR_SET_PDEATHSIG = 1  # <linux/prctl.h>
+# The layout of the package's own files in a state directory (docs/state.md): `<state_dir>/airflow/<dag>/` holds a
+# DAG's sealed plans (`plans/<run>/`) and crashed ledgers (`crashed/`), which `_prune_stale` walks; `airflow/locks/`
+# the export locks; `logs/<dag>/<task>/` the stderr files.
+WORK, PLANS, CRASHED, LOCKS, LOGS = "airflow", "plans", "crashed", "locks", "logs"
 
 
 def worker_environment(
@@ -63,6 +67,11 @@ def worker_environment(
     patterns = [*ENV_ALLOWLIST, *passthrough, *(name for cloud in clouds for name in CLOUD_ENV[cloud])]
     source = os.environ if environ is None else environ
     return {k: v for k, v in source.items() if any(fnmatch.fnmatchcase(k, pattern) for pattern in patterns)}
+
+
+def crashed_ledger(state_dir: str | Path, dag_id: str, run_id: str, task_part: str) -> Path:
+    """The crashed-retry ledger of one task of one DAG run, in the DAG's work folder where `_prune_stale` finds it."""
+    return Path(state_dir) / WORK / path_name(dag_id) / CRASHED / f"{path_name(run_id, task_part)}.json"
 
 
 def hashed_name(*parts: Any) -> str:
@@ -239,7 +248,7 @@ class _Session:
         self.global_name = path_name(*request.label[:3], attempt)
         self.log_name = f"{run}__{attempt}"
         if pf.state_dir is not None:
-            self.work = _private_dir(pf.state_dir, "airflow", dag)
+            self.work = _private_dir(pf.state_dir, WORK, dag)
         else:
             self.tmp = Path(tempfile.mkdtemp(prefix="rivet-airflow-"))
             self.work = self.tmp
@@ -247,9 +256,9 @@ class _Session:
             Path(request.stderr_dir).mkdir(parents=True, exist_ok=True)
             self.logs = _private_dir(Path(request.stderr_dir), dag, task)
         elif pf.state_dir is not None:
-            self.logs = _private_dir(pf.state_dir, "logs", dag, task)
+            self.logs = _private_dir(pf.state_dir, LOGS, dag, task)
         else:
-            self.logs = _private_dir(_temp_base(), "logs", dag, task)
+            self.logs = _private_dir(_temp_base(), LOGS, dag, task)
             self.degraded.add("stderr_temp")
 
     def close(self) -> None:
@@ -453,16 +462,16 @@ def _tighten(path: Path) -> None:
 def _prune_stale(work: Path, now: float | None = None) -> None:
     """Remove expired plan artifacts and crashed ledgers untouched for STALE_AFTER, and the run folders left empty (D33)."""
     cutoff = (time.time() if now is None else now) - STALE_AFTER
-    for kind in ("plans", "crashed"):
+    for kind in (PLANS, CRASHED):
         try:
             files = [p for p in (work / kind).rglob("*") if p.is_file() and p.stat().st_mtime < cutoff]
         except OSError:
             continue
         for path in files:
-            if _unexpired(path) if kind == "plans" else not isinstance(_read_json(path), list):
+            if _unexpired(path) if kind == PLANS else not isinstance(_read_json(path), list):
                 continue  # a replayable plan, or a ledger that is not one: left until a person deletes it
             path.unlink(missing_ok=True)  # pragma: no mutate - just listed; gone only if a parallel task removed it
-        if kind == "plans":
+        if kind == PLANS:
             for folder in (work / kind).iterdir() if (work / kind).is_dir() else ():
                 try:
                     folder.rmdir()
@@ -621,7 +630,7 @@ def _lock_path(s: _Session) -> tuple[Path, str] | None:
     if s.pf.state_dir is None or s.req.command == "plan":
         return None
     cmd, export, table = s.req.command, s.req.export, s.req.table
-    locks = _private_dir(s.pf.state_dir, "airflow", "locks")
+    locks = _private_dir(s.pf.state_dir, WORK, LOCKS)
     whole = hashed_name("config", os.path.abspath(s.req.config))
     if cmd in ("load", "compact"):
         if table and s.pf.caps.has_flag(cmd, "--table"):
@@ -862,7 +871,7 @@ def _apply(s: _Session) -> Outcome:
     # success plans again instead of replaying a snapshot the successful apply already moved the cursor past (D04).
     series = () if s.req.series is None else (f"s{int(s.req.series)}",)
     name = path_name(export, s.req.label[2], *series, _plan_inputs(s, export))
-    artifact = _private_dir(s.work, "plans", s.run) / f"{name}.json"
+    artifact = _private_dir(s.work, PLANS, s.run) / f"{name}.json"
     _refuse_foreign_artifact(artifact, export, cfg)
     if not _unexpired(artifact):
         plan_argv = [s.pf.binary, "plan", "--config", cfg, "--export", export, "--format", "json"]

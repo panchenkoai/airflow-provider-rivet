@@ -62,6 +62,25 @@ def test_closing_a_session_with_a_state_directory_prunes_old_ledgers(tmp_path: P
     assert not ledger.exists()
 
 
+def test_the_ledger_an_operator_writes_is_one_a_session_prunes(tmp_path: Path) -> None:
+    """crashed_ledger and _Session.work name one folder: a ledger the operator keeps is pruned by the session's close,
+    whatever the DAG id's spelling (path_name hashes an upper-case one in both)."""
+    for dag in ("dag", "Daily Orders"):
+        s = invocation._Session(
+            Request("load", str(session(tmp_path).req.config), {}, label=(dag, "run", "task[3]", 1), log_keep=None),
+            session(tmp_path).pf,
+            lambda e: None,
+            None,
+        )
+        ledger = invocation.crashed_ledger(tmp_path / "state", dag, "run", "task[3]")
+        assert ledger.parent == s.work / invocation.CRASHED
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        ledger.write_text("[[1, 2]]")
+        os.utime(ledger, (0, 0))
+        s.close()
+        assert not ledger.exists()
+
+
 def test_a_stderr_directory_whose_parents_are_missing_is_created(tmp_path: Path) -> None:
     """_Session.__init__ 48/50/53."""
     logs = tmp_path / "a" / "b" / "logs"
