@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sys
 import types
 from pathlib import Path
@@ -82,6 +83,9 @@ with open(here / "calls.jsonl", "a") as log:
                           "state": os.environ.get("RIVET_STATE_URL"), "cwd": os.getcwd()}) + "\\n")
 spec = json.loads((here / "spec.json").read_text())
 if argv[0] == "init":
+    if spec.get("sleep"):
+        import time
+        time.sleep(spec["sleep"])
     if spec.get("init_exit"):
         print("error: cannot connect", file=sys.stderr)
         sys.exit(spec["init_exit"])
@@ -189,8 +193,7 @@ def init_operator(tmp_path: Path, **kwargs: Any) -> RivetInitOperator:
         mode="cdc",
         source_env="RIVET_SOURCE_URL",
         config=str(tmp_path / "cfg" / "shop.yaml"),
-        rivet_bin=str(tmp_path / "bin" / "rivet"),
-        **kwargs,
+        **{"rivet_bin": str(tmp_path / "bin" / "rivet"), **kwargs},
     )
 
 
@@ -307,8 +310,8 @@ def test_an_existing_config_is_never_replaced(init: Init) -> None:
 def test_a_config_written_meanwhile_is_kept(init: Init, monkeypatch: pytest.MonkeyPatch) -> None:
     real = RivetInitOperator._rivet
 
-    def racing(self: RivetInitOperator, argv: list[str], env: Any, cwd: Path) -> None:
-        real(self, argv, env, cwd)
+    def racing(self: RivetInitOperator, binary: str, argv: list[str], env: Any, cwd: Path) -> None:
+        real(self, binary, argv, env, cwd)
         if argv[0] == "check":
             init.config.parent.mkdir(exist_ok=True)
             init.config.write_text("# another try's\n")
@@ -552,6 +555,12 @@ def logged(caplog: pytest.LogCaptureFixture, capsys: pytest.CaptureFixture) -> A
     return lambda: caplog.text + capsys.readouterr().out
 
 
+def said(text: str, message: str) -> bool:
+    """`message` is one whole log line: `] message [airflow...` on Airflow 3, `... message` at a line's end on 2.10."""
+    framed = re.compile(rf"\] {re.escape(message)} +\[")  # Airflow 3 pads the message to a column
+    return any(framed.search(line) or line.endswith(f" {message}") for line in text.splitlines())
+
+
 def refusal(call: Any) -> PreflightRefusal:
     with pytest.raises(PreflightRefusal) as exc:
         call()
@@ -620,7 +629,7 @@ def test_the_data_source_log_line_word_for_word(
 ) -> None:
     lookup(monkeypatch, {})
     init_operator(tmp_path)._database({"conn_id": "rivet_shop", "odbc_ini": odbc_ini, "dsn": "shop"})
-    assert f"database `rivet_shop`: no such Connection, ODBC data source [shop] in {odbc_ini}" in logged()
+    assert said(logged(), f"database `rivet_shop`: no such Connection, ODBC data source [shop] in {odbc_ini}")
 
 
 @pytest.mark.parametrize("owned", ["--source", "--source-env", "--source-file", "-o", "--output", "--mode"])
@@ -659,11 +668,11 @@ def test_batch_init_asks_rivet_for_no_mode_and_runs_where_it_writes(init: Init) 
 def test_init_logs_rivet_s_lines_and_what_it_wrote_word_for_word(init: Init, logged: Any) -> None:
     init.run()
     text = logged()
-    assert "wrote config, 100% %s of it" in text  # a line is logged as text, never as a format
+    assert said(text, "wrote config, 100% %s of it")  # a line is logged as text, never as a format
     lines = [line.split(" [airflow.task")[0].rstrip() for line in text.splitlines()]  # Airflow 3 appends the logger
     assert any(line.endswith("export shop_orders (full)") for line in lines)
     assert any(line.endswith("export shop_cdc (cdc): orders, customers") for line in lines)
-    assert f"{init.config} written; the next DAG parse replaces this task with the rivet tasks it describes" in text
+    assert said(text, f"{init.config} written; the next DAG parse replaces this task with the rivet tasks it describes")
 
 
 def test_init_names_the_failing_command(init: Init) -> None:
@@ -681,10 +690,11 @@ def test_the_existing_config_log_line_word_for_word(init: Init, logged: Any) -> 
     init.config.parent.mkdir()
     init.config.write_text("x: 1\n")
     init.run()
-    assert (
+    assert said(
+        logged(),
         f"{init.config} exists: the next DAG parse builds this DAG's rivet tasks from it. If this task keeps running "
-        "instead, the scheduler does not see this file: put the config folder where both read it"
-    ) in logged()
+        "instead, the scheduler does not see this file: put the config folder where both read it",
+    )
 
 
 def test_a_config_written_meanwhile_is_logged_and_its_places_are_not_another_source_s(
@@ -692,15 +702,15 @@ def test_a_config_written_meanwhile_is_logged_and_its_places_are_not_another_sou
 ) -> None:
     real = RivetInitOperator._rivet
 
-    def racing(self: RivetInitOperator, argv: list[str], env: Any, cwd: Path) -> None:
-        real(self, argv, env, cwd)
+    def racing(self: RivetInitOperator, binary: str, argv: list[str], env: Any, cwd: Path) -> None:
+        real(self, binary, argv, env, cwd)
         if argv[0] == "check":
             init.config.parent.mkdir(exist_ok=True)
             init.config.write_text(CDC_CONFIG.format(env="RIVET_SOURCE_URL"))  # the same places: the same source
 
     monkeypatch.setattr(RivetInitOperator, "_rivet", racing)
     assert init.run()["written"] is True
-    assert f"{init.config} was written meanwhile; it is kept" in logged()
+    assert said(logged(), f"{init.config} was written meanwhile; it is kept")
 
 
 def test_an_unreadable_neighbour_is_skipped_and_the_next_one_still_checked(init: Init) -> None:
@@ -760,7 +770,7 @@ def test_the_state_database_sql_word_for_word(init: Init, monkeypatch: pytest.Mo
     init.run(env_from_connections=state_refs(init, 'we"ird'))
     assert server.dsn == ["postgresql://u:pw@rivet_state.host/admin"]
     assert server.sql == [("SELECT 1 FROM pg_database WHERE datname = %s", ('we"ird',)), ('CREATE DATABASE "we""ird"', ())]
-    assert 'state database `we"ird` created on rivet_state.host' in logged()
+    assert said(logged(), 'state database `we"ird` created on rivet_state.host')
 
 
 def test_without_psycopg2_the_state_database_is_refused(init: Init, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -826,3 +836,58 @@ def test_batch_leaves_out_the_stream_and_loads_only_with_a_warehouse(tmp_path: P
         "apply.customers",
         "watcher",
     }
+
+
+GCS_DEST = "    destination: {type: gcs, bucket: b, prefix: shop/cdc/}\n"
+
+
+def test_every_shared_place_is_named(init: Init) -> None:
+    init.spec(yaml=CDC_CONFIG.format(env="RIVET_SOURCE_URL") + GCS_DEST)
+    init.config.parent.mkdir()
+    (init.config.parent / "billing.yaml").write_text(CDC_CONFIG.format(env="X") + GCS_DEST)
+    assert "writes to bigquery p.shop, gcs://b/shop/cdc/, as" in str(init.run())
+
+
+def test_a_missing_binary_is_refused_with_the_payload_every_task_pushes(init: Init) -> None:
+    ti = FakeTI(task_id="init")
+    op = init_operator(init.tmp, rivet_bin="rivet-nowhere")
+    with pytest.raises(AirflowFailException, match=r"^\[RIVET_AIRFLOW_BINARY_MISSING\] no rivet binary `rivet-nowhere`"):
+        op.execute({"ti": ti, "run_id": "r"})
+    assert ti.store[("init", "return_value")] == {
+        "command": "init",
+        "decision": "fail",
+        "preflight_refusal": "RIVET_AIRFLOW_BINARY_MISSING",
+        "units": [],
+    }
+    assert init.calls() == []
+
+
+def test_the_packaged_binary_is_found_off_the_path(init: Init, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr("airflow_provider_rivet.preflight._packaged_rivet", lambda: str(init.tmp / "bin" / "rivet"))
+    op = init_operator(init.tmp, rivet_bin="rivet", env_passthrough=())
+    monkeypatch.setenv("PATH", "/nonexistent")
+    assert op.execute({"ti": FakeTI(task_id="init"), "run_id": "r"})["written"] is True
+
+
+def test_a_stop_before_a_step_starts_none_and_is_retried(init: Init) -> None:
+    ti = FakeTI(task_id="init")
+    op = init_operator(init.tmp)
+    op.on_kill()
+    with pytest.raises(Exception) as exc:
+        op.execute({"ti": ti, "run_id": "r"})
+    assert type(exc.value).__name__ == "AirflowException"
+    assert ti.store[("init", "return_value")] == {"command": "init", "decision": "retry", "stopped_before": "init", "units": []}
+    assert init.calls() == [] and not init.config.exists()
+
+
+def test_a_stop_reaches_the_running_rivet(init: Init) -> None:
+    import threading
+    import time
+
+    init.spec(sleep=60)
+    op = init_operator(init.tmp)
+    threading.Timer(1.0, op.on_kill).start()
+    started = time.monotonic()
+    with pytest.raises(AirflowFailException, match="`rivet init` exited -15"):
+        op.execute({"ti": FakeTI(task_id="init"), "run_id": "r"})
+    assert time.monotonic() - started < 20 and not init.config.exists()

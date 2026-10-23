@@ -38,9 +38,10 @@ from .invocation import (
     crashed_retry_allowed,
     invoke,
     path_name,
+    spawn,
     worker_environment,
 )
-from .preflight import PreflightRefusal, read_config
+from .preflight import PreflightRefusal, read_config, resolve_binary
 from .tasklog import TaskLog
 
 XCOM_KEY = "return_value"
@@ -423,10 +424,17 @@ class RivetInitOperator(RivetBaseOperator):
             return {"config": str(target), "written": False}
         try:
             env = self._environment(secrets)
+            binary = resolve_binary(self.rivet_bin, env)
             self._create_state_database()
         except PreflightRefusal as refusal:
-            raise AirflowFailException(str(refusal)) from None
-        return self._write_config(target, env)
+            self._refuse(ti, refusal)
+        try:
+            return self._write_config(target, env, binary)
+        except Stopped as stop:
+            payload = {"command": self.command, "decision": "retry", "stopped_before": stop.step, "units": []}
+            self._fail(ti, payload, str(stop), retry=True)
+        finally:
+            self._proc = None
 
     def _config_doc(self) -> dict[str, Any]:
         """No config yet: a storage or warehouse Connection is filed under its own name."""
@@ -459,17 +467,20 @@ class RivetInitOperator(RivetBaseOperator):
         finally:
             conn.close()
 
-    def _rivet(self, argv: list[str], env: Mapping[str, str], cwd: Path) -> None:
-        """Run one rivet command, its output in the task log; a nonzero exit fails the task without a retry."""
-        proc = subprocess.run([self.rivet_bin, *argv], env=dict(env), cwd=cwd, capture_output=True, text=True)
-        for line in (proc.stdout + proc.stderr).splitlines():
+    def _rivet(self, binary: str, argv: list[str], env: Mapping[str, str], cwd: Path) -> None:
+        """Run one rivet command, stoppable by `on_kill`, its output in the task log; a nonzero exit fails the task
+        without a retry. A stop requested before it starts raises `Stopped`."""
+        if self._stop_requested:
+            raise Stopped(argv[0])
+        output = cwd / f"{argv[0]}.log"
+        with output.open("w") as out:
+            code = spawn([binary, *argv], out, subprocess.STDOUT, env, str(cwd), self._hold)
+        for line in output.read_text(errors="replace").splitlines():
             self.log.info(
                 "%s", line
             )  # pragma: no mutate - info(line) is the same line: a logger formats no message given no args
-        if proc.returncode != 0:
-            raise AirflowFailException(
-                f"`rivet {argv[0]}` exited {proc.returncode}; its output is above, and no config was written"
-            )
+        if code != 0:
+            raise AirflowFailException(f"`rivet {argv[0]}` exited {code}; its output is above, and no config was written")
 
     def _refuse_shared_places(self, doc: Mapping[str, Any], target: Path) -> None:
         """Refuse a config that writes where another config of the folder writes: one bucket prefix (their files mix) or
@@ -489,7 +500,7 @@ class RivetInitOperator(RivetBaseOperator):
                     "`--clickhouse-database {name}`); no config was written"
                 )
 
-    def _write_config(self, target: Path, env: Mapping[str, str]) -> dict[str, Any]:
+    def _write_config(self, target: Path, env: Mapping[str, str], binary: str) -> dict[str, Any]:
         """`rivet init` into the state folder (where the tasks run the config), `rivet check` there, then `target`."""
         state_dir = Path(self.state_dir or target.parent)
         if not state_dir.parent.is_dir():  # a state root that is not there is a volume not mounted: never made here
@@ -500,8 +511,8 @@ class RivetInitOperator(RivetBaseOperator):
         draft = work / target.name  # init names the stream's server_id, slot, checkpoint and prefix after this stem
         draft.unlink(missing_ok=True)
         mode = ["--mode", "cdc"] if self.mode == "cdc" else []
-        self._rivet(["init", "--source-env", self.source_env, *mode, "-o", str(draft), *self.init_args], env, work)
-        self._rivet(["check", "--config", str(draft)], env, work)
+        self._rivet(binary, ["init", "--source-env", self.source_env, *mode, "-o", str(draft), *self.init_args], env, work)
+        self._rivet(binary, ["check", "--config", str(draft)], env, work)
         doc = read_config(str(draft))  # init writes `url_env:`, no `${...}`
         target.parent.mkdir(parents=True, exist_ok=True)
         self._refuse_shared_places(doc, target)

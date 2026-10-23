@@ -335,25 +335,8 @@ class _Session:
         self.emit({"event": "rivet.start", "step": name, "argv": argv, "stderr_path": str(stderr_path)})
         cwd = self.req.cwd or str(Path(self.req.config).resolve().parent)
         with _open_private(stdout_path) as out, _open_private(stderr_path) as err:
-            proc = subprocess.Popen(
-                argv,
-                stdout=out,
-                stderr=err,
-                stdin=subprocess.DEVNULL,
-                env=dict(self.req.env),
-                cwd=cwd,
-                pass_fds=() if self.lock_fd is None else (self.lock_fd,),
-                preexec_fn=_parent_death_signal(),
-            )
-            running = Running(proc)
-            if self.on_process:
-                self.on_process(running)
-            try:
-                code = running.wait()
-            except BaseException:
-                running.request_stop()
-                running.wait()
-                raise
+            pass_fds = () if self.lock_fd is None else (self.lock_fd,)
+            code = spawn(argv, out, err, self.req.env, cwd, self.on_process, pass_fds)
         self.emit(
             {
                 "event": "rivet.step",
@@ -758,6 +741,33 @@ def _release_lock(s: _Session, fd: int) -> None:
     """Release by an explicit unlock, never by close alone: a copy of the descriptor elsewhere keeps a closed lock."""
     s.lock_fd = None
     fcntl.flock(fd, fcntl.LOCK_UN)
+
+
+def spawn(
+    argv: list[str], out: Any, err: Any, env: Mapping[str, str], cwd: str, on_process: Callable | None, pass_fds: tuple = ()
+) -> int:
+    """Run one process to its end and return its exit code (negative: the signal). `on_process` gets it as `Running`, so
+    a stop can reach it; an exception while waiting stops and reaps it first. stdin is /dev/null, and on Linux the
+    process gets SIGTERM when the task process dies (G2)."""
+    proc = subprocess.Popen(
+        argv,
+        stdout=out,
+        stderr=err,
+        stdin=subprocess.DEVNULL,
+        env=dict(env),
+        cwd=cwd,
+        pass_fds=pass_fds,
+        preexec_fn=_parent_death_signal(),
+    )
+    running = Running(proc)
+    if on_process:
+        on_process(running)
+    try:
+        return running.wait()
+    except BaseException:
+        running.request_stop()
+        running.wait()
+        raise
 
 
 class Running:

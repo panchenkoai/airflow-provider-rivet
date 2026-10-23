@@ -53,13 +53,18 @@ def _names(field: str, value: Any) -> list[str]:
     return list(value)
 
 
-def _common(config: str, state_dir: str | None, operator_kwargs: Mapping[str, Any] | None) -> dict[str, Any]:
-    """The arguments every rivet task gets; its trigger rule is the builder's gate, whatever default_args says (D24)."""
+def _refuse_trigger_rule(operator_kwargs: Mapping[str, Any] | None) -> None:
+    """Every builder's tasks run only after their upstream succeeded: `operator_kwargs` may not say otherwise (D24)."""
     if operator_kwargs and "trigger_rule" in operator_kwargs:
         raise ValueError(
             "operator_kwargs may not set `trigger_rule`: every rivet task runs only after its upstream succeeded "
             "(load after its extract, compact after its load); the watcher fails the run on any failure"
         )
+
+
+def _common(config: str, state_dir: str | None, operator_kwargs: Mapping[str, Any] | None) -> dict[str, Any]:
+    """The arguments every rivet task gets; its trigger rule is the builder's gate, whatever default_args says (D24)."""
+    _refuse_trigger_rule(operator_kwargs)
     return {
         "config": config,
         "state_dir": state_dir,
@@ -238,7 +243,7 @@ def build_source_dags(
     taken = sorted({"env_from_connections", "config", "state_dir"} & set(operator_kwargs or {}))
     if taken:
         raise ValueError(f"operator_kwargs may not set {taken}: each source's DAG sets them")
-    _common("", None, operator_kwargs)  # the builders' own refusals, before any source has a config
+    _refuse_trigger_rule(operator_kwargs)  # before any source has a config, as the builders it calls later
     dags: dict[str, DAG] = {}
     for name in names:
         config = Path(config_dir) / f"{name}.yaml"
