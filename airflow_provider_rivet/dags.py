@@ -190,24 +190,47 @@ def build_cdc_dag(
     **dag_kwargs: Any,
 ) -> DAG:
     """One `run` task for the stream, then load.T >> compact.T per captured table."""
-    tables = _names("tables", tables)
-    if not tables and load:
+    return _cdc_dag(dag_id, [(export, tables)], load, compact, _common(config, state_dir, operator_kwargs), dag_kwargs)
+
+
+def _cdc_dag(
+    dag_id: str,
+    streams: Sequence[tuple[str, Sequence[str]]],
+    load: bool,
+    compact: bool,
+    common: Mapping[str, Any],
+    dag_kwargs: Mapping[str, Any],
+) -> DAG:
+    """The CDC DAG of one or more streams: one stream's tasks at the top (`run`, `load.T`, `compact.T`), several streams'
+    each in a group named after its export (rivet init writes one stream per table on SQL Server, Oracle, MongoDB and
+    PostgreSQL outside `public`); the streams run side by side, each under its own export's lock."""
+    streams = [(export, _names("tables", tables)) for export, tables in streams]
+    if load and any(not tables for _, tables in streams):
         raise ValueError("`tables` lists the captured tables the load and compact tasks are built for")
-    common = _common(config, state_dir, operator_kwargs)
     with _dag(dag_id, ("rivet", "cdc"), dag_kwargs) as dag:
-        run = RivetCdcRunOperator(task_id="run", export=export, **common)
-        if load:
-            loads = {}
-            with TaskGroup(group_id="load"):
-                for table in tables:
-                    loads[table] = RivetLoadOperator(task_id=task_name(table), export=export, table=table, **common)
-                    run >> loads[table]
-            if compact:
-                with TaskGroup(group_id="compact"):
-                    for table in tables:
-                        loads[table] >> RivetCompactOperator(task_id=task_name(table), export=export, table=table, **common)
+        for export, tables in streams:
+            if len(streams) == 1:
+                _cdc_stream(export, tables, load, compact, common)
+            else:
+                with TaskGroup(group_id=task_name(export)):
+                    _cdc_stream(export, tables, load, compact, common)
         _watch(dag)
     return dag
+
+
+def _cdc_stream(export: str, tables: Sequence[str], load: bool, compact: bool, common: Mapping[str, Any]) -> None:
+    """One stream's tasks in the DAG or group being built: run, then load.T >> compact.T per captured table."""
+    run = RivetCdcRunOperator(task_id="run", export=export, **common)
+    if load:
+        loads = {}
+        with TaskGroup(group_id="load"):
+            for table in tables:
+                loads[table] = RivetLoadOperator(task_id=task_name(table), export=export, table=table, **common)
+                run >> loads[table]
+        if compact:
+            with TaskGroup(group_id="compact"):
+                for table in tables:
+                    loads[table] >> RivetCompactOperator(task_id=task_name(table), export=export, table=table, **common)
 
 
 def build_source_dags(
@@ -268,13 +291,19 @@ def build_source_dags(
             kwargs["env_from_connections"] = {url_env: source, "RIVET_STATE_URL": state}
         exports = doc.get("exports") or []
         if mode == "cdc":
-            streams = [e for e in exports if e.get("mode") == "cdc"]
-            if len(streams) != 1:
-                raise ValueError(f"{config}: expected one export with `mode: cdc`, found {len(streams)}")
-            stream, load = streams[0], doc.get("load") or {}  # a config init wrote without a warehouse lands files only
-            tables = stream.get("tables") or ([stream["table"]] if stream.get("table") else [])  # init: `table:` for one
+            # init: one `tables:` stream on MySQL and `public` PostgreSQL, one stream per table elsewhere (`table:`)
+            streams = [
+                (e["name"], e.get("tables") or ([e["table"]] if e.get("table") else []))
+                for e in exports
+                if e.get("mode") == "cdc"
+            ]
+            if not streams:
+                raise ValueError(f"{config}: no export with `mode: cdc`")
+            load = doc.get("load") or {}  # a config init wrote without a warehouse lands files only
             compact = load.get("layout") == "base_buffer"  # a buffer to merge: ClickHouse and Snowflake read a change log
-            dags[dag_id] = build_cdc_dag(dag_id, export=stream["name"], tables=tables, load=bool(load), compact=compact, **common)
+            task_common = _common(common["config"], common["state_dir"], kwargs)
+            dag_settings = {k: v for k, v in common.items() if k not in ("config", "state_dir", "operator_kwargs")}
+            dags[dag_id] = _cdc_dag(dag_id, streams, bool(load), compact, task_common, dag_settings)
         else:
             batch = [e["name"] for e in exports if e.get("mode") != "cdc"]
             dags[dag_id] = build_batch_dag(dag_id, exports=batch, load=bool(doc.get("load")), **common)
