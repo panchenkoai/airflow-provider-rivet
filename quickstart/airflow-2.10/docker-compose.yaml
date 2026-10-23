@@ -1,0 +1,161 @@
+# rivet + Apache Airflow 2.10 quickstart: Airflow (LocalExecutor) with rivet and airflow-provider-rivet, demo MySQL and
+# PostgreSQL sources ready for CDC, MinIO as the bucket, ClickHouse as the warehouse, PostgreSQL for rivet's state.
+#
+#   cp .env.example .env && docker compose up -d --build      # UI: http://localhost:8080 (airflow / airflow)
+#
+# Every password here is a demo value for containers that publish no database port. Change them before you point the
+# stack at anything real (see docs/quickstart.md).
+
+x-airflow-common: &airflow-common
+  build:
+    context: ..
+    args: { AIRFLOW_VERSION: "2.10.5" }
+  image: rivet-quickstart:2.10.5
+  environment: &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    AIRFLOW__CORE__FERNET_KEY: ${FERNET_KEY:-}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: "true"
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    AIRFLOW__SCHEDULER__DAG_DIR_LIST_INTERVAL: "30"
+    AIRFLOW__API__AUTH_BACKENDS: airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session
+    AIRFLOW__SCHEDULER__ENABLE_HEALTH_CHECK: "true"
+    # The connections the quickstart DAGs use. `airflow connections add` with the same id overrides nothing here:
+    # Airflow reads AIRFLOW_CONN_* first. To use your own database, change the value (docs/quickstart.md).
+    AIRFLOW_CONN_RIVET_MYSQL: '{"conn_type": "mysql", "host": "mysql", "port": 3306, "schema": "shop", "login": "rivet", "password": "rivet_demo"}'
+    AIRFLOW_CONN_RIVET_POSTGRES: '{"conn_type": "postgres", "host": "source-postgres", "port": 5432, "schema": "shop", "login": "rivet", "password": "rivet_demo"}'
+    AIRFLOW_CONN_RIVET_STATE_MYSQL_CDC: '{"conn_type": "postgres", "host": "rivet-state", "port": 5432, "schema": "rivet_state_mysql_cdc", "login": "rivet", "password": "rivet_state_demo", "extra": {"rivet_params": "sslmode=disable"}}'
+    AIRFLOW_CONN_RIVET_STATE_MYSQL_BATCH: '{"conn_type": "postgres", "host": "rivet-state", "port": 5432, "schema": "rivet_state_mysql_batch", "login": "rivet", "password": "rivet_state_demo", "extra": {"rivet_params": "sslmode=disable"}}'
+    AIRFLOW_CONN_RIVET_STATE_POSTGRES_CDC: '{"conn_type": "postgres", "host": "rivet-state", "port": 5432, "schema": "rivet_state_postgres_cdc", "login": "rivet", "password": "rivet_state_demo", "extra": {"rivet_params": "sslmode=disable"}}'
+    AIRFLOW_CONN_RIVET_STATE_POSTGRES_BATCH: '{"conn_type": "postgres", "host": "rivet-state", "port": 5432, "schema": "rivet_state_postgres_batch", "login": "rivet", "password": "rivet_state_demo", "extra": {"rivet_params": "sslmode=disable"}}'
+    AIRFLOW_CONN_RIVET_S3: '{"conn_type": "aws", "login": "rivet", "password": "rivet_minio_demo", "extra": {"region_name": "us-east-1", "endpoint_url": "http://minio:9000"}}'
+    AIRFLOW_CONN_RIVET_CLICKHOUSE: '{"conn_type": "clickhouse", "host": "clickhouse", "port": 8123, "login": "loader", "password": "rivet_clickhouse_demo"}'
+  volumes:
+    - ../dags:/opt/airflow/dags
+    - ./logs:/opt/airflow/logs
+    - ./rivet-state:/opt/airflow/rivet-state
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on: &airflow-common-depends-on
+    postgres: { condition: service_healthy }
+    rivet-state: { condition: service_healthy }
+    mysql: { condition: service_healthy }
+    source-postgres: { condition: service_healthy }
+    minio-bucket: { condition: service_completed_successfully }
+    clickhouse: { condition: service_healthy }
+
+services:
+  # --- Airflow -------------------------------------------------------------------------------------------------------
+  postgres:
+    image: postgres:16
+    environment: { POSTGRES_USER: airflow, POSTGRES_PASSWORD: airflow, POSTGRES_DB: airflow }
+    volumes: [airflow-db:/var/lib/postgresql/data]
+    healthcheck: { test: ["CMD", "pg_isready", "-U", "airflow"], interval: 5s, retries: 20 }
+    restart: always
+
+  airflow-webserver:
+    <<: *airflow-common
+    command: webserver
+    ports: ["127.0.0.1:${AIRFLOW_PORT:-8080}:8080"]
+    healthcheck: { test: ["CMD", "curl", "--fail", "http://localhost:8080/health"], interval: 10s, retries: 20, start_period: 30s }
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init: { condition: service_completed_successfully }
+
+  airflow-scheduler:
+    <<: *airflow-common
+    command: scheduler
+    healthcheck: { test: ["CMD", "curl", "--fail", "http://localhost:8974/health"], interval: 10s, retries: 20, start_period: 30s }
+    restart: always
+    depends_on:
+      <<: *airflow-common-depends-on
+      airflow-init: { condition: service_completed_successfully }
+
+  airflow-init:
+    <<: *airflow-common
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        mkdir -p /opt/airflow/logs /opt/airflow/rivet-state/{mysql_cdc,mysql_batch,postgres_cdc,postgres_batch}
+        chown -R "${AIRFLOW_UID:-50000}:0" /opt/airflow/logs /opt/airflow/rivet-state
+        exec /entrypoint airflow version
+    environment:
+      <<: *airflow-common-env
+      _AIRFLOW_DB_MIGRATE: "true"
+      _AIRFLOW_WWW_USER_CREATE: "true"
+      _AIRFLOW_WWW_USER_USERNAME: airflow
+      _AIRFLOW_WWW_USER_PASSWORD: airflow
+    user: "0:0"
+
+  # --- rivet's state: cursors, run journal, load ledger --------------------------------------------------------------
+  rivet-state:
+    image: postgres:16
+    environment: { POSTGRES_USER: rivet, POSTGRES_PASSWORD: rivet_state_demo, POSTGRES_DB: rivet }
+    volumes:
+      - ../demo/rivet-state.sql:/docker-entrypoint-initdb.d/databases.sql:ro
+      - rivet-state-db:/var/lib/postgresql/data
+    healthcheck: { test: ["CMD", "pg_isready", "-U", "rivet", "-d", "rivet_state_postgres_batch"], interval: 5s, retries: 20 }
+    restart: always
+
+  # --- demo sources --------------------------------------------------------------------------------------------------
+  mysql:
+    image: mysql:8.4
+    environment: { MYSQL_ROOT_PASSWORD: root_demo, MYSQL_DATABASE: shop }
+    # rivet's MySQL CDC: row events with every column's name, UTC.
+    command: ["--binlog-format=ROW", "--binlog-row-image=FULL", "--binlog-row-metadata=FULL",
+              "--gtid-mode=ON", "--enforce-gtid-consistency=ON", "--default-time-zone=+00:00"]
+    volumes:
+      - ../demo/mysql.sql:/docker-entrypoint-initdb.d/shop.sql:ro
+      - mysql-db:/var/lib/mysql
+    healthcheck: { test: ["CMD", "mysqladmin", "ping", "-uroot", "-proot_demo", "--silent"], interval: 5s, retries: 30 }
+    restart: always
+
+  source-postgres:
+    image: postgres:16
+    environment: { POSTGRES_USER: postgres, POSTGRES_PASSWORD: postgres_demo, POSTGRES_DB: shop }
+    # rivet's PostgreSQL CDC: a logical slot (test_decoding) read over an ordinary connection.
+    command: ["postgres", "-c", "wal_level=logical", "-c", "max_replication_slots=10"]
+    volumes:
+      - ../demo/postgres.sql:/docker-entrypoint-initdb.d/shop.sql:ro
+      - source-postgres-db:/var/lib/postgresql/data
+    healthcheck: { test: ["CMD", "pg_isready", "-U", "postgres", "-d", "shop"], interval: 5s, retries: 20 }
+    restart: always
+
+  # --- the bucket: MinIO (S3 API) ------------------------------------------------------------------------------------
+  minio:
+    image: cgr.dev/chainguard/minio:latest
+    command: ["server", "/data", "--console-address", ":9001"]
+    environment: { MINIO_ROOT_USER: rivet, MINIO_ROOT_PASSWORD: rivet_minio_demo }
+    ports: ["127.0.0.1:${MINIO_CONSOLE_PORT:-9001}:9001"]
+    volumes: [minio-data:/data]
+    healthcheck: { test: ["CMD", "mc", "ready", "local"], interval: 5s, retries: 20 }
+    restart: always
+
+  minio-bucket:
+    image: cgr.dev/chainguard/minio:latest
+    # One bucket per pipeline: init gives every batch export the prefix `exports/<table>/`.
+    entrypoint: ["mc", "mb", "--ignore-existing", "quickstart/mysql-cdc", "quickstart/mysql-batch",
+                 "quickstart/postgres-cdc", "quickstart/postgres-batch"]
+    environment: { MC_HOST_quickstart: "http://rivet:rivet_minio_demo@minio:9000" }
+    depends_on: { minio: { condition: service_healthy } }
+
+  # --- the warehouse: ClickHouse -------------------------------------------------------------------------------------
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8
+    environment: { CLICKHOUSE_USER: loader, CLICKHOUSE_PASSWORD: rivet_clickhouse_demo, CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1" }
+    ports: ["127.0.0.1:${CLICKHOUSE_PORT:-8123}:8123"]
+    volumes:
+      - ../demo/clickhouse.sql:/docker-entrypoint-initdb.d/databases.sql:ro
+      - clickhouse-data:/var/lib/clickhouse
+    healthcheck: { test: ["CMD", "clickhouse-client", "--user", "loader", "--password", "rivet_clickhouse_demo", "-q", "SELECT 1"], interval: 5s, retries: 30 }
+    ulimits: { nofile: { soft: 262144, hard: 262144 } }
+    restart: always
+
+volumes:
+  airflow-db:
+  rivet-state-db:
+  mysql-db:
+  source-postgres-db:
+  minio-data:
+  clickhouse-data:
