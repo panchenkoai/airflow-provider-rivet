@@ -26,7 +26,7 @@ from .connections import (
     build_environment,
     connection_url,
     database_ref,
-    odbc_connection,
+    resolve_database,
     with_database,
 )
 from .invocation import (
@@ -48,16 +48,17 @@ from .tasklog import TaskLog
 XCOM_KEY = "return_value"
 
 
-def get_connection(conn_id: str) -> Any:
-    """The Airflow Connection the task names; a refusal when no backend defines it, since a retry cannot create it."""
+def airflow_connection(conn_id: str) -> Any:
+    """The Airflow Connection of this id, or None when no backend defines it."""
     try:
         return BaseHook.get_connection(conn_id)
-    except AirflowNotFoundException as exc:
-        raise PreflightRefusal(
-            "RIVET_AIRFLOW_CONNECTION_MISSING",
-            f"connection `{conn_id}` is not defined in the metadata database or any secrets backend this worker reads; "
-            "create it, or correct the id the task names",
-        ) from exc
+    except AirflowNotFoundException:
+        return None
+
+
+def get_connection(conn_id: str) -> Any:
+    """The Airflow Connection the task names; a refusal when no backend defines it, since a retry cannot create it."""
+    return resolve_database({"conn_id": conn_id}, airflow_connection)[0]
 
 
 class RivetBaseOperator(BaseOperator):
@@ -150,20 +151,10 @@ class RivetBaseOperator(BaseOperator):
     def _database(self, ref: Mapping[str, Any]) -> Any:
         """The database an `env_from_connections` entry names: its Airflow Connection, else (with `odbc_ini`) the data
         source of that name in the file; its `database` instead of the one stored. Where it came from is logged."""
-        conn_id, odbc_ini, dsn = ref["conn_id"], ref.get("odbc_ini"), ref.get("dsn") or ref["conn_id"]
-        try:
-            conn = BaseHook.get_connection(conn_id)
-        except AirflowNotFoundException:
-            conn = odbc_connection(odbc_ini, dsn) if odbc_ini else None
-            if conn is None:
-                raise PreflightRefusal(
-                    "RIVET_AIRFLOW_CONNECTION_MISSING",
-                    f"connection `{conn_id}` is not defined in the metadata database or any secrets backend this worker reads"
-                    + (f", and {odbc_ini} has no data source [{dsn}]" if odbc_ini else "")
-                    + "; create it, or correct the id the task names",
-                ) from None
-            self.log.info("database `%s`: no such Connection, ODBC data source [%s] in %s", conn_id, dsn, odbc_ini)
-        return with_database(conn, ref.get("database"))
+        conn, dsn = resolve_database(ref, airflow_connection)
+        if dsn is not None:
+            self.log.info("database `%s`: no such Connection, ODBC data source [%s] in %s", ref["conn_id"], dsn, ref["odbc_ini"])
+        return conn
 
     def _config_doc(self) -> dict[str, Any]:
         """The config as rivet builds it, for the names a Connection is filed under; read by the preflight's reader, so a

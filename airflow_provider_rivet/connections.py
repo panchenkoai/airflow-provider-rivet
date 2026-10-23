@@ -454,6 +454,31 @@ def database_ref(ref: Any) -> dict[str, Any]:
     return {"conn_id": conn_id, "scheme": scheme}
 
 
+def missing_connection(conn_id: str, odbc_ini: str | None = None, dsn: str | None = None) -> PreflightRefusal:
+    """The refusal of a Connection no backend defines (and, with `odbc_ini`, no data source `dsn` of that file): final,
+    since a retry cannot create it."""
+    return PreflightRefusal(
+        "RIVET_AIRFLOW_CONNECTION_MISSING",
+        f"connection `{conn_id}` is not defined in the metadata database or any secrets backend this worker reads"
+        + (f", and {odbc_ini} has no data source [{dsn}]" if odbc_ini else "")
+        + "; create it, or correct the id the task names",
+    )
+
+
+def resolve_database(ref: Mapping[str, Any], lookup: Callable[[str], Any]) -> tuple[Any, str | None]:
+    """The database an `env_from_connections` entry (`database_ref`) names, and the data source it was read from:
+    `lookup(conn_id)` (the Connection, or None when no backend defines it), else with `odbc_ini` the data source `dsn`
+    (default the id) of that file, `None` naming no data source; its `database` instead of the one stored."""
+    conn_id, odbc_ini = ref["conn_id"], ref.get("odbc_ini")
+    dsn = ref.get("dsn") or conn_id
+    conn, source = lookup(conn_id), None
+    if conn is None and odbc_ini:
+        conn, source = odbc_connection(odbc_ini, dsn), dsn
+    if conn is None:
+        raise missing_connection(conn_id, odbc_ini, dsn)
+    return with_database(conn, ref.get("database")), source
+
+
 def with_database(conn: Any, database: str | None) -> Any:
     """`conn` with its database (`schema`) replaced, the Connection itself untouched; `conn` when `database` is None."""
     if database is None:
