@@ -64,3 +64,22 @@ def test_a_config_without_exactly_one_cdc_export_is_refused_at_parse(tmp_path: P
 def test_no_sources_builds_no_dag(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     module = load(tmp_path, monkeypatch, "")
     assert not [name for name in vars(module) if name.startswith("rivet_") and name.endswith("_cdc")]
+
+
+def test_a_source_without_a_config_is_refused_at_parse_naming_it(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (tmp_path / "shop.yaml").write_text(CONFIG.format(src="shop"))
+    with pytest.raises(ValueError, match=r"no config for billing in .*list only sources that have"):
+        load(tmp_path, monkeypatch, "shop,billing")
+
+
+def test_a_source_listed_twice_is_refused_at_parse(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    (tmp_path / "shop.yaml").write_text(CONFIG.format(src="shop"))
+    with pytest.raises(ValueError, match="sources listed twice: shop"):
+        load(tmp_path, monkeypatch, "shop,shop")
+
+
+def test_spaces_around_listed_sources_are_ignored(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    for src in ("shop", "billing"):
+        (tmp_path / f"{src}.yaml").write_text(CONFIG.format(src=src))
+    module = load(tmp_path, monkeypatch, " shop , billing ")
+    assert module.rivet_shop_cdc.dag_id == "rivet_shop_cdc" and module.rivet_billing_cdc.dag_id == "rivet_billing_cdc"

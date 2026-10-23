@@ -21,9 +21,23 @@ import yaml
 
 from airflow_provider_rivet.dags import build_cdc_dag
 
-SOURCES = [s for s in os.environ.get("RIVET_EXAMPLE_SOURCES", "").split(",") if s]
+SOURCES = [s.strip() for s in os.environ.get("RIVET_EXAMPLE_SOURCES", "").split(",") if s.strip()]
 CONFIG_DIR = Path(os.environ.get("RIVET_EXAMPLE_CONFIG_DIR", "/opt/airflow/dags/rivet"))
 STATE_ROOT = Path(os.environ.get("RIVET_EXAMPLE_STATE_ROOT", "/opt/airflow/rivet-state"))
+
+
+def checked_sources(sources: list[str], config_dir: Path) -> list[str]:
+    """The listed sources, refused when one is listed twice or has no `<src>.yaml` yet."""
+    twice = sorted({s for s in sources if sources.count(s) > 1})
+    if twice:
+        raise ValueError(f"sources listed twice: {', '.join(twice)}; list each source once")
+    missing = [s for s in sources if not (config_dir / f"{s}.yaml").is_file()]
+    if missing:
+        raise ValueError(
+            f"no config for {', '.join(missing)} in {config_dir}: list only sources that have `<src>.yaml` "
+            "(a source cron never ran gets one from `rivet init` first)"
+        )
+    return sources
 
 
 def cdc_export(config: Path) -> dict:
@@ -34,7 +48,7 @@ def cdc_export(config: Path) -> dict:
     return exports[0]
 
 
-for src in SOURCES:
+for src in checked_sources(SOURCES, CONFIG_DIR):
     config = CONFIG_DIR / f"{src}.yaml"
     export = cdc_export(config)
     globals()[f"rivet_{src}_cdc"] = build_cdc_dag(
