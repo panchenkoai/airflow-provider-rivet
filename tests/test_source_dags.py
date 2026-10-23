@@ -933,3 +933,15 @@ def test_another_source_sharing_a_place_is_found_beside_a_config_written_meanwhi
     (init.config.parent / "zeta.yaml").write_text(CDC_CONFIG.format(env="X"))  # sorted after shop.yaml
     monkeypatch.setattr(RivetInitOperator, "_rivet", racing)
     assert "writes to bigquery p.shop, as" in str(init.run())
+
+
+def test_resolve_database_takes_any_lookup(odbc_ini: str) -> None:
+    from airflow_provider_rivet.connections import resolve_database
+
+    found = {"shop": connection("shop", "mysql", schema="a")}
+    assert resolve_database({"conn_id": "shop", "database": "b"}, found.get)[0].schema == "b"
+    conn, dsn = resolve_database({"conn_id": "rivet_shop", "odbc_ini": odbc_ini, "dsn": "shop"}, {}.get)
+    assert (conn.host, dsn) == ("db1.internal", "shop")
+    assert resolve_database({"conn_id": "shop", "odbc_ini": odbc_ini}, found.get)[1] is None  # the Connection: no data source
+    with pytest.raises(PreflightRefusal, match=r"connection `x` is not defined .*reads; create it"):
+        resolve_database({"conn_id": "x"}, {}.get)

@@ -14,6 +14,7 @@ import pytest
 from airflow_provider_rivet import invocation
 from airflow_provider_rivet.invocation import Request, hashed_name, path_name
 from airflow_provider_rivet.preflight import STATE_URL_ENV, PreflightRefusal
+from airflow_provider_rivet.reading import Reading
 
 LABEL = ("dag", "run", "task", 2)
 
@@ -61,6 +62,25 @@ def test_closing_a_session_with_a_state_directory_prunes_old_ledgers(tmp_path: P
     assert not ledger.exists()
 
 
+def test_the_ledger_an_operator_writes_is_one_a_session_prunes(tmp_path: Path) -> None:
+    """crashed_ledger and _Session.work name one folder: a ledger the operator keeps is pruned by the session's close,
+    whatever the DAG id's spelling (path_name hashes an upper-case one in both)."""
+    for dag in ("dag", "Daily Orders"):
+        s = invocation._Session(
+            Request("load", str(session(tmp_path).req.config), {}, label=(dag, "run", "task[3]", 1), log_keep=None),
+            session(tmp_path).pf,
+            lambda e: None,
+            None,
+        )
+        ledger = invocation.crashed_ledger(tmp_path / "state", dag, "run", "task[3]")
+        assert ledger.parent == s.work / invocation.CRASHED
+        ledger.parent.mkdir(parents=True, exist_ok=True)
+        ledger.write_text("[[1, 2]]")
+        os.utime(ledger, (0, 0))
+        s.close()
+        assert not ledger.exists()
+
+
 def test_a_stderr_directory_whose_parents_are_missing_is_created(tmp_path: Path) -> None:
     """_Session.__init__ 48/50/53."""
     logs = tmp_path / "a" / "b" / "logs"
@@ -98,8 +118,8 @@ def test_a_narrowed_copy_that_cannot_be_cut_names_the_source_config(tmp_path: Pa
     ids=["missing", "not-json", "not-utf8", "object"],
 )
 def test_a_result_file_on_exit_zero_records_what_is_wrong_with_it(tmp_path: Path, body: object, degraded: set) -> None:
-    """_Session.result_file 7: missing and malformed are different words; a good file is neither."""
-    s = session(tmp_path)
+    """Reading.result_file 7: missing and malformed are different words; a good file is neither."""
+    s = Reading(set(), {}, "run")
     path = tmp_path / "summary.json"
     if isinstance(body, bytes):
         path.write_bytes(body)
@@ -180,3 +200,24 @@ def test_the_preflight_is_told_whether_the_task_is_a_cdc_run_and_its_warnings_ar
         invocation._invoke(Request(command, "c", {}), events.append, None, None)
     assert seen["cdc"] is cdc
     assert events == [{"event": "rivet.warning", "warning": "no_notify", "text": "the binary has no --no-notify"}]
+
+
+def test_every_dispatched_command_names_its_lock() -> None:
+    """LOCK_SCOPE: a command added to the dispatch without a lock row is caught here, not by a run blocked for lock_wait."""
+    assert set(invocation.LOCK_SCOPE) == set(invocation._DISPATCH)
+
+
+def test_a_failed_unit_without_its_own_error_takes_the_one_rivet_printed() -> None:
+    """Reading.run_units 42: the process-level object rivet printed (its code), not one rebuilt from the exit."""
+    from conftest import fixture
+
+    from airflow_provider_rivet.reading import EXIT_ZERO, _Step
+    from airflow_provider_rivet.result import ErrorObject
+
+    printed = ErrorObject.from_contract(fixture("error_object.json"))
+    read = Reading(set(), {}, "run")
+    step = _Step(5, None, None)
+    units = read.run_units(step, {"per_export": [{"export_name": "a", "status": "failed"}]}, printed, None)
+    assert units[0].error == printed and printed.code
+    units = read.run_units(_Step(0, None, None), {"per_export": [{"export_name": "a", "status": "failed"}]}, None, None)
+    assert units[0].error == EXIT_ZERO and EXIT_ZERO.message == "rivet exited 0 and printed no error object"

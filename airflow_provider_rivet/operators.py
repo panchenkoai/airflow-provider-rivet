@@ -26,7 +26,7 @@ from .connections import (
     build_environment,
     connection_url,
     database_ref,
-    odbc_connection,
+    resolve_database,
     with_database,
 )
 from .invocation import (
@@ -35,28 +35,30 @@ from .invocation import (
     Outcome,
     Request,
     Stopped,
+    crashed_ledger,
     crashed_retry_allowed,
     invoke,
-    path_name,
     spawn,
     worker_environment,
 )
 from .preflight import PreflightRefusal, read_config, resolve_binary
+from .result import BUSY, REFUSED, STOPPED, unstarted
 from .tasklog import TaskLog
 
 XCOM_KEY = "return_value"
 
 
-def get_connection(conn_id: str) -> Any:
-    """The Airflow Connection the task names; a refusal when no backend defines it, since a retry cannot create it."""
+def airflow_connection(conn_id: str) -> Any:
+    """The Airflow Connection of this id, or None when no backend defines it."""
     try:
         return BaseHook.get_connection(conn_id)
-    except AirflowNotFoundException as exc:
-        raise PreflightRefusal(
-            "RIVET_AIRFLOW_CONNECTION_MISSING",
-            f"connection `{conn_id}` is not defined in the metadata database or any secrets backend this worker reads; "
-            "create it, or correct the id the task names",
-        ) from exc
+    except AirflowNotFoundException:
+        return None
+
+
+def get_connection(conn_id: str) -> Any:
+    """The Airflow Connection the task names; a refusal when no backend defines it, since a retry cannot create it."""
+    return resolve_database({"conn_id": conn_id}, airflow_connection)[0]
 
 
 class RivetBaseOperator(BaseOperator):
@@ -149,20 +151,10 @@ class RivetBaseOperator(BaseOperator):
     def _database(self, ref: Mapping[str, Any]) -> Any:
         """The database an `env_from_connections` entry names: its Airflow Connection, else (with `odbc_ini`) the data
         source of that name in the file; its `database` instead of the one stored. Where it came from is logged."""
-        conn_id, odbc_ini, dsn = ref["conn_id"], ref.get("odbc_ini"), ref.get("dsn") or ref["conn_id"]
-        try:
-            conn = BaseHook.get_connection(conn_id)
-        except AirflowNotFoundException:
-            conn = odbc_connection(odbc_ini, dsn) if odbc_ini else None
-            if conn is None:
-                raise PreflightRefusal(
-                    "RIVET_AIRFLOW_CONNECTION_MISSING",
-                    f"connection `{conn_id}` is not defined in the metadata database or any secrets backend this worker reads"
-                    + (f", and {odbc_ini} has no data source [{dsn}]" if odbc_ini else "")
-                    + "; create it, or correct the id the task names",
-                ) from None
-            self.log.info("database `%s`: no such Connection, ODBC data source [%s] in %s", conn_id, dsn, odbc_ini)
-        return with_database(conn, ref.get("database"))
+        conn, dsn = resolve_database(ref, airflow_connection)
+        if dsn is not None:
+            self.log.info("database `%s`: no such Connection, ODBC data source [%s] in %s", ref["conn_id"], dsn, ref["odbc_ini"])
+        return conn
 
     def _config_doc(self) -> dict[str, Any]:
         """The config as rivet builds it, for the names a Connection is filed under; read by the preflight's reader, so a
@@ -218,8 +210,13 @@ class RivetBaseOperator(BaseOperator):
     def _refuse(self, ti: Any, refusal: PreflightRefusal) -> None:
         """Log and publish a refusal made before rivet started, then fail without retry."""
         self._emit({"event": "rivet.refused", "code": refusal.code, "text": str(refusal)})
-        payload = {"command": self.command, "decision": "fail", "preflight_refusal": refusal.code, "units": []}
+        payload = unstarted(self.command, REFUSED, refusal.code)
         self._fail(ti, payload, str(refusal), retry=False)  # pragma: no mutate - `retry` is read as a truth value
+
+    def _stopped(self, ti: Any, stop: Stopped) -> None:
+        """Log and publish a stop Airflow asked for before a rivet step started, then fail for a retry (D40)."""
+        self._emit({"event": "rivet.stopped", "step": stop.step, "text": str(stop)})
+        self._fail(ti, unstarted(self.command, STOPPED, stop.step), str(stop), retry=True)
 
     def execute(self, context: Any) -> dict[str, Any]:
         """Run the command; return the XCom payload or raise by the contract's retry table."""
@@ -267,13 +264,10 @@ class RivetBaseOperator(BaseOperator):
         except PreflightRefusal as refusal:
             self._refuse(ti, refusal)
         except Stopped as stop:
-            self._emit({"event": "rivet.stopped", "step": stop.step, "text": str(stop)})
-            payload = {"command": self.command, "decision": "retry", "stopped_before": stop.step, "units": []}
-            self._fail(ti, payload, str(stop), retry=True)
+            self._stopped(ti, stop)
         except Busy as busy:
             self._emit({"event": "rivet.busy", "code": busy.code, "text": str(busy)})
-            payload = {"command": self.command, "decision": "retry", "busy": busy.code, "units": []}
-            self._fail(ti, payload, str(busy), retry=True)
+            self._fail(ti, unstarted(self.command, BUSY, busy.code), str(busy), retry=True)
         finally:
             self._proc = None
         return self._settle(ti, run_id, task_part, outcome)
@@ -301,8 +295,7 @@ class RivetBaseOperator(BaseOperator):
             # SQLite state guarantees and PostgreSQL state does not (a retry on another host saw an empty ledger and
             # granted the budget again). Elsewhere the budget is the first `crashed_retries` tries, as on a pod.
             if outcome.marker is not None and self.state_dir and outcome.state_kind == "sqlite":
-                name = f"{path_name(run_id, task_part)}.json"
-                ledger = Path(self.state_dir) / "airflow" / path_name(ti.dag_id) / "crashed" / name
+                ledger = crashed_ledger(self.state_dir, ti.dag_id, run_id, task_part)
             allowed, problem = crashed_retry_allowed(ledger, ti.try_number, ti.max_tries, self.crashed_retries)
             payload["crashed_retry"] = allowed
             if ledger is None or problem:
@@ -431,8 +424,7 @@ class RivetInitOperator(RivetBaseOperator):
         try:
             return self._write_config(target, env, binary)
         except Stopped as stop:
-            payload = {"command": self.command, "decision": "retry", "stopped_before": stop.step, "units": []}
-            self._fail(ti, payload, str(stop), retry=True)
+            self._stopped(ti, stop)
         finally:
             self._proc = None
 

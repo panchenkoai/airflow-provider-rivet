@@ -14,6 +14,7 @@ from dataclasses import dataclass
 from typing import Any
 
 from .operators import XCOM_KEY
+from .result import REFUSED
 
 MAX_UNITS = 10
 # the thread's code block; a webhook message carries title and link too, and stays under Slack's 4000
@@ -49,8 +50,8 @@ def format_failure(payload: Mapping[str, Any] | None, *, dag_id: str, task_id: s
     """A Slack message from the XCom payload: code, class, action and unit; never rivet's error text."""
     lines = [f":x: *{dag_id}.{task_id}* failed (run `{run_id}`)"]
     payload = payload or {}
-    if payload.get("preflight_refusal"):
-        lines.append(f"refused before rivet started: `{payload['preflight_refusal']}`")
+    if payload.get(REFUSED):
+        lines.append(f"refused before rivet started: `{payload[REFUSED]}`")
     failed = _failed_units(payload)
     for unit in failed[:MAX_UNITS]:
         error = unit["error"]
@@ -75,8 +76,8 @@ def format_failure(payload: Mapping[str, Any] | None, *, dag_id: str, task_id: s
 def format_title(payload: Mapping[str, Any] | None, *, dag_id: str, task_id: str, exception: Any = None) -> str:
     """`dag.task — <error type>`: the rivet code and final / retryable, else the exception's class."""
     payload = payload or {}
-    if payload.get("preflight_refusal"):
-        kind = f"{payload['preflight_refusal']} (final)"
+    if payload.get(REFUSED):
+        kind = f"{payload[REFUSED]} (final)"
     elif failed := _failed_units(payload):
         error = failed[0]["error"]
         name = error.get("code") or error.get("class") or "rivet failed"

@@ -17,7 +17,7 @@ from typing import Any
 
 from .capabilities import DEGRADATIONS
 from .preflight import SETUP_GUIDE
-from .result import BUSY_CODES
+from .result import BUSY, BUSY_CODES, REFUSED, STOPPED
 
 clock = time.monotonic  # replaced by tests, so a golden log has fixed durations
 Write = Callable[[int, str], None]
@@ -177,19 +177,19 @@ class TaskLog:
         units = [u for u in payload.get("units") or [] if isinstance(u, dict)]
         error = payload.get("error") or {}
         lines: list[tuple[int, str]] = []
-        if "preflight_refusal" in payload:
+        if REFUSED in payload:
             refused = self._first("rivet.refused") or {}
-            lines.append((logging.ERROR, f"{head} REFUSED [{payload['preflight_refusal']}] before rivet started, final"))
+            lines.append((logging.ERROR, f"{head} REFUSED [{payload[REFUSED]}] before rivet started, final"))
             lines.append((logging.ERROR, f"  why      {refused.get('text')}"))
-        elif "stopped_before" in payload:
-            step = payload["stopped_before"]
+        elif STOPPED in payload:
+            step = payload[STOPPED]
             lines.append((logging.WARNING, f"{head} STOPPED by Airflow before rivet {step} started; rivet {step} was not run"))
-        elif "busy" in payload:
+        elif BUSY in payload:
             wait = self._first("rivet.lock.wait") or {}
             lines.append(
                 (
                     retry_level,
-                    f"{head} BUSY [{payload['busy']}]: the lock of {wait.get('unit')} stayed held for "
+                    f"{head} BUSY [{payload[BUSY]}]: the lock of {wait.get('unit')} stayed held for "
                     f"{wait.get('lock_wait')} s; rivet was not started, {retry_text}",
                 )
             )

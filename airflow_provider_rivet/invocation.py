@@ -28,11 +28,10 @@ from typing import Any
 from . import _yaml
 from .capabilities import ProbeFailed
 from .preflight import STATE_URL_ENV, Preflight, PreflightRefusal, binary_unanswering, run_preflight, state_kind
-from .result import DIGEST_COUNTS, DIGEST_KEYS, STATUSES, ErrorObject, UnitResult, error_from_exit, error_from_line, worst
+from .reading import Reading, _json_of, _Step, config_target  # noqa: F401  (config_target is re-exported)
+from .result import ErrorObject, UnitResult, worst
 
 Emit = Callable[[dict[str, Any]], None]
-COMMANDS = ("run", "cdc_run", "apply", "plan", "load", "compact")
-DONE_WORD = {"load": "loaded", "compact": "compacted"}
 ENV_ALLOWLIST = (
     "PATH", "HOME", "USER", "LOGNAME", "TZ", "LANG", "LC_*", "TMPDIR", "SSL_CERT_FILE", "SSL_CERT_DIR",
     "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "no_proxy", "all_proxy",
@@ -55,6 +54,13 @@ _LOG_FILE = re.compile(r"^(?P<attempt>.+)\.[a-z]+\.(?:stderr|stdout)\.log$")
 LOCK_POLL = 0.2  # seconds between two tries of a held export lock
 BUSY_CODE = "RIVET_AIRFLOW_EXPORT_BUSY"
 PR_SET_PDEATHSIG = 1  # <linux/prctl.h>
+# The layout of the package's own files in a state directory (docs/state.md): `<state_dir>/airflow/<dag>/` holds a
+# DAG's sealed plans (`plans/<run>/`) and crashed ledgers (`crashed/`), which `_prune_stale` walks; `airflow/locks/`
+# the export locks; `logs/<dag>/<task>/` the stderr files.
+WORK, PLANS, CRASHED, LOCKS, LOGS = "airflow", "plans", "crashed", "locks", "logs"
+# The lock each command takes (`_lock_path`): rivet's run lease covers run, cdc_run and apply alike, its load lease a
+# load or compact of one table; `plan` only reads. Every command `invoke` dispatches has a row.
+LOCK_SCOPE = {"run": "run", "cdc_run": "run", "apply": "run", "load": "load", "compact": "load", "plan": None}
 
 
 def worker_environment(
@@ -64,6 +70,11 @@ def worker_environment(
     patterns = [*ENV_ALLOWLIST, *passthrough, *(name for cloud in clouds for name in CLOUD_ENV[cloud])]
     source = os.environ if environ is None else environ
     return {k: v for k, v in source.items() if any(fnmatch.fnmatchcase(k, pattern) for pattern in patterns)}
+
+
+def crashed_ledger(state_dir: str | Path, dag_id: str, run_id: str, task_part: str) -> Path:
+    """The crashed-retry ledger of one task of one DAG run, in the DAG's work folder where `_prune_stale` finds it."""
+    return Path(state_dir) / WORK / path_name(dag_id) / CRASHED / f"{path_name(run_id, task_part)}.json"
 
 
 def hashed_name(*parts: Any) -> str:
@@ -195,16 +206,6 @@ class Outcome:
         }
 
 
-@dataclass
-class _Step:
-    """One finished rivet process."""
-
-    exit_status: int | None
-    signal: int | None
-    line: dict[str, Any] | None
-    broken: bool = False
-
-
 class Stopped(Exception):
     """Airflow asked the task to stop while no rivet process was running: the next step is not started (D40)."""
 
@@ -238,6 +239,7 @@ class _Session:
         self.on_process = on_process
         self.stopped = stopped
         self.degraded: set[str] = set()
+        self.read = Reading(self.degraded, pf.config, request.command)
         self.stderr_path: str | None = None
         self.tmp: Path | None = None
         self.lock_fd: int | None = None
@@ -249,7 +251,7 @@ class _Session:
         self.global_name = path_name(*request.label[:3], attempt)
         self.log_name = f"{run}__{attempt}"
         if pf.state_dir is not None:
-            self.work = _private_dir(pf.state_dir, "airflow", dag)
+            self.work = _private_dir(pf.state_dir, WORK, dag)
         else:
             self.tmp = Path(tempfile.mkdtemp(prefix="rivet-airflow-"))
             self.work = self.tmp
@@ -257,9 +259,9 @@ class _Session:
             Path(request.stderr_dir).mkdir(parents=True, exist_ok=True)
             self.logs = _private_dir(Path(request.stderr_dir), dag, task)
         elif pf.state_dir is not None:
-            self.logs = _private_dir(pf.state_dir, "logs", dag, task)
+            self.logs = _private_dir(pf.state_dir, LOGS, dag, task)
         else:
-            self.logs = _private_dir(_temp_base(), "logs", dag, task)
+            self.logs = _private_dir(_temp_base(), LOGS, dag, task)
             self.degraded.add("stderr_temp")
 
     def close(self) -> None:
@@ -290,20 +292,6 @@ class _Session:
         if only_export is None:
             return _write_atomic(folder / copy_name(named), source.read_bytes())
         return _write_atomic(folder / copy_name(named, only_export), narrowed_config(self.pf, str(source), only_export).encode())
-
-    def malformed(self, value: Any, kind: type) -> Any:
-        """A value of a result file when it has the type the contract gives it, else `None`, recorded."""
-        if value is None or type(value) is kind:
-            return value
-        self.degraded.add("result_malformed")
-        return None
-
-    def status(self, value: Any) -> str:
-        """A unit's status word; anything outside the contract's sets counts as failed, recorded."""
-        if isinstance(value, str) and value in STATUSES:
-            return value
-        self.degraded.add("result_malformed")
-        return "failed"
 
     def globals_for(self, subcommand: str) -> list[str]:
         """The global flags this binary accepts; a missing one is recorded, never passed."""
@@ -353,51 +341,15 @@ class _Session:
         signal = -code if code < 0 else None
         return _Step(None if signal else code, signal, _error_line(lines), _has_broken_object(lines))
 
-    def classify(self, step: _Step) -> ErrorObject | None:
-        """The process-level error object: read when rivet printed a well-formed one, built from the exit when not."""
-        if step.signal is None and step.exit_status == 0:
-            return None
-        if step.signal is None and step.line is not None:
-            error, derived = error_from_line(step.line, step.exit_status)
-            if error is not None:
-                if derived:
-                    self.degraded.add("error_object")
-                return error
-            self.degraded.add("result_malformed")
-        elif step.signal is None and step.broken:
-            self.degraded.add("result_malformed")
-        return error_from_exit(step.exit_status, step.signal)
-
-    def result_file(self, path: Path, step: _Step) -> Any:
-        """A `--summary-output` file rivet was asked for; on exit 0 an absent or non-JSON one is recorded (D18)."""
-        try:
-            raw: bytes | None = path.read_bytes()
-        except OSError:
-            raw = None
-        doc = None if raw is None else _json_of(raw)
-        if step.signal is None and step.exit_status == 0:
-            if raw is None:
-                self.degraded.add("result_missing")
-            elif not isinstance(doc, dict):
-                self.degraded.add("result_malformed")
-        return doc
-
-    def unit_error(self, step: _Step, own: Any, export: str | None, table: str | None, shared: ErrorObject) -> ErrorObject:
-        """A failed unit's object: its own, its `failures[]` entry, or the process-level one (recorded)."""
-        failures = (step.line or {}).get("failures")
-        candidates = [own] if own is not None else []
-        for entry in failures if isinstance(failures, list) else []:
-            if not isinstance(entry, dict):
-                self.degraded.add("result_malformed")
-            elif entry.get("export") == export and entry.get("table") == table:
-                candidates.append(entry)
-        for candidate in candidates:
-            parsed = ErrorObject.from_contract(candidate)
-            if parsed is not None:
-                return parsed
-            self.degraded.add("result_malformed")
-        self.degraded.add("per_unit_error")
-        return shared
+    def step_with_result(self, name: str, argv: list[str], result: Path | None) -> tuple[_Step, ErrorObject | None, Any]:
+        """Run a step asked to write `result` (`None`: no result file), classify its exit, read and remove the file."""
+        step = self.step(name, argv)
+        error = self.read.classify(step)
+        if result is None:
+            return step, error, None
+        doc = self.read.result_file(result, step)
+        result.unlink(missing_ok=True)
+        return step, error, doc
 
     def outcome(self, step: _Step, units: list[UnitResult], error: ErrorObject | None) -> Outcome:
         """Assemble the task's result and log one structured line per unit; a failed unit fails the task."""
@@ -513,16 +465,16 @@ def _tighten(path: Path) -> None:
 def _prune_stale(work: Path, now: float | None = None) -> None:
     """Remove expired plan artifacts and crashed ledgers untouched for STALE_AFTER, and the run folders left empty (D33)."""
     cutoff = (time.time() if now is None else now) - STALE_AFTER
-    for kind in ("plans", "crashed"):
+    for kind in (PLANS, CRASHED):
         try:
             files = [p for p in (work / kind).rglob("*") if p.is_file() and p.stat().st_mtime < cutoff]
         except OSError:
             continue
         for path in files:
-            if _unexpired(path) if kind == "plans" else not isinstance(_read_json(path), list):
+            if _unexpired(path) if kind == PLANS else not isinstance(_read_json(path), list):
                 continue  # a replayable plan, or a ledger that is not one: left until a person deletes it
             path.unlink(missing_ok=True)  # pragma: no mutate - just listed; gone only if a parallel task removed it
-        if kind == "plans":
+        if kind == PLANS:
             for folder in (work / kind).iterdir() if (work / kind).is_dir() else ():
                 try:
                     folder.rmdir()
@@ -678,12 +630,13 @@ def _lock_path(s: _Session) -> tuple[Path, str] | None:
 
     run / cdc_run / apply share one lock per export (rivet's run lease covers the three); load / compact take one per
     table where the binary narrows to a table, else one per export, as the load lease covers (G2)."""
-    if s.pf.state_dir is None or s.req.command == "plan":
-        return None
     cmd, export, table = s.req.command, s.req.export, s.req.table
-    locks = _private_dir(s.pf.state_dir, "airflow", "locks")
+    scope = LOCK_SCOPE[cmd]  # a command with no row is a KeyError, never a silent run lock
+    if s.pf.state_dir is None or scope is None:
+        return None
+    locks = _private_dir(s.pf.state_dir, WORK, LOCKS)
     whole = hashed_name("config", os.path.abspath(s.req.config))
-    if cmd in ("load", "compact"):
+    if scope == "load":
         if table and s.pf.caps.has_flag(cmd, "--table"):
             return _private_dir(locks, "table") / f"{hashed_name(export or '', table)}.lock", f"table `{table}` of `{export}`"
         return locks / f"{path_name(export) if export else whole}.lock", f"export `{export}`" if export else "the config"
@@ -850,14 +803,6 @@ def _read_json(path: Path) -> Any:
     return _json_of(raw)
 
 
-def _json_of(raw: bytes) -> Any:
-    """The JSON document of some bytes, `None` when they are not one (not UTF-8 included)."""
-    try:
-        return json.loads(raw)
-    except ValueError:
-        return None
-
-
 def _unexpired(artifact: Path) -> bool:
     """True when a sealed plan artifact exists and its `expires_at` is still ahead."""
     doc = _read_json(artifact)
@@ -910,48 +855,6 @@ def _refuse_foreign_artifact(artifact: Path, export: str, config: str) -> None:
         )
 
 
-def _entries(s: _Session, doc: Any, key: str) -> list[dict[str, Any]]:
-    """The unit entries of a result file; anything that is not a list of objects is dropped and recorded."""
-    entries = doc.get(key) if isinstance(doc, dict) else None
-    if entries is None:
-        return []
-    if not isinstance(entries, list) or not all(isinstance(e, dict) for e in entries):
-        s.degraded.add("result_malformed")
-    return [e for e in entries if isinstance(e, dict)] if isinstance(entries, list) else []
-
-
-def _run_units(s: _Session, step: _Step, summary: Any, error: ErrorObject | None) -> list[UnitResult]:
-    """Units of a `run` / `apply` process, from its summary file when it wrote one."""
-    entries = _entries(s, summary, "per_export")
-    if not entries:
-        if error is None and s.req.export is None:
-            return []
-        return [UnitResult(s.req.export, status="failed" if error else "success", error=error)]
-    units = []
-    for entry in entries:
-        name, status = s.malformed(entry.get("export_name"), str), s.status(entry.get("status"))
-        unit_error = None  # pragma: no mutate - a unit not failed is read by its status, its error by truthiness
-        if status == "failed":
-            shared = error or error_from_exit(step.exit_status, step.signal)
-            unit_error = s.unit_error(step, entry.get("error"), name, None, shared)
-        if entry.get("mode") == "cdc" and status == "success" and "stop_reason" not in entry:
-            s.degraded.add("stop_reason")
-        units.append(
-            UnitResult(
-                export=name,
-                status=status,
-                run_id=s.malformed(entry.get("run_id"), str),
-                rows=s.malformed(entry.get("rows"), int),
-                files=s.malformed(entry.get("files"), int),
-                stop_reason=s.malformed(entry.get("stop_reason"), str),
-                error=unit_error,
-            )
-        )
-    if len([u for u in units if u.status == "failed"]) <= 1:
-        s.degraded.discard("per_unit_error")
-    return units
-
-
 def _run(s: _Session) -> Outcome:
     """`rivet run`, for one export or the whole config."""
     cfg = s.config_for(None)
@@ -960,11 +863,8 @@ def _run(s: _Session) -> Outcome:
     if s.req.export:
         argv += ["--export", s.req.export]
     argv += ["--summary-output", str(summary), *s.req.extra_args, *s.globals_for("run")]
-    step = s.step("run", argv)
-    error = s.classify(step)
-    doc = s.result_file(summary, step)
-    summary.unlink(missing_ok=True)
-    return s.outcome(step, _run_units(s, step, doc, error), error)
+    step, error, doc = s.step_with_result("run", argv, summary)
+    return s.outcome(step, s.read.run_units(step, doc, error, s.req.export), error)
 
 
 def _apply(s: _Session) -> Outcome:
@@ -975,13 +875,13 @@ def _apply(s: _Session) -> Outcome:
     # success plans again instead of replaying a snapshot the successful apply already moved the cursor past (D04).
     series = () if s.req.series is None else (f"s{int(s.req.series)}",)
     name = path_name(export, s.req.label[2], *series, _plan_inputs(s, export))
-    artifact = _private_dir(s.work, "plans", s.run) / f"{name}.json"
+    artifact = _private_dir(s.work, PLANS, s.run) / f"{name}.json"
     _refuse_foreign_artifact(artifact, export, cfg)
     if not _unexpired(artifact):
         plan_argv = [s.pf.binary, "plan", "--config", cfg, "--export", export, "--format", "json"]
         plan_argv += ["--output", str(artifact), "--json-errors"]
         planned = s.step("plan", plan_argv)
-        error = s.classify(planned)
+        error = s.read.classify(planned)
         if error is not None:
             return s.outcome(planned, [UnitResult(export, status="failed", error=error)], error)
         _refuse_foreign_artifact(artifact, export, cfg)
@@ -996,11 +896,8 @@ def _apply(s: _Session) -> Outcome:
         )
     summary = s.work / f"{s.name}.summary.json"
     argv = [s.pf.binary, "apply", str(artifact), "--summary-output", str(summary), *s.req.extra_args]
-    step = s.step("apply", [*argv, *s.globals_for("apply")])
-    error = s.classify(step)
-    doc = s.result_file(summary, step)
-    summary.unlink(missing_ok=True)
-    units = _run_units(s, step, doc, error)
+    step, error, doc = s.step_with_result("apply", [*argv, *s.globals_for("apply")], summary)
+    units = s.read.run_units(step, doc, error, s.req.export)
     for unit in units:
         # rivet >= 0.32 answers a replay of a plan it already applied with the run that applied it (an earlier try's
         # result lost to a dead task process); an incremental plan replays as an empty run of its moved cursor
@@ -1020,7 +917,7 @@ def _plan(s: _Session) -> Outcome:
     scratch = target.with_name(f"{target.name}.{s.global_name}.tmp")
     argv = [s.pf.binary, "plan", "--config", s.config_for(None), "--format", "json", *s.req.extra_args, "--json-errors"]
     step = s.step("plan", argv, stdout_to=scratch)
-    error = s.classify(step)
+    error = s.read.classify(step)
     if error is None:
         try:
             plan_layout(_read_json(scratch))
@@ -1030,57 +927,6 @@ def _plan(s: _Session) -> Outcome:
             error = ErrorObject(None, None, "internal", 6, False, None, "rivet plan printed no plan layout")
     scratch.unlink(missing_ok=True)
     return s.outcome(step, [UnitResult(None, status="failed" if error else "success", error=error)], error)
-
-
-# The `load:` keys that hold where a warehouse's tables are created, outermost first (rivet's src/config/load.rs).
-TARGET_CONTAINER = {"bigquery": ("project", "dataset"), "snowflake": ("database", "schema"), "clickhouse": ("database",)}
-
-
-def config_target(config: Mapping[str, Any], cmd: str, export: str | None, table: str | None) -> tuple[str | None, str | None]:
-    """`(target, buffer)` as the config's `load:` block names them, in rivet's terms: a load writes the table of a `full`
-    export and the `<table>__changes` log of any other; a compact merges that log (buffer) into the base (target).
-    `(None, None)` when the block names no warehouse or no table is known; a part the block leaves to the warehouse's
-    default (BigQuery's project) is left out."""
-    load = config.get("load")
-    if not table or not isinstance(load, Mapping):
-        return None, None
-    keys = TARGET_CONTAINER.get(_yaml.text_of(load.get("target")))
-    if keys is None:
-        return None, None
-    base = ".".join([*(str(_yaml.text_of(load[k])) for k in keys if load.get(k) not in (None, "")), table])
-    if cmd == "compact":
-        return base, f"{base}__changes"
-    entry = next(
-        (e for e in config.get("exports") or [] if isinstance(e, Mapping) and _yaml.text_of(e.get("name")) == export), {}
-    )
-    return (base if _yaml.text_of(entry.get("mode")) == "full" else f"{base}__changes"), None
-
-
-def _with_target(s: _Session, unit: UnitResult, row: Mapping[str, Any]) -> UnitResult:
-    """The unit with the warehouse objects it touched: rivet's own names when its result has them, else the config's."""
-    named = row.get("target")
-    if isinstance(named, str) and named:
-        buffer = row.get("buffer")
-        unit.target, unit.buffer, unit.target_from = named, buffer if isinstance(buffer, str) else None, "rivet"
-    else:
-        unit.target, unit.buffer = config_target(s.pf.config, s.req.command, unit.export, unit.table)
-        unit.target_from = "config" if unit.target else None
-    return unit
-
-
-def _digest(s: _Session, row: Mapping[str, Any]) -> dict[str, Any] | None:
-    """The D3 digest of one `per_table` entry, each value of the contract's type or null (recorded); `None`, recorded as
-    `load_digest`, when the entry has none of its keys (a binary older than the digest)."""
-    if not any(key in row for key in DIGEST_KEYS):
-        s.degraded.add("load_digest")
-        return None
-    digest = {key: s.malformed(row.get(key), int) for key in DIGEST_COUNTS}
-    jobs = s.malformed(row.get("warehouse_job_ids"), list)
-    if jobs is not None and not all(isinstance(job, str) for job in jobs):
-        s.degraded.add("result_malformed")  # a list holding something other than ids: null, recorded
-        jobs = None
-    digest["warehouse_job_ids"] = jobs
-    return digest
 
 
 def _load(s: _Session) -> Outcome:
@@ -1104,39 +950,8 @@ def _load(s: _Session) -> Outcome:
     argv += [*s.req.extra_args, *s.globals_for(cmd)]
     if table and not by_table:
         s.degraded.add("load_table_filter")  # the whole export is loaded, under the export's lock (`_lock_path`)
-    step = s.step(cmd, argv)
-    error = s.classify(step)
-    doc = s.result_file(result, step) if has_result else None
-    result.unlink(missing_ok=True)
-    rows = _entries(s, doc, "per_table")
-    if not rows:
-        status = "failed" if error else DONE_WORD[cmd]
-        return s.outcome(step, [_with_target(s, UnitResult(export, table, status=status, error=error), {})], error)
-    units = []
-    for row in rows:
-        if table and row.get("table") != table:
-            continue
-        name, of, status = s.malformed(row.get("export"), str), s.malformed(row.get("table"), str), s.status(row.get("status"))
-        unit_error = None  # pragma: no mutate - a unit not failed is read by its status, its error by truthiness
-        if status == "failed":
-            shared = error or error_from_exit(step.exit_status, step.signal)
-            unit_error = s.unit_error(step, row.get("error"), name, of, shared)
-        units.append(
-            UnitResult(
-                export=name,
-                table=of,
-                status=status,
-                run_id=s.malformed(doc.get("run_id"), str),
-                rows=s.malformed(row.get("rows"), int),
-                error=unit_error,
-                skip_reason=s.malformed(row.get("skip_reason"), str),
-                digest=_digest(s, row),
-            )
-        )
-        _with_target(s, units[-1], row)
-    if len([u for u in units if u.status == "failed"]) <= 1:
-        s.degraded.discard("per_unit_error")
-    return s.outcome(step, units, error)
+    step, error, doc = s.step_with_result(cmd, argv, result if has_result else None)
+    return s.outcome(step, s.read.load_units(step, doc, error, export, table), error)
 
 
 _DISPATCH = {"run": _run, "cdc_run": _run, "apply": _apply, "plan": _plan, "load": _load, "compact": _load}

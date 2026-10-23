@@ -279,17 +279,13 @@ def test_several_units_each_name_their_table() -> None:
     ],
 )
 def test_a_unit_takes_rivets_names_else_the_configs(row: dict, expected: tuple) -> None:
-    from types import SimpleNamespace
-
-    from airflow_provider_rivet.invocation import _with_target
+    from airflow_provider_rivet.reading import Reading
     from airflow_provider_rivet.result import UnitResult
 
-    config = {"load": BQ, "exports": EXPORTS}
-    s = SimpleNamespace(pf=SimpleNamespace(config=config), req=SimpleNamespace(command="load"))
-    unit = _with_target(s, UnitResult("snap", "t"), row)  # type: ignore[arg-type]
+    unit = Reading(set(), {"load": BQ, "exports": EXPORTS}, "load").with_target(UnitResult("snap", "t"), row)
     assert (unit.target, unit.buffer, unit.target_from) == expected
-    s.pf.config = {"exports": EXPORTS}  # no `load:` block: nothing to name, and no source claimed
-    unit = _with_target(s, UnitResult("snap", "t"), {})  # type: ignore[arg-type]
+    # no `load:` block: nothing to name, and no source claimed
+    unit = Reading(set(), {"exports": EXPORTS}, "load").with_target(UnitResult("snap", "t"), {})
     assert (unit.target, unit.buffer, unit.target_from) == (None, None, None)
 
 
