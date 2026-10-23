@@ -7,7 +7,7 @@ The operators, the XCom value every task returns, and the block each task writes
 Every operator takes the same parameters (plus Airflow's own: `task_id`, `retries`, ...).
 **Templated** ones accept Jinja; `env` and `env_from_connections` are not templated, so their
 values are never stored as rendered fields. No operator builds argv: one module,
-`invocation.py`, builds it, runs the process, reads the outputs and classifies.
+`invocation.py`, builds it and runs the process; `reading.py` reads rivet's outputs into units and classifies.
 
 | Parameter | Default | Templated | What it is |
 |---|---|---|---|

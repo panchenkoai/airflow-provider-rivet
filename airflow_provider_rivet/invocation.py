@@ -58,6 +58,9 @@ PR_SET_PDEATHSIG = 1  # <linux/prctl.h>
 # DAG's sealed plans (`plans/<run>/`) and crashed ledgers (`crashed/`), which `_prune_stale` walks; `airflow/locks/`
 # the export locks; `logs/<dag>/<task>/` the stderr files.
 WORK, PLANS, CRASHED, LOCKS, LOGS = "airflow", "plans", "crashed", "locks", "logs"
+# The lock each command takes (`_lock_path`): rivet's run lease covers run, cdc_run and apply alike, its load lease a
+# load or compact of one table; `plan` only reads. Every command `invoke` dispatches has a row.
+LOCK_SCOPE = {"run": "run", "cdc_run": "run", "apply": "run", "load": "load", "compact": "load", "plan": None}
 
 
 def worker_environment(
@@ -627,12 +630,13 @@ def _lock_path(s: _Session) -> tuple[Path, str] | None:
 
     run / cdc_run / apply share one lock per export (rivet's run lease covers the three); load / compact take one per
     table where the binary narrows to a table, else one per export, as the load lease covers (G2)."""
-    if s.pf.state_dir is None or s.req.command == "plan":
-        return None
     cmd, export, table = s.req.command, s.req.export, s.req.table
+    scope = LOCK_SCOPE[cmd]  # a command with no row is a KeyError, never a silent run lock
+    if s.pf.state_dir is None or scope is None:
+        return None
     locks = _private_dir(s.pf.state_dir, WORK, LOCKS)
     whole = hashed_name("config", os.path.abspath(s.req.config))
-    if cmd in ("load", "compact"):
+    if scope == "load":
         if table and s.pf.caps.has_flag(cmd, "--table"):
             return _private_dir(locks, "table") / f"{hashed_name(export or '', table)}.lock", f"table `{table}` of `{export}`"
         return locks / f"{path_name(export) if export else whole}.lock", f"export `{export}`" if export else "the config"

@@ -200,3 +200,8 @@ def test_the_preflight_is_told_whether_the_task_is_a_cdc_run_and_its_warnings_ar
         invocation._invoke(Request(command, "c", {}), events.append, None, None)
     assert seen["cdc"] is cdc
     assert events == [{"event": "rivet.warning", "warning": "no_notify", "text": "the binary has no --no-notify"}]
+
+
+def test_every_dispatched_command_names_its_lock() -> None:
+    """LOCK_SCOPE: a command added to the dispatch without a lock row is caught here, not by a run blocked for lock_wait."""
+    assert set(invocation.LOCK_SCOPE) == set(invocation._DISPATCH)
