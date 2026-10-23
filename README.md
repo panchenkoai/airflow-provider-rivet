@@ -128,6 +128,7 @@ or a shared state: see [State](https://github.com/panchenkoai/airflow-provider-r
 | [DAG builders](https://github.com/panchenkoai/airflow-provider-rivet/blob/main/docs/dag-builders.md) | `build_batch_dag`, `build_cdc_dag`: tasks, waves, trigger rules, the `watcher` |
 | [Retries](https://github.com/panchenkoai/airflow-provider-rivet/blob/main/docs/retries.md) | exit status → success, retry or stop; the crashed budget; a retry of an apply that succeeded |
 | [State](https://github.com/panchenkoai/airflow-provider-rivet/blob/main/docs/state.md) | state by deployment, the local worker setup guide, moving to PostgreSQL |
+| [Recipe: CDC from cron to Airflow](https://github.com/panchenkoai/airflow-provider-rivet/blob/main/docs/cron-to-airflow-cdc.md) | a MySQL CDC stream run by cron moved to a DAG with PostgreSQL state, one stream per source, no new baseline |
 | [Connections and secrets](https://github.com/panchenkoai/airflow-provider-rivet/blob/main/docs/connections-and-secrets.md) | the subprocess environment, database / storage / warehouse Connections, where to keep them |
 | [Slack alerts](https://github.com/panchenkoai/airflow-provider-rivet/blob/main/docs/slack.md) | the failure callback and its setup guide |
 | [Capabilities](https://github.com/panchenkoai/airflow-provider-rivet/blob/main/docs/capabilities.md) | what works with today's rivet and what waits for a newer one |
