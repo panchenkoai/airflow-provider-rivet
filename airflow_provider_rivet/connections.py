@@ -382,15 +382,22 @@ def connection_url(conn: Any, scheme: str | None = None) -> str:
 # --- A database by name: an Airflow Connection, else an ODBC data source ---
 
 # What an odbc.ini `Driver` names -> the Connection type it is; matched on the lower-cased name or library path.
-ODBC_DRIVERS = (("mysql", "mysql"), ("myodbc", "mysql"), ("mariadb", "mysql"), ("postgres", "postgres"), ("psqlodbc", "postgres"))
+ODBC_DRIVERS = (
+    ("mysql", "mysql"), ("myodbc", "mysql"), ("mariadb", "mysql"),
+    ("postgres", "postgres"), ("psqlodbc", "postgres"),
+    ("sql server", "mssql"), ("msodbcsql", "mssql"), ("freetds", "mssql"), ("tdsodbc", "mssql"),
+    ("oracle", "oracle"), ("sqora", "oracle"),
+)  # fmt: skip
 # odbc.ini keys (case-insensitive, first one set wins) -> the Connection field they fill.
 ODBC_FIELDS = {
-    "host": ("server", "servername", "host"),
+    "host": ("server", "servername", "host", "dbq"),
     "port": ("port",),
-    "login": ("user", "uid", "username"),
+    "login": ("user", "uid", "username", "userid"),
     "password": ("password", "pwd"),
     "schema": ("database", "db"),
 }
+# Oracle's EZConnect `[//]host[:port]/service`; anything else in ServerName is a tnsnames.ora alias.
+EZCONNECT = re.compile(r"(?://)?(?P<host>[^:/\s]+)(?::(?P<port>[^/]*))?/(?P<service>\S+)")
 REF_KEYS = {"conn_id", "scheme", "database", "odbc_ini", "dsn"}
 
 
@@ -424,17 +431,62 @@ def odbc_connection(path: str, name: str) -> OdbcConnection | None:
     section = dict(ini[name])  # keys lower-cased by the parser
     driver = section.get("driver", "")
     conn_type = next((kind for word, kind in ODBC_DRIVERS if word in driver.lower()), None)
+    where = f"ODBC data source [{name}] in {path}"
     if conn_type is None:
+        why = (
+            "MongoDB's ODBC driver reads through the BI Connector's MySQL protocol, not the database rivet reads"
+            if "mongo" in driver.lower()
+            else "rivet reads MySQL, PostgreSQL, SQL Server and Oracle data sources from odbc.ini"
+        )
         raise PreflightRefusal(
-            UNSUPPORTED,
-            f"ODBC data source [{name}] in {path} uses driver `{driver}`; rivet reads MySQL and PostgreSQL "
-            f"data sources from odbc.ini: create an Airflow Connection `{name}` instead",
+            UNSUPPORTED, f"{where} uses driver `{driver}`; {why}: create an Airflow Connection `{name}` instead"
         )
     values = {f: next((section[k].strip() for k in keys if section.get(k, "").strip()), None) for f, keys in ODBC_FIELDS.items()}
+    if conn_type == "mssql":
+        _odbc_sqlserver(section, values, where)
+    elif conn_type == "oracle":
+        _odbc_oracle(values, where)
     port = values.pop("port")
     if port is not None and not port.isdigit():
         raise PreflightRefusal(UNSUPPORTED, f"ODBC data source [{name}] in {path} has port `{port}`, which is no number")
     return OdbcConnection(conn_id=name, conn_type=conn_type, port=int(port) if port else None, **values)
+
+
+def _odbc_sqlserver(section: Mapping[str, str], values: dict[str, Any], where: str) -> None:
+    """SQL Server's `Server`: `[tcp:]host[,port]`; a named instance (`host\\name`) and Windows or Entra sign-in are
+    refused, since a rivet URL carries a host, a port and a password."""
+    if _yes(section.get("trusted_connection")) or section.get("authentication"):  # configparser strips each value
+        raise PreflightRefusal(
+            UNSUPPORTED, f"{where} signs in with Windows or Entra ID; rivet signs in with a SQL login: set UID and PWD"
+        )
+    host = values["host"]
+    if host is None:
+        return
+    if "\\" in host:
+        raise PreflightRefusal(
+            UNSUPPORTED, f"{where} names the instance `{host}`; give the instance's TCP port: Server = host,port"
+        )
+    host, comma, port = host.removeprefix("tcp:").partition(",")
+    values["host"] = host.strip() or None
+    if comma:
+        values["port"] = port.strip()
+
+
+def _odbc_oracle(values: dict[str, Any], where: str) -> None:
+    """Oracle's `ServerName` as EZConnect `[//]host[:port]/service`, the service becoming the database; a tnsnames.ora
+    alias is refused, since resolving it needs the worker's Oracle network files."""
+    if values["host"] is None:
+        raise PreflightRefusal(UNSUPPORTED, f"{where} has no ServerName: write ServerName = host:port/service")
+    match = EZCONNECT.fullmatch(values["host"])
+    if match is None:
+        raise PreflightRefusal(
+            UNSUPPORTED,
+            f"{where} names `{values['host']}`, a tnsnames.ora alias; write ServerName = host:port/service, or create "
+            "an Airflow Connection",
+        )
+    values["host"], values["schema"] = match["host"], match["service"]
+    if match["port"] is not None:
+        values["port"] = match["port"]
 
 
 def database_ref(ref: Any) -> dict[str, Any]:

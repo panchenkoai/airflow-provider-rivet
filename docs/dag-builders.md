@@ -139,7 +139,7 @@ For each name `<name>`:
 | | |
 |---|---|
 | DAG | `rivet_<name>_cdc` / `rivet_<name>_batch`, paused at creation (`is_paused_upon_creation`) |
-| source | the Airflow Connection `source_connection` (default `{name}`; `rivet_{name}` for the layout of [the cron recipe](cron-to-airflow-cdc.md)); without one, the data source `[<name>]` of `odbc_ini` (default `/etc/odbc.ini`; `None` turns it off). The task log says when odbc.ini was used. MySQL and PostgreSQL drivers |
+| source | the Airflow Connection `source_connection` (default `{name}`; `rivet_{name}` for the layout of [the cron recipe](cron-to-airflow-cdc.md)); without one, the data source `[<name>]` of `odbc_ini` (default `/etc/odbc.ini`; `None` turns it off). The task log says when odbc.ini was used. odbc.ini: MySQL, PostgreSQL, SQL Server (`Server = host,port`, a SQL login) and Oracle (`ServerName = host:port/service`) drivers; MongoDB only through a Connection |
 | config | `<config_dir>/<name>.yaml` |
 | state | the database `rivet_state_<name>` on the server of `state_connection`, and the folder `<state_root>/<name>` |
 
@@ -160,9 +160,17 @@ only (an `init` cleared in several runs at once fails in each run that starts af
 since the DAG has no `init` task then). The bucket and the
 warehouse dataset are not created: they must exist.
 
-**Once the config exists**, the next parse builds the same DAG from it: for `cdc`, the config's one `mode: cdc` export
-through `build_cdc_dag`, with a load per table when the config has a `load:` block and a compaction when its
-`layout` is `base_buffer`; for `batch`, every export through `build_batch_dag`, with a load when it has `load:`. So
+**Once the config exists**, the next parse builds the same DAG from it: for `cdc`, each `mode: cdc` export of the
+config as a stream (`run`, then a load per table when the config has a `load:` block and a compaction when its
+`layout` is `base_buffer`); for `batch`, every export through `build_batch_dag`, with a load when it has `load:`.
+`rivet init --mode cdc` writes one stream over all tables on MySQL and PostgreSQL's `public`, which keeps the
+`build_cdc_dag` shape (`run`, `load.T`, `compact.T`), and one stream per table on SQL Server, Oracle, MongoDB and other
+PostgreSQL schemas: each stream is then a group named after its export (`dbo_orders.run`, `dbo_orders.load.dbo_orders`: a load takes the warehouse name, the schema's dot folded to `_`),
+the streams running side by side. A batch DAG takes init's suggested mode per table (`full` for a small one), or the one `init_args` names
+(`--mode incremental`). One name is one config and one state database: a source in both a CDC and a batch DAG needs
+two names, or a `config_dir` and `state_root` per mode. Oracle CDC signs in as a common user (`c##…`) that LogMiner
+lets mine, with `--schema` naming the tables' owner. `init_args` are one list for every name of a call: sources that need other flags
+(`--tls require` for SQL Server, `--schema`) go in a call of their own. So
 unpausing runs `init` at once, and the stream starts at the next scheduled run (or trigger one).
 
 - The config folder must be one the scheduler (Airflow 3: the dag-processor) and every worker read, as the DAGs

@@ -18,7 +18,7 @@ values are never stored as rendered fields. No operator builds argv: one module,
 | `plan_file` | `None` | yes | the layout file `RivetPlanOperator` rewrites and `build_batch_dag` reads waves from |
 | `rivet_bin` | `"rivet"` | no | the binary: a name looked up on the worker's `PATH`, else the one `rivet-cli` installed; or an absolute path |
 | `env` | `None` | no | extra variables for the rivet process; computed by your DAG file, so no secret literals |
-| `env_from_connections` | `None` | no | `{ENV_NAME: conn_id}`: a database URL built from an Airflow Connection inside the task (see [Connections and secrets](connections-and-secrets.md)); the value may also be `{"conn_id": …, "database": …, "odbc_ini": …, "dsn": …}`: another database on the same server, and the odbc.ini data source `dsn` (default the id) when no Connection has the id |
+| `env_from_connections` | `None` | no | `{ENV_NAME: conn_id}`: a database URL built from an Airflow Connection inside the task (see [Connections and secrets](connections-and-secrets.md)); the value may also be `{"conn_id": …, "database": …, "odbc_ini": …, "dsn": …}`: another database on the same server, and the odbc.ini data source `dsn` (default the id; MySQL, PostgreSQL, SQL Server and Oracle drivers) when no Connection has the id |
 | `env_passthrough` | `()` | no | worker variables (names or `MY_*` patterns) passed on; nothing outside the allow-list is inherited otherwise |
 | `cloud_credentials` | `()` | no | `"gcp"`, `"aws"`, `"azure"`: pass the worker's credential variables of that kind |
 | `connections` | `()` | no | storage and warehouse Connection ids (see ["Storage and warehouse connections"](connections-and-secrets.md#storage-and-warehouse-connections)) |

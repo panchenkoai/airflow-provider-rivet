@@ -1,4 +1,4 @@
-"""python -m gate --rivet-bin <linux rivet> [--airflow 2.10.5,3.3.2] [--sources mysql,mssql,mongodb,oracle] [--destinations s3] [--workers 2] [--verdicts out.jsonl] [--keep] [--sabotage drop-delta-file|warehouse-value]
+"""python -m gate --rivet-bin <linux rivet> [--airflow 2.10.5,3.3.2] [--sources mysql,mssql,mongodb,oracle [--source-dags]] [--destinations s3] [--workers 2] [--verdicts out.jsonl] [--keep] [--sabotage drop-delta-file|warehouse-value]
 
 With --warehouses: [--connections env|gsm] [--gcp-auth key|adc] choose where the stack's Connections live and how
 rivet authenticates to GCP; see docs/connections-and-secrets.md.
@@ -17,7 +17,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from . import client, destinations, migrate, multihost, sources
+from . import client, destinations, migrate, multihost, source_dags, sources
 from . import conns as proofs
 from .scenario import TABLES, Verdicts, play
 from .stand import FLAVORS, Stand
@@ -47,6 +47,12 @@ def main(argv: list[str] | None = None) -> int:
         default="",
         help=f"comma-separated source legs beside postgres ({','.join(sources.ENGINES)}): each to GCS and BigQuery on the "
         "configs `rivet init` writes; needs --warehouses",
+    )
+    ap.add_argument(
+        "--source-dags",
+        action="store_true",
+        help="the source legs through build_source_dags: a DAG per named database (odbc.ini data sources, MongoDB a "
+        "Connection) whose own `init` task writes its config; the gate runs no `rivet init`",
     )
     ap.add_argument(
         "--destinations",
@@ -141,6 +147,11 @@ def main(argv: list[str] | None = None) -> int:
                 "--airflow 2.10.2, --sources with mysql and --migrate-from"
             )
         args.gcp_auth = "env-file"  # the client's: GOOGLE_APPLICATION_CREDENTIALS, no GCP Connection
+    if args.source_dags and (not engines or args.migrate_from or args.client_override or args.state != "gate"):
+        ap.error(
+            "--source-dags runs the source legs (--sources) on the gate's own state server: no --migrate-from, "
+            "--client-override or --state compose-postgres beside it"
+        )
     if args.migrate_from and "mysql" not in engines:
         ap.error("--migrate-from runs beside the MySQL source leg: pass --sources with mysql")
     if args.state != "gate" and not engines:
@@ -202,10 +213,11 @@ def main(argv: list[str] | None = None) -> int:
             workers=args.workers,
             state_place=args.state,
             migrate_from=args.migrate_from.resolve() if args.migrate_from else None,
+            source_dags=source_dags.Layout(sources.engines(engines)) if args.source_dags else None,
         )
         leg = Leg(cloud, version, TABLES, warehouses) if cloud and warehouses else None
         hosts = multihost.MultiHost(stand, Verdicts(version), cloud) if cloud and args.workers > 1 else None
-        src_legs = sources.legs(cloud, version, engines)
+        src_legs = (source_dags.legs if args.source_dags else sources.legs)(cloud, version, engines)
         mig_legs = migrate.legs(src_legs, args.migrate_from)
         readme_legs = client.legs(src_legs, args.client_override)
         dest_legs = list(stand.destinations)

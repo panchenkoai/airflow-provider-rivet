@@ -144,8 +144,7 @@ def test_a_missing_file_or_data_source_is_none_and_a_foreign_driver_is_refused(o
     assert odbc_connection(odbc_ini, "nope") is None
     assert odbc_connection(str(tmp_path / "absent.ini"), "shop") is None
     assert odbc_connection(odbc_ini, "SHOP") is None  # a data source name is case-sensitive, as in unixODBC
-    with pytest.raises(PreflightRefusal, match=r"\[mssql\].*ODBC Driver 18 for SQL Server.*Airflow Connection `mssql`"):
-        odbc_connection(odbc_ini, "mssql")
+    assert odbc_connection(odbc_ini, "mssql").conn_type == "mssql"
 
 
 def test_a_port_that_is_no_number_is_refused(tmp_path: Path) -> None:
@@ -192,10 +191,9 @@ def init_operator(tmp_path: Path, **kwargs: Any) -> RivetInitOperator:
     kwargs.setdefault("state_dir", str(tmp_path / "state" / "shop"))
     return RivetInitOperator(
         task_id="init",
-        mode="cdc",
         source_env="RIVET_SOURCE_URL",
         config=str(tmp_path / "cfg" / "shop.yaml"),
-        **{"rivet_bin": str(tmp_path / "bin" / "rivet"), **kwargs},
+        **{"rivet_bin": str(tmp_path / "bin" / "rivet"), "mode": "cdc", **kwargs},
     )
 
 
@@ -585,8 +583,8 @@ def test_odbc_refusals_carry_their_code_and_text(tmp_path: Path) -> None:
     path = write(tmp_path, "[shop]\nServer = h\n")
     r = refusal(lambda: odbc_connection(path, "shop"))
     assert str(r) == (
-        f"[RIVET_AIRFLOW_CONNECTION_UNSUPPORTED] ODBC data source [shop] in {path} uses driver ``; rivet reads MySQL and "
-        "PostgreSQL data sources from odbc.ini: create an Airflow Connection `shop` instead"
+        f"[RIVET_AIRFLOW_CONNECTION_UNSUPPORTED] ODBC data source [shop] in {path} uses driver ``; rivet reads MySQL, "
+        "PostgreSQL, SQL Server and Oracle data sources from odbc.ini: create an Airflow Connection `shop` instead"
     )
     path = write(tmp_path, "[shop]\nDriver = MySQL\nPort = x\n")
     r = refusal(lambda: odbc_connection(path, "shop"))
@@ -638,7 +636,7 @@ def test_the_data_source_log_line_word_for_word(
 def test_every_flag_the_operator_owns_is_refused(tmp_path: Path, owned: str) -> None:
     with pytest.raises(ValueError) as exc:
         init_operator(tmp_path, init_args=["--tls", "disable", owned, "x"])
-    assert str(exc.value) == f"init_args may not set ['{owned}']: the operator sets the source, the output and the mode"
+    assert str(exc.value) == f"init_args may not set ['{owned}']: the operator sets the source, the output and the CDC mode"
 
 
 def test_init_takes_cdc_or_batch(tmp_path: Path) -> None:
@@ -800,7 +798,7 @@ def test_builder_refusals_word_for_word(tmp_path: Path) -> None:
         assert message(operator_kwargs={key: "x"}) == f"operator_kwargs may not set ['{key}']: each source's DAG sets them"
     assert message(operator_kwargs={"trigger_rule": "all_done"}).startswith("operator_kwargs may not set `trigger_rule`")
     (tmp_path / "shop.yaml").write_text("exports: []\n")
-    assert message() == f"{tmp_path / 'shop.yaml'}: expected one export with `mode: cdc`, found 0"
+    assert message() == f"{tmp_path / 'shop.yaml'}: no export with `mode: cdc`"
 
 
 def test_every_source_is_built_whichever_has_a_config(tmp_path: Path) -> None:
@@ -945,3 +943,145 @@ def test_resolve_database_takes_any_lookup(odbc_ini: str) -> None:
     assert resolve_database({"conn_id": "shop", "odbc_ini": odbc_ini}, found.get)[1] is None  # the Connection: no data source
     with pytest.raises(PreflightRefusal, match=r"connection `x` is not defined .*reads; create it"):
         resolve_database({"conn_id": "x"}, {}.get)
+
+
+PER_TABLE_STREAMS = """\
+source:
+  type: mssql
+  url_env: RIVET_SOURCE_URL
+load:
+  target: bigquery
+  project: p
+  dataset: shop
+  layout: base_buffer
+exports:
+  - name: dbo_orders
+    table: dbo.orders
+    mode: cdc
+  - name: dbo_users
+    table: dbo.users
+    mode: cdc
+  - name: users_recipe
+    table: dbo.users
+    mode: full
+"""
+
+
+def test_a_stream_per_table_gets_a_group_per_stream(tmp_path: Path) -> None:
+    """rivet init on SQL Server, Oracle, MongoDB and PostgreSQL outside `public`: one CDC export per table."""
+    (tmp_path / "shop.yaml").write_text(PER_TABLE_STREAMS)
+    dag = build(tmp_path)["rivet_shop_cdc"]
+    assert {t.task_id for t in dag.tasks} == {
+        "dbo_orders.run",
+        "dbo_orders.load.dbo_orders",
+        "dbo_orders.compact.dbo_orders",
+        "dbo_users.run",
+        "dbo_users.load.dbo_users",
+        "dbo_users.compact.dbo_users",
+        "watcher",
+    }
+    run, load = dag.get_task("dbo_users.run"), dag.get_task("dbo_users.load.dbo_users")
+    # `rivet load --table` takes the warehouse name: init's `dbo.users` folded (rivet 0.32.2: RIVET_CLI_TABLE_UNKNOWN)
+    assert (run.export, load.export, load.table) == ("dbo_users", "dbo_users", "dbo_users")
+    assert load.upstream_task_ids == {"dbo_users.run"}
+    assert dag.get_task("dbo_users.compact.dbo_users").upstream_task_ids == {"dbo_users.load.dbo_users"}
+    assert run.trigger_rule == "all_success" and run.env_from_connections["RIVET_SOURCE_URL"]["conn_id"] == "shop"
+
+
+@pytest.mark.parametrize(
+    ("section", "expected"),
+    [
+        (
+            "Driver = ODBC Driver 18 for SQL Server\nServer = tcp:ms1,14330\nDatabase = shop\nUID = sa\nPWD = p\n",
+            ("mssql", "ms1", 14330, "shop", "sqlserver://sa:p@ms1:14330/shop"),
+        ),
+        (
+            "Driver = /usr/lib/libtdsodbc.so\nServer = ms1\nPort = 1433\nDatabase = shop\nUID = u\nPWD = p\n",
+            ("mssql", "ms1", 1433, "shop", "sqlserver://u:p@ms1:1433/shop"),
+        ),
+        (
+            "Driver = Oracle 21 ODBC driver\nServerName = //ora1:1521/FREEPDB1\nUserID = rivet\nPassword = p\n",
+            ("oracle", "ora1", 1521, "FREEPDB1", "oracle://rivet:p@ora1:1521/FREEPDB1"),
+        ),
+        (
+            "Driver = /opt/oracle/libsqora.so.21.1\nServerName = ora1/ORCL\nUserID = rivet\nPassword = p\n",
+            ("oracle", "ora1", None, "ORCL", "oracle://rivet:p@ora1/ORCL"),
+        ),
+    ],
+    ids=["msodbc", "freetds", "oracle-ezconnect", "oracle-no-port"],
+)
+def test_sql_server_and_oracle_data_sources_read_as_connections(tmp_path: Path, section: str, expected: tuple) -> None:
+    from airflow_provider_rivet.connections import connection_url
+
+    conn = odbc_connection(write(tmp_path, f"[src]\n{section}"), "src")
+    assert (conn.conn_type, conn.host, conn.port, conn.schema, connection_url(conn)) == expected
+
+
+@pytest.mark.parametrize(
+    ("section", "why"),
+    [
+        (
+            "Driver = ODBC Driver 18 for SQL Server\nServer = ms1\nTrusted_Connection = yes\n",
+            "signs in with Windows or Entra ID; rivet signs in with a SQL login: set UID and PWD",
+        ),
+        (
+            "Driver = ODBC Driver 18 for SQL Server\nServer = ms1\nAuthentication = ActiveDirectoryPassword\n",
+            "signs in with Windows or Entra ID; rivet signs in with a SQL login: set UID and PWD",
+        ),
+        (
+            "Driver = ODBC Driver 18 for SQL Server\nServer = ms1\\SQLEXPRESS\n",
+            "names the instance `ms1\\SQLEXPRESS`; give the instance's TCP port: Server = host,port",
+        ),
+        (
+            "Driver = Oracle 21 ODBC driver\nServerName = PRODDB\n",
+            "names `PRODDB`, a tnsnames.ora alias; write ServerName = host:port/service, or create an Airflow Connection",
+        ),
+        (
+            "Driver = MongoDB ODBC 1.4.2 Unicode Driver\nServer = m1\n",
+            "uses driver `MongoDB ODBC 1.4.2 Unicode Driver`; MongoDB's ODBC driver reads through the BI Connector's MySQL "
+            "protocol, not the database rivet reads: create an Airflow Connection `src` instead",
+        ),
+        (
+            "Driver = Snowflake\nServer = s\n",
+            "uses driver `Snowflake`; rivet reads MySQL, PostgreSQL, SQL Server and Oracle data sources from odbc.ini: "
+            "create an Airflow Connection `src` instead",
+        ),
+    ],
+    ids=["trusted", "entra", "named-instance", "tns-alias", "mongodb", "other"],
+)
+def test_what_a_data_source_cannot_give_rivet_is_refused(tmp_path: Path, section: str, why: str) -> None:
+    path = write(tmp_path, f"[src]\n{section}")
+    r = refusal(lambda: odbc_connection(path, "src"))
+    assert str(r) == f"[RIVET_AIRFLOW_CONNECTION_UNSUPPORTED] ODBC data source [src] in {path} {why}"
+
+
+def test_a_batch_dag_may_choose_init_s_mode_but_not_cdc(tmp_path: Path) -> None:
+    op = init_operator(tmp_path, mode="batch", init_args=["--mode", "incremental"])
+    assert op.init_args == ["--mode", "incremental"]
+    with pytest.raises(ValueError) as exc:
+        init_operator(tmp_path, mode="batch", init_args=["--mode", "cdc"])
+    assert str(exc.value) == "init_args may not ask for `--mode cdc` in a batch DAG: use mode='cdc'"
+    with pytest.raises(ValueError, match=r"may not set \['--mode'\]"):
+        init_operator(tmp_path, mode="cdc", init_args=["--mode", "incremental"])
+
+
+@pytest.mark.parametrize("trusted", ["true", "Yes", "1"])
+def test_every_spelling_of_windows_sign_in_is_refused(tmp_path: Path, trusted: str) -> None:
+    path = write(tmp_path, f"[src]\nDriver = ODBC Driver 18 for SQL Server\nServer = ms1\nTrusted_Connection = {trusted}\n")
+    assert "signs in with Windows or Entra ID" in str(refusal(lambda: odbc_connection(path, "src")))
+
+
+def test_a_sql_server_data_source_without_a_server_has_no_host(tmp_path: Path) -> None:
+    from airflow_provider_rivet.connections import connection_url
+
+    conn = odbc_connection(write(tmp_path, "[src]\nDriver = ODBC Driver 18 for SQL Server\nUID = u\n"), "src")
+    assert conn.host is None
+    assert "has no host" in str(refusal(lambda: connection_url(conn)))
+
+
+def test_an_oracle_data_source_without_a_server_name_is_refused(tmp_path: Path) -> None:
+    path = write(tmp_path, "[src]\nDriver = Oracle 21 ODBC driver\nUserID = u\n")
+    assert str(refusal(lambda: odbc_connection(path, "src"))) == (
+        f"[RIVET_AIRFLOW_CONNECTION_UNSUPPORTED] ODBC data source [src] in {path} has no ServerName: write ServerName = "
+        "host:port/service"
+    )

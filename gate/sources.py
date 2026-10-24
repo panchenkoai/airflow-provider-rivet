@@ -27,9 +27,9 @@ import yaml
 from . import warehouse
 from .stand import COMPOSE_STATE_ROLE, METASTORE_DB, sh, state_db
 
-#: A bucket the gate made for one config of a stack and engine: `rivet-afgate-<tag>-<stack>-<engine>-<batch|cdc>` (the
-#: sweep drops nothing else).
-BUCKET_SHAPE = re.compile(r"rivet-afgate-\d{8}[0-9a-f]{4}-\d+-[a-z]+-(batch|cdc)")
+#: A bucket the gate made for one config of a stack and engine: `rivet-afgate-<tag>-<stack>-<engine>-<batch|cdc>`, or
+#: `...-<engine>_<batch|cdc>` for a source of `--source-dags`, named after the source (the sweep drops nothing else).
+BUCKET_SHAPE = re.compile(r"rivet-afgate-\d{8}[0-9a-f]{4}-\d+-[a-z]+[-_](batch|cdc)")
 
 
 @dataclass(frozen=True)
@@ -419,8 +419,9 @@ ORACLE = Engine(
     ping="SELECT 1 FROM dual;\nEXIT\n",
     ready=("healthcheck.sh",),
     ready_timeout=600,
-    # LogMiner's prerequisites as rivet's stand sets them (dev/oracle/init/02-logminer.sh): ARCHIVELOG and minimal
-    # supplemental logging; the tables log ALL columns. Then the leg's user in the pluggable database.
+    # LogMiner's prerequisites as rivet's stand sets them (dev/oracle/init/02-logminer.sh): ARCHIVELOG, minimal
+    # supplemental logging and the common user LogMiner mines as from CDB$ROOT (`c##rivetcdc`, rivet's cdc.md, read
+    # only by `--source-dags`); the tables log ALL columns. Then the leg's user in the pluggable database.
     setup="""
 HOST mkdir -p /opt/oracle/oradata/archive
 ALTER SYSTEM SET log_archive_dest_1 = 'LOCATION=/opt/oracle/oradata/archive' SCOPE = BOTH;
@@ -431,6 +432,15 @@ ALTER DATABASE OPEN;
 ALTER PLUGGABLE DATABASE ALL OPEN;
 ALTER PLUGGABLE DATABASE ALL SAVE STATE;
 ALTER DATABASE ADD SUPPLEMENTAL LOG DATA;
+CREATE USER c##rivetcdc IDENTIFIED BY "{password}" CONTAINER = ALL;
+GRANT CREATE SESSION, SET CONTAINER, LOGMINING, SELECT_CATALOG_ROLE, EXECUTE_CATALOG_ROLE TO c##rivetcdc CONTAINER = ALL;
+GRANT SELECT ON v_$database TO c##rivetcdc CONTAINER = ALL;
+GRANT SELECT ON v_$archived_log TO c##rivetcdc CONTAINER = ALL;
+GRANT SELECT ON v_$log TO c##rivetcdc CONTAINER = ALL;
+GRANT SELECT ON v_$logfile TO c##rivetcdc CONTAINER = ALL;
+GRANT SELECT ON v_$logmnr_contents TO c##rivetcdc CONTAINER = ALL;
+GRANT SELECT ON v_$logmnr_logs TO c##rivetcdc CONTAINER = ALL;
+GRANT SELECT ON v_$transaction TO c##rivetcdc CONTAINER = ALL;
 ALTER SESSION SET CONTAINER = FREEPDB1;
 CREATE USER rivet IDENTIFIED BY "{password}" QUOTA UNLIMITED ON USERS;
 GRANT CREATE SESSION, CREATE TABLE TO rivet;
@@ -461,6 +471,8 @@ INSERT INTO gate_orders (customer_id, amount, status, placed_at, payload, doc)
 COMMIT;
 ALTER TABLE gate_customers ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;
 ALTER TABLE gate_orders ADD SUPPLEMENTAL LOG DATA (ALL) COLUMNS;
+GRANT SELECT ON gate_customers TO c##rivetcdc;
+GRANT SELECT ON gate_orders TO c##rivetcdc;
 EXIT
 """,
     changes="""
@@ -542,8 +554,16 @@ def read_config(text: str, tables: Sequence[str]) -> dict[str, Any]:
 class SourceLeg:
     """One engine of one stack: its bucket, datasets, init-made configs, its DAGs (batch, one per CDC stream), and their oracles."""
 
+    #: Whether the phases after the cycles (hot ALTER, shared checkpoint, overlap, worker recreate, git-sync, same names
+    #: in another database) run for this leg: they drive the gate's own DAGs of the engine.
+    extras = True
+
     def __init__(self, cloud: warehouse.Cloud, stack: str, engine: Engine) -> None:
         self.cloud, self.stack, self.engine = cloud, stack, engine
+        #: The kinds whose configs load into BigQuery, graded there each cycle.
+        self.kinds: tuple[str, ...] = engine.kinds
+        #: Per DAG, the tasks a documented limit of rivet stops every cycle (their run then ends `failed`).
+        self.refused: dict[str, list[str]] = {}
         tag = f"{cloud.tag}-{stack.replace('.', '')}"
         # A bucket per config: init's prefixes are fixed, and SQL Server's CDC exports write under `exports/<table>/cdc/`,
         # inside the batch export's `exports/<table>/`, which `rivet load` lists recursively as its own runs.
@@ -739,6 +759,9 @@ class SourceLeg:
         self.tasks[dag] = ["run", *(f"{g}.{t}" for t in streams[0]["tables"] for g in ("load", "compact"))]
         self.shape["shared"] = {"dag": dag, "config": out, "stream": streams[0]}
 
+    def adopt(self, stand: Any, v: Any) -> None:
+        """After the DAGs are unpaused, before the first cycle: nothing here (init ran in `prepare`)."""
+
     def cycle_tasks(self) -> dict[str, list[str]]:
         """The rivet tasks of the DAGs every cycle runs (not the hot-ALTER DAG, which runs once after the cycles)."""
         return {dag: self.tasks[dag] for dag in self.dags}
@@ -844,6 +867,8 @@ class SourceLeg:
                 )
             if self.engine.ops:
                 for kind, text in sorted(self.texts.items()):
+                    if kind not in self.delta_kinds():
+                        continue
                     v.check(
                         f"{name}/{self.engine.name}/{kind}/load-block-as-written",
                         load_block_problems,
@@ -853,8 +878,8 @@ class SourceLeg:
         source = v.guard(f"{name}/{self.engine.name}/source", self.source_rows, stand)
         if source is None:
             return
-        deleted = {"batch": {t: deleted_by_batch(name, t) for t in self.engine.tables}}
-        self.grade_targets(v, name, source, self.engine.kinds, deleted)
+        deleted = {"batch": {t: self.kept_by_batch(name, t) for t in self.engine.tables}}
+        self.grade_targets(v, name, source, self.kinds, deleted)
         if name == "initial" and getattr(stand, "state_place", "gate") == "compose-postgres":
             v.check(
                 f"compose-pg/{self.engine.name}/state-in-own-database",
@@ -874,8 +899,16 @@ class SourceLeg:
         if self.engine.ops and run_id:
             ops = self.engine.ops.get(name, {})
             self.grade_tasks(stand, v, name, run_id, self.dags, source, ops, baseline=name == "initial")
-            self.grade_staged(v, name, self.engine.kinds)
+            self.grade_staged(v, name, self.kinds)
             self.high_water = {t: high_water(rows, self.engine.cursor) for t, rows in source.items()}
+
+    def kept_by_batch(self, cycle: str, table: str) -> int:
+        """Keys of `table` the batch target keeps after `cycle` although the source deleted them."""
+        return deleted_by_batch(cycle, table)
+
+    def delta_kinds(self) -> set[str]:
+        """The configs that load deltas (a base and a buffer `compact` merges): every config the leg's init wrote."""
+        return set(self.texts)
 
     def grade_targets(
         self,
