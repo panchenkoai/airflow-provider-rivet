@@ -1085,3 +1085,21 @@ def test_an_oracle_data_source_without_a_server_name_is_refused(tmp_path: Path) 
         f"[RIVET_AIRFLOW_CONNECTION_UNSUPPORTED] ODBC data source [src] in {path} has no ServerName: write ServerName = "
         "host:port/service"
     )
+
+
+def test_init_takes_only_its_own_parameters_and_the_builder_keeps_the_rest_for_the_rivet_tasks(tmp_path: Path) -> None:
+    """RivetInitOperator is no RivetBaseOperator: a lock, extra_args or a crash budget would mean nothing to it."""
+    from airflow_provider_rivet.dags import RUN_ONLY
+    from airflow_provider_rivet.operators import RivetBaseOperator
+
+    assert not issubclass(RivetInitOperator, RivetBaseOperator)
+    assert {"lock_wait", "extra_args", "crashed_retries", "export", "table", "deployment"} <= RUN_ONLY
+    assert not RUN_ONLY & {"env", "env_from_connections", "connections", "cloud_credentials", "rivet_bin", "config"}
+    with pytest.raises(Exception, match="lock_wait"):
+        init_operator(tmp_path, lock_wait=5)
+    run_kwargs = {"lock_wait": 5, "extra_args": ["-p", "day=1"], "cloud_credentials": ["gcp"]}
+    init = build(tmp_path, operator_kwargs=run_kwargs)["rivet_shop_cdc"].get_task("init")
+    assert init.cloud_credentials == ("gcp",)
+    (tmp_path / "shop.yaml").write_text(CDC_CONFIG.format(env="RIVET_SOURCE_URL"))
+    run = build(tmp_path, operator_kwargs=run_kwargs)["rivet_shop_cdc"].get_task("run")
+    assert (run.lock_wait, run.extra_args) == (5, ["-p", "day=1"])

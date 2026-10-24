@@ -61,21 +61,16 @@ def get_connection(conn_id: str) -> Any:
     return resolve_database({"conn_id": conn_id}, airflow_connection)[0]
 
 
-class RivetBaseOperator(BaseOperator):
-    """Runs one rivet command on the worker and turns its ADR-0039 result into an Airflow outcome."""
+class _RivetTask(BaseOperator):
+    """What every rivet task of this package has: the environment rivet runs with (Connections, odbc.ini data sources,
+    key files), the task log, and how a task that ends before or between rivet's steps reports it (a refusal, a stop
+    Airflow asked for), with `on_kill` reaching the running rivet. `RivetBaseOperator` adds the ADR-0039 invocation,
+    `RivetInitOperator` the writing of a config."""
 
     command = ""
-    needs_export = False
-    template_fields: Sequence[str] = (
-        "config",
-        "export",
-        "table",
-        "state_dir",
-        "plan_file",
-        "extra_args",
-        "stderr_dir",
-        "cwd",
-    )
+    export: str | None = None
+    table: str | None = None
+    template_fields: Sequence[str] = ("config", "state_dir")
     ui_color = "#e8f0fe"
     _tasklog: TaskLog  # this try's task log; `execute` starts a new one before anything is recorded
 
@@ -83,54 +78,26 @@ class RivetBaseOperator(BaseOperator):
         self,
         *,
         config: str,
-        export: str | None = None,
-        table: str | None = None,
         state_dir: str | None = None,
-        plan_file: str | None = None,
         rivet_bin: str = "rivet",
         env: Mapping[str, str] | None = None,
         env_from_connections: Mapping[str, Any] | None = None,
         env_passthrough: Sequence[str] = (),
         cloud_credentials: Sequence[str] = (),
         connections: Sequence[str] = (),
-        deployment: str = "auto",
-        extra_args: Sequence[str] | None = None,
-        lock_wait: int = 600,
-        rivet_notifications: bool = False,
-        crashed_retries: int = 1,
-        stderr_dir: str | None = None,
-        stream_stderr: bool = False,
-        log_keep: int | None = 10,
-        cwd: str | None = None,
-        single_host: bool = False,
         **kwargs: Any,
     ) -> None:
         super().__init__(**kwargs)
-        if self.needs_export and not export:
-            raise ValueError(f"{type(self).__name__} needs `export`")
         if set(cloud_credentials) - set(CLOUD_ENV):
             raise ValueError(f"cloud_credentials names {sorted(CLOUD_ENV)}, got {sorted(cloud_credentials)}")
         self.config = config
-        self.export = export
-        self.table = table
         self.state_dir = state_dir
-        self.plan_file = plan_file
         self.rivet_bin = rivet_bin
         self.env = env
         self.env_from_connections = env_from_connections
         self.env_passthrough = tuple(env_passthrough)
         self.cloud_credentials = tuple(cloud_credentials)
         self.connections = tuple(connections)
-        self.deployment = deployment
-        self.single_host = single_host
-        self.extra_args = extra_args
-        self.lock_wait = lock_wait
-        self.rivet_notifications = rivet_notifications
-        self.crashed_retries = crashed_retries
-        self.stderr_dir = stderr_dir
-        self.stream_stderr = stream_stderr
-        self.log_keep = log_keep
-        self.cwd = cwd
         self._proc: Any = None
         self._stop_requested = False  # pragma: no mutate - only ever read as a truth value, so None reads as False
 
@@ -157,11 +124,9 @@ class RivetBaseOperator(BaseOperator):
         return conn
 
     def _config_doc(self) -> dict[str, Any]:
-        """The config as rivet builds it, for the names a Connection is filed under; read by the preflight's reader, so a
-        config it refuses is refused here too, and a `${...}` in `load.password_env` / `load.connection` resolves from
-        `-p` and the task's environment (the worker's allow-listed variables and `env`) as rivet resolves it (D06)."""
-        env = {**worker_environment(self.env_passthrough, self.cloud_credentials), **(self.env or {})}
-        return read_config(self.config, {str(k): str(v) for k, v in env.items()}, params_of(self.extra_args or ()))
+        """The config, for the names a storage or warehouse Connection is filed under; a task with no config to read
+        (`init`, before it wrote one) files each under its own name."""
+        return {}
 
     def _emit(self, record: dict[str, Any]) -> None:
         """Keep one structured record: written as JSON at DEBUG, read into the task's readable lines (`tasklog`)."""
@@ -190,15 +155,6 @@ class RivetBaseOperator(BaseOperator):
         self._stop_requested = True
         if self._proc is not None:
             self._proc.request_stop()
-
-    def _upstream_markers(self, ti: Any) -> list[str]:
-        """State-directory markers the direct upstream rivet tasks of this run reported."""
-        upstream = sorted(self.upstream_task_ids)
-        if not upstream:
-            return []
-        pulled = ti.xcom_pull(task_ids=upstream, key=XCOM_KEY)  # pragma: no mutate - XCOM_KEY is Airflow's default key
-        values = [] if pulled is None else [pulled] if isinstance(pulled, dict) else list(pulled)
-        return [p["state_marker"] for p in values if isinstance(p, dict) and p.get("state_marker")]
 
     def _fail(self, ti: Any, payload: dict[str, Any], text: str, retry: bool) -> None:
         """Publish the payload and write the task's readable block, then raise the exception Airflow retries or the one
@@ -230,6 +186,96 @@ class RivetBaseOperator(BaseOperator):
             return self._run_with_secrets(ti, run_id, task_part, secrets)
         finally:
             shutil.rmtree(secrets, ignore_errors=True)
+
+    def _run_with_secrets(self, ti: Any, run_id: str, task_part: str, secrets: Path) -> dict[str, Any]:
+        """The task's work, with a private folder for the key files of this try."""
+        raise NotImplementedError
+
+
+class RivetBaseOperator(_RivetTask):
+    """Runs one rivet command on the worker and turns its ADR-0039 result into an Airflow outcome."""
+
+    command = ""
+    needs_export = False
+    template_fields: Sequence[str] = (
+        "config",
+        "export",
+        "table",
+        "state_dir",
+        "plan_file",
+        "extra_args",
+        "stderr_dir",
+        "cwd",
+    )
+
+    def __init__(
+        self,
+        *,
+        config: str,
+        export: str | None = None,
+        table: str | None = None,
+        state_dir: str | None = None,
+        plan_file: str | None = None,
+        rivet_bin: str = "rivet",
+        env: Mapping[str, str] | None = None,
+        env_from_connections: Mapping[str, Any] | None = None,
+        env_passthrough: Sequence[str] = (),
+        cloud_credentials: Sequence[str] = (),
+        connections: Sequence[str] = (),
+        deployment: str = "auto",
+        extra_args: Sequence[str] | None = None,
+        lock_wait: int = 600,
+        rivet_notifications: bool = False,
+        crashed_retries: int = 1,
+        stderr_dir: str | None = None,
+        stream_stderr: bool = False,
+        log_keep: int | None = 10,
+        cwd: str | None = None,
+        single_host: bool = False,
+        **kwargs: Any,
+    ) -> None:
+        super().__init__(
+            config=config,
+            state_dir=state_dir,
+            rivet_bin=rivet_bin,
+            env=env,
+            env_from_connections=env_from_connections,
+            env_passthrough=env_passthrough,
+            cloud_credentials=cloud_credentials,
+            connections=connections,
+            **kwargs,
+        )
+        if self.needs_export and not export:
+            raise ValueError(f"{type(self).__name__} needs `export`")
+        self.export = export
+        self.table = table
+        self.plan_file = plan_file
+        self.deployment = deployment
+        self.single_host = single_host
+        self.extra_args = extra_args
+        self.lock_wait = lock_wait
+        self.rivet_notifications = rivet_notifications
+        self.crashed_retries = crashed_retries
+        self.stderr_dir = stderr_dir
+        self.stream_stderr = stream_stderr
+        self.log_keep = log_keep
+        self.cwd = cwd
+
+    def _config_doc(self) -> dict[str, Any]:
+        """The config as rivet builds it, for the names a Connection is filed under; read by the preflight's reader, so a
+        config it refuses is refused here too, and a `${...}` in `load.password_env` / `load.connection` resolves from
+        `-p` and the task's environment (the worker's allow-listed variables and `env`) as rivet resolves it (D06)."""
+        env = {**worker_environment(self.env_passthrough, self.cloud_credentials), **(self.env or {})}
+        return read_config(self.config, {str(k): str(v) for k, v in env.items()}, params_of(self.extra_args or ()))
+
+    def _upstream_markers(self, ti: Any) -> list[str]:
+        """State-directory markers the direct upstream rivet tasks of this run reported."""
+        upstream = sorted(self.upstream_task_ids)
+        if not upstream:
+            return []
+        pulled = ti.xcom_pull(task_ids=upstream, key=XCOM_KEY)  # pragma: no mutate - XCOM_KEY is Airflow's default key
+        values = [] if pulled is None else [pulled] if isinstance(pulled, dict) else list(pulled)
+        return [p["state_marker"] for p in values if isinstance(p, dict) and p.get("state_marker")]
 
     def _run_with_secrets(self, ti: Any, run_id: str, task_part: str, secrets: Path) -> dict[str, Any]:
         """`execute` with a private folder for the key files of this try."""
@@ -383,7 +429,7 @@ def places(doc: Mapping[str, Any]) -> set[str]:
     return out
 
 
-class RivetInitOperator(RivetBaseOperator):
+class RivetInitOperator(_RivetTask):
     """Writes the config a source's DAG is built from: `rivet init` against the source, `rivet check` of what it wrote,
     then the file at `config`, never over one that exists. The data source is the `source_env` entry of
     `env_from_connections`; a `database` named for RIVET_STATE_URL is created on its PostgreSQL server if missing."""
@@ -430,10 +476,6 @@ class RivetInitOperator(RivetBaseOperator):
             self._stopped(ti, stop)
         finally:
             self._proc = None
-
-    def _config_doc(self) -> dict[str, Any]:
-        """No config yet: a storage or warehouse Connection is filed under its own name."""
-        return {}
 
     def _create_state_database(self) -> None:
         """CREATE DATABASE for a RIVET_STATE_URL entry that names a `database`, on the server its Connection points at."""

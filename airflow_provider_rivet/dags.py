@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import inspect
 import json
 import re
 from collections.abc import Mapping, Sequence
@@ -14,6 +15,7 @@ from ._compat import DAG, TaskGroup
 from .invocation import PLAN_ERRORS, plan_layout
 from .operators import (
     RivetApplyOperator,
+    RivetBaseOperator,
     RivetCdcRunOperator,
     RivetCompactOperator,
     RivetInitOperator,
@@ -22,6 +24,7 @@ from .operators import (
     RivetRunOperator,
     RivetRunWatcher,
     RivetWaveBarrier,
+    _RivetTask,
     config_present,
 )
 from .preflight import read_config
@@ -32,6 +35,13 @@ GATE = "all_success"
 DEFAULT_ARGS = {"retries": 2, "retry_delay": timedelta(minutes=5)}
 SOURCE_NAME = re.compile(r"[a-z0-9_]+")  # a file stem, a database name and a dag_id part as it is
 SOURCE_ENV = "RIVET_SOURCE_URL"
+# The parameters of a task that runs rivet's ADR-0039 commands which `init` has no use for (locks, extra_args, crash
+# retries, ...): `operator_kwargs` goes to every task of a source's DAG, and `init` takes only its own.
+RUN_ONLY = (
+    frozenset(inspect.signature(RivetBaseOperator.__init__).parameters)
+    - frozenset(inspect.signature(RivetInitOperator.__init__).parameters)
+    - frozenset(inspect.signature(_RivetTask.__init__).parameters)
+)
 NOT_IN_TASK_ID = re.compile(r"[^A-Za-z0-9_.-]")  # ASCII only: Airflow 3 cannot run a non-ASCII task id
 
 
@@ -319,7 +329,7 @@ def warehouse_table(table: str) -> str:
 def _init_dag(dag_id: str, mode: str, init_args: list[str], common: Mapping[str, Any]) -> DAG:
     """The DAG of a source with no config yet: its one task writes the config."""
     settings = {k: v for k, v in common.items() if k not in ("config", "state_dir", "operator_kwargs")}
-    task_kwargs = common["operator_kwargs"]
+    task_kwargs = {k: v for k, v in common["operator_kwargs"].items() if k not in RUN_ONLY}
     with _dag(dag_id, ("rivet", mode, "init"), settings) as dag:
         RivetInitOperator(
             task_id="init",
