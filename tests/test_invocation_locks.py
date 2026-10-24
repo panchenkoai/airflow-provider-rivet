@@ -143,9 +143,12 @@ def test_releasing_the_lock_forgets_its_descriptor(tmp_path: Path) -> None:
     """_release_lock 1."""
     fd = os.open(tmp_path / "l", os.O_RDWR | os.O_CREAT)
     fcntl.flock(fd, fcntl.LOCK_EX)
-    s = SimpleNamespace(lock_fd=fd)
+    s = SimpleNamespace(lock_fds=(7, fd))
     invocation._release_lock(s, fd)
-    assert s.lock_fd is None
+    assert s.lock_fds == (7,)
+    probe = os.open(tmp_path / "l", os.O_RDWR)
+    fcntl.flock(probe, fcntl.LOCK_EX | fcntl.LOCK_NB)  # unlocked, not merely forgotten
+    os.close(probe)
     os.close(fd)
 
 
@@ -220,3 +223,35 @@ def test_a_free_lock_is_taken_without_a_record(tmp_path: Path, monkeypatch: pyte
     finally:
         os.close(fd)
     assert events == []
+
+
+def run_session(tmp_path: Path, export: str | None, exports: tuple[str, ...] = ("a", "b")) -> SimpleNamespace:
+    s = lock_session(tmp_path, "run", export)
+    s.pf.config = {"exports": [{"name": name} for name in exports]}
+    s.req.lock_wait = 0
+    s.emit, s.stopped, s.lock_fds = (lambda record: None), None, ()
+    return s
+
+
+def test_a_run_of_the_whole_config_excludes_a_run_of_one_of_its_exports(tmp_path: Path) -> None:
+    """Measured on 0.2.0: the whole config locked `run/<config>` and an export `run/<export>`, so a whole-config run and
+    a run of one of its exports both started, side by side (rivet's own lease then refused one as busy). The whole
+    config now takes the lock of every export it runs, sorted, and each export's own run waits for it."""
+    with invocation._export_lock(run_session(tmp_path, None)):
+        for export in ("a", "b"):
+            with pytest.raises(Busy):
+                with invocation._export_lock(run_session(tmp_path, export)):
+                    pass
+    with invocation._export_lock(run_session(tmp_path, "b")):
+        with pytest.raises(Busy):
+            with invocation._export_lock(run_session(tmp_path, None)):
+                pass
+
+
+def test_a_whole_config_run_holds_every_lock_until_it_ends_and_rivet_inherits_them_all(tmp_path: Path) -> None:
+    s = run_session(tmp_path, None)
+    with invocation._export_lock(s):
+        assert len(s.lock_fds) == 2  # each step passes them to rivet (`pass_fds`)
+    assert s.lock_fds == ()
+    with invocation._export_lock(run_session(tmp_path, "a")):
+        pass  # released

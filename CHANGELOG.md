@@ -5,6 +5,13 @@ rivet binary; its release tags will use the prefix `airflow-v`.
 
 ## Unreleased
 
+### Fixed
+
+- A `run` of the whole config (no `export`) took a lock of its own (`locks/run/<config>`) and a run of one of its exports
+  `locks/run/<export>`, so the two started side by side and rivet's lease refused one as busy. The whole config now takes
+  every export's run lock, in one sorted order, and rivet inherits them all. Measured with a test that held the whole
+  config's lock and started an export run with `lock_wait=0`: it ran, now it is `RIVET_AIRFLOW_EXPORT_BUSY`.
+
 ### Added
 
 - `build_source_dags`: one DAG per named database, paused at creation. Until `<config_dir>/<name>.yaml` exists its one
