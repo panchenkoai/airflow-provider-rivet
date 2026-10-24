@@ -3,19 +3,9 @@
 All notable changes to `airflow-provider-rivet`. The package is versioned independently of the
 rivet binary; its release tags will use the prefix `airflow-v`.
 
-## Unreleased
+## 0.3.0 (2026-10-24)
 
-### Fixed
-
-- `RivetLoadOperator` and `RivetCompactOperator` passed `table` to `rivet load --table` as written, so a schema-qualified
-  name copied from a config `rivet init` wrote (`table: dbo.orders` on SQL Server, Oracle, PostgreSQL outside
-  `public`) was refused by rivet 0.32.2 (`RIVET_CLI_TABLE_UNKNOWN`) on every `build_cdc_dag` load. The table is now
-  passed by its warehouse name, the dot folded to `_` (`dbo_orders`), and its table lock is taken under that name.
-  Found by the pre-release stand (SQL Server CDC on BigQuery, Airflow 3.3.2 and 2.10.5).
-- A `run` of the whole config (no `export`) took a lock of its own (`locks/run/<config>`) and a run of one of its exports
-  `locks/run/<export>`, so the two started side by side and rivet's lease refused one as busy. The whole config now takes
-  every export's run lock, in one sorted order, and rivet inherits them all. Measured with a test that held the whole
-  config's lock and started an export run with `lock_wait=0`: it ran, now it is `RIVET_AIRFLOW_EXPORT_BUSY`.
+Against rivet 0.32.2 (the minimum) and the contract of ADR-0039 at rivet 0.32.2.
 
 ### Added
 
@@ -36,6 +26,27 @@ rivet binary; its release tags will use the prefix `airflow-v`.
   `rivet init` configs; guide in `docs/quickstart.md`.
 - A docs site (mdBook on GitHub Pages, https://panchenkoai.github.io/airflow-provider-rivet/) with a command builder
   that writes every command to add your own database as a pipeline of the quickstart stack (`docs/your-database.md`).
+
+### Changed
+
+- `RivetInitOperator` (new in this release) takes only its own parameters: `config`, `state_dir`, `rivet_bin`, the
+  environment parameters and `mode` / `source_env` / `init_args`; `build_source_dags` gives the run tasks the rest of
+  `operator_kwargs` (#90).
+- Internal, no change of behaviour (#88): rivet's result is read by `reading.Reading`, apart from the process; the
+  state-directory layout, the payload of a task rivet never started, the Connection lookup and each command's lock are
+  each defined once.
+
+### Fixed
+
+- `RivetLoadOperator` and `RivetCompactOperator` passed `table` to `rivet load --table` as written, so a schema-qualified
+  name copied from a config `rivet init` wrote (`table: dbo.orders` on SQL Server, Oracle, PostgreSQL outside
+  `public`) was refused by rivet 0.32.2 (`RIVET_CLI_TABLE_UNKNOWN`) on every `build_cdc_dag` load. The table is now
+  passed by its warehouse name, the dot folded to `_` (`dbo_orders`), and its table lock is taken under that name.
+  Found by the pre-release stand (SQL Server CDC on BigQuery, Airflow 3.3.2 and 2.10.5).
+- A `run` of the whole config (no `export`) took a lock of its own (`locks/run/<config>`) and a run of one of its exports
+  `locks/run/<export>`, so the two started side by side and rivet's lease refused one as busy. The whole config now takes
+  every export's run lock, in one sorted order, and rivet inherits them all. Measured with a test that held the whole
+  config's lock and started an export run with `lock_wait=0`: it ran, now it is `RIVET_AIRFLOW_EXPORT_BUSY`.
 
 ## 0.2.0 (2026-10-22)
 
