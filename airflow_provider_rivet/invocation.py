@@ -230,6 +230,8 @@ class Busy(Exception):
 class _Session:
     """One task's invocation: its preflight result, working files and collected degradations."""
 
+    lock_fds: tuple[int, ...] = ()  # the locks `_export_lock` holds; every step passes them to rivet
+
     def __init__(
         self, request: Request, pf: Preflight, emit: Emit, on_process: Callable | None, stopped: Callable[[], bool] | None = None
     ) -> None:
@@ -242,7 +244,6 @@ class _Session:
         self.read = Reading(self.degraded, pf.config, request.command)
         self.stderr_path: str | None = None
         self.tmp: Path | None = None
-        self.lock_fd: int | None = None
         dag, run = (path_name(part) for part in request.label[:2])
         task = hashed_name(request.label[2])
         attempt = f"try{int(request.label[3])}"
@@ -323,8 +324,7 @@ class _Session:
         self.emit({"event": "rivet.start", "step": name, "argv": argv, "stderr_path": str(stderr_path)})
         cwd = self.req.cwd or str(Path(self.req.config).resolve().parent)
         with _open_private(stdout_path) as out, _open_private(stderr_path) as err:
-            pass_fds = () if self.lock_fd is None else (self.lock_fd,)
-            code = spawn(argv, out, err, self.req.env, cwd, self.on_process, pass_fds)
+            code = spawn(argv, out, err, self.req.env, cwd, self.on_process, self.lock_fds)
         self.emit(
             {
                 "event": "rivet.step",
@@ -645,28 +645,40 @@ def _lock_path(s: _Session) -> tuple[Path, str] | None:
     )
 
 
-@contextlib.contextmanager
-def _export_lock(s: _Session) -> Iterator[None]:
-    """Hold the export's exclusive lock while this task runs rivet: wait up to `lock_wait` seconds, then raise `Busy`.
-
-    Every rivet step inherits the descriptor (`step`), so a rivet that outlives the task keeps the lock and a retry
-    cannot start a second one beside it. The lock is released by an explicit unlock once the steps have ended: a copy
-    of the descriptor in any other process would keep a lock released by close alone held."""
+def _lock_paths(s: _Session) -> list[tuple[Path, str]]:
+    """The locks this task takes: its export's (`_lock_path`), or for a run of the whole config the run lock of every
+    export the config has, sorted, so a run of one of them waits for the whole config's and the other way round."""
     found = _lock_path(s)
     if found is None:
+        return []
+    if s.req.export is not None or LOCK_SCOPE[s.req.command] != "run":
+        return [found]
+    names = {_yaml.text_of(e.get("name")) for e in s.pf.config.get("exports") or [] if isinstance(e, Mapping)}
+    named = sorted(str(n) for n in names if n is not None)
+    if not named:
+        return [found]
+    run = _private_dir(s.pf.state_dir, WORK, LOCKS, "run")
+    return [(run / f"{path_name(n)}.lock", f"export `{n}` of the config") for n in named]
+
+
+@contextlib.contextmanager
+def _export_lock(s: _Session) -> Iterator[None]:
+    """Hold this task's exclusive locks while it runs rivet: each waited for up to `lock_wait` seconds, in the order
+    `_lock_paths` gives (one order for every task, so two tasks never wait for each other), then `Busy`.
+
+    Every rivet step inherits the descriptors (`step`), so a rivet that outlives the task keeps the locks and a retry
+    cannot start a second one beside it. They are released by an explicit unlock once the steps have ended: a copy of
+    a descriptor in any other process would keep a lock released by close alone held."""
+    with contextlib.ExitStack() as held:
+        fds = []
+        for path, unit in _lock_paths(s):
+            fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
+            held.callback(os.close, fd)
+            _wait_for_lock(s, fd, path, unit)
+            held.callback(_release_lock, s, fd)
+            fds.append(fd)
+        s.lock_fds = tuple(fds)
         yield
-        return
-    path, unit = found
-    fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_CLOEXEC, 0o600)
-    try:
-        _wait_for_lock(s, fd, path, unit)
-        s.lock_fd = fd
-        try:
-            yield
-        finally:
-            _release_lock(s, fd)
-    finally:
-        os.close(fd)
 
 
 def _wait_for_lock(s: _Session, fd: int, path: Path, unit: str) -> None:
@@ -692,7 +704,7 @@ def _wait_for_lock(s: _Session, fd: int, path: Path, unit: str) -> None:
 
 def _release_lock(s: _Session, fd: int) -> None:
     """Release by an explicit unlock, never by close alone: a copy of the descriptor elsewhere keeps a closed lock."""
-    s.lock_fd = None
+    s.lock_fds = tuple(f for f in s.lock_fds if f != fd)
     fcntl.flock(fd, fcntl.LOCK_UN)
 
 

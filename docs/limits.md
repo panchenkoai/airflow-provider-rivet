@@ -13,8 +13,11 @@ Airflow does not stop two tries of one task from running at once: a zombie try (
 the task still running) and its retry, or a rivet left running by a task process that was killed
 (the scheduler counts task instances, and the dead try's is already failed). With a state
 directory every task but `plan` holds an exclusive lock file while it runs rivet: one per export
-for `run`, `apply` and `cdc_run`; one per table for `load` and `compact` with `--table`, else one
-per export. The lock's descriptor is passed to every rivet process the task starts, so a rivet that
+for `run`, `apply` and `cdc_run` (a `run` of the whole config takes the lock of every export the config has, in one
+sorted order, so it and a run of one of its exports wait for each other); one per table for `load` and `compact` with
+`--table`, else one per export. A lock is named by the export, not the config: two configs that share a state directory
+and an export name share its lock (they wait for each other; rivet's own lease, keyed by export and source, is the
+exact one). The lock's descriptor is passed to every rivet process the task starts, so a rivet that
 outlives its task keeps the lock until it exits. A task that finds the lock held waits up to
 `lock_wait` seconds, then starts no rivet and ends retryable (`RIVET_AIRFLOW_EXPORT_BUSY`; the
 waiting is logged when it starts, `waiting up to <lock_wait> s for the lock of ...`, record `rivet.lock.wait`). The task releases the lock by an explicit unlock once its
