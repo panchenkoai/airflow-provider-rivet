@@ -230,6 +230,8 @@ class Busy(Exception):
 class _Session:
     """One task's invocation: its preflight result, working files and collected degradations."""
 
+    lock_fds: tuple[int, ...] = ()  # the locks `_export_lock` holds; every step passes them to rivet
+
     def __init__(
         self, request: Request, pf: Preflight, emit: Emit, on_process: Callable | None, stopped: Callable[[], bool] | None = None
     ) -> None:
@@ -242,7 +244,6 @@ class _Session:
         self.read = Reading(self.degraded, pf.config, request.command)
         self.stderr_path: str | None = None
         self.tmp: Path | None = None
-        self.lock_fds: tuple[int, ...] = ()
         dag, run = (path_name(part) for part in request.label[:2])
         task = hashed_name(request.label[2])
         attempt = f"try{int(request.label[3])}"
