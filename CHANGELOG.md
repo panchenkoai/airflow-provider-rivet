@@ -7,6 +7,11 @@ rivet binary; its release tags will use the prefix `airflow-v`.
 
 ### Fixed
 
+- `RivetLoadOperator` and `RivetCompactOperator` passed `table` to `rivet load --table` as written, so a schema-qualified
+  name copied from a config `rivet init` wrote (`table: dbo.orders` on SQL Server, Oracle, PostgreSQL outside
+  `public`) was refused by rivet 0.32.2 (`RIVET_CLI_TABLE_UNKNOWN`) on every `build_cdc_dag` load. The table is now
+  passed by its warehouse name, the dot folded to `_` (`dbo_orders`), and its table lock is taken under that name.
+  Found by the pre-release stand (SQL Server CDC on BigQuery, Airflow 3.3.2 and 2.10.5).
 - A `run` of the whole config (no `export`) took a lock of its own (`locks/run/<config>`) and a run of one of its exports
   `locks/run/<export>`, so the two started side by side and rivet's lease refused one as busy. The whole config now takes
   every export's run lock, in one sorted order, and rivet inherits them all. Measured with a test that held the whole

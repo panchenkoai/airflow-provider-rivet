@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Any
 
 from ._compat import DAG, TaskGroup
-from .invocation import PLAN_ERRORS, plan_layout
+from .invocation import PLAN_ERRORS, plan_layout, warehouse_table
 from .operators import (
     RivetApplyOperator,
     RivetBaseOperator,
@@ -318,12 +318,6 @@ def build_source_dags(
             batch = [e["name"] for e in exports if e.get("mode") != "cdc"]
             dags[dag_id] = build_batch_dag(dag_id, exports=batch, load=bool(doc.get("load")), **common)
     return dags
-
-
-def warehouse_table(table: str) -> str:
-    """The name `rivet load --table` takes for a captured table: a schema-qualifying dot folded to `_` (`dbo.orders` is
-    loaded as `dbo_orders`; rivet's `folded_table`, src/load/plan.rs), a bare name as it is."""
-    return str(table).replace(".", "_")
 
 
 def _init_dag(dag_id: str, mode: str, init_args: list[str], common: Mapping[str, Any]) -> DAG:

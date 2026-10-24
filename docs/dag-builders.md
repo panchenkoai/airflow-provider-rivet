@@ -85,6 +85,8 @@ dag = build_cdc_dag(
 ```
 
 - `run` is ONE task for the stream. `load.T` and `compact.T` are separate tasks per table.
+- `tables` are written as the config names them: `dbo.orders` is loaded and compacted as the
+  warehouse table `dbo_orders` (the schema's dot folded to `_`, as rivet names it).
 - `run >> load.T >> compact.T`, all `all_success`: **nothing is loaded or compacted after a
   drain that did not succeed** (a refusal such as a log gap means the files of this cycle are
   not the stream), and a failed `load.T` blocks `compact.T` but not another table. The parts of

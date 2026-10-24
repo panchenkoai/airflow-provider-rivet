@@ -381,6 +381,16 @@ def test_load_on_a_contract_binary_filters_by_flag_and_reads_the_result(rig: Rig
     assert payload["degraded"] == []
 
 
+@pytest.mark.parametrize("operator", [RivetLoadOperator, RivetCompactOperator])
+def test_a_schema_qualified_table_is_passed_by_its_warehouse_name(rig: Rig, operator: type) -> None:
+    # init writes `table: dbo.orders`; rivet loads it as `dbo_orders` and refuses the dotted name
+    # (RIVET_CLI_TABLE_UNKNOWN, rivet 0.32.2), so a DAG built from the config as written failed every load.
+    rig.scenario(flags=NEW_FLAGS)
+    rig.run(rig.operator(operator, export="orders_cdc", table="dbo.orders"))
+    argv = rig.argv(operator.command)
+    assert argv[argv.index("--table") + 1] == "dbo_orders"
+
+
 def test_a_load_that_is_up_to_date_is_a_success_so_compact_still_runs(rig: Rig) -> None:
     rig.scenario(flags=NEW_FLAGS, load={"summary": fixture("load_result.json")})
     payload, _ = rig.run(rig.operator(RivetLoadOperator, export="countries", table="countries"))

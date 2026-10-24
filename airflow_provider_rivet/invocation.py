@@ -154,6 +154,16 @@ class Request:
     series: int | None = None
     upstream_markers: Sequence[str] = ()
 
+    def __post_init__(self) -> None:
+        if self.table:  # one spelling for the argv, the table lock and the summary read
+            self.table = warehouse_table(self.table)
+
+
+def warehouse_table(table: str) -> str:
+    """The name `rivet load --table` takes for a captured table: a schema-qualifying dot folded to `_` (`dbo.orders` is
+    loaded as `dbo_orders`; rivet's `folded_table`, src/load/plan.rs), a bare name as it is."""
+    return str(table).replace(".", "_")
+
 
 def decision_of(error: ErrorObject | None) -> str:
     """The retry table: `success`, `retry` (transient budget), `retry_crashed` (its own budget) or `fail`.
